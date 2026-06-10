@@ -35,5 +35,9 @@ target_link_libraries(shuttle_tests PRIVATE shuttle_core)
 add_executable(shuttle_bench bench/bench_main.cpp)
 target_link_libraries(shuttle_bench PRIVATE shuttle_core)
 
+add_executable(shuttle_shm_smoke tests/shm_smoke.cpp)
+target_link_libraries(shuttle_shm_smoke PRIVATE shuttle_core)
+
 enable_testing()
 add_test(NAME shuttle_tests COMMAND shuttle_tests)
+add_test(NAME shuttle_shm_smoke COMMAND shuttle_shm_smoke)

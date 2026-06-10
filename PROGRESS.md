@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G0.3
+## Current objective: G0.4
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -12,7 +12,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 |------|---------|-----------|-------------|------|-------|
 | G0.1 | PASS | PASS | `make test-mac` / `make test-linux` (ctest 1/1 Passed, ASan+UBSan) | 2026-06-10 | mac leg required CLT 26.5 update — see decisions log |
 | G0.2 | PASS | PASS | `make tsan-mac` / `make tsan-linux` (ctest 1/1 Passed under TSan) | 2026-06-10 | linux leg needed seccomp=unconfined for setarch — see decisions log |
-| G0.3 | PENDING | PENDING | | | 4 KB shm smoke in container with `--shm-size=512m` |
+| G0.3 | PASS | PASS | `make test-mac` / `make test-linux` (shuttle_shm_smoke: 4 KB + 128 MB page-touched) | 2026-06-10 | Negative control verified: same binary SIGBUSes in container at default 64 MB /dev/shm |
 | G0.4 | PENDING | PENDING | | | Two-process pshared mutex+condvar smoke; mac leg is highest-risk unknown, gates Phase 4 |
 | G1.1 | PENDING | PENDING | | | Create/open, magic+version validation, version-mismatch error |
 | G1.2 | PENDING | PENDING | | | FR-4 capacity validation error, no crash |
