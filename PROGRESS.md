@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G2.3
+## Current objective: G3.1 (Phases 0–2 complete)
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -19,7 +19,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G1.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_leak_test) | 2026-06-10 | Linux: object visible in /dev/shm while alive, gone after unlink. Both: survives close (FR-5), unlinked name → kErrNotFound, double unlink distinct |
 | G2.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_bipbuffer_test) | 2026-06-10 | 2×100k pairs (roomy 64KB: 1496 wraps; tight 4KB: 19267 wraps), byte-exact FIFO, size/cursor invariants after every op |
 | G2.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_bipbuffer_edge_test) | 2026-06-10 | Deterministic scripts w/ hand-computed cursors + pointer-identity wrap proofs; also pins both strict-inequality refusals (wrapped-full vs linear-empty aliasing) |
-| G2.3 | PENDING | PENDING | | | Oversized write fails fast |
+| G2.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_bipbuffer_oversize_test) | 2026-06-10 | Oversize refused immediately with zero cursor mutation, from empty/linear/wrapped; exact max_payload boundary still fits |
 | G3.1 | PENDING | PENDING | | | ≥1 GB two-process byte-exact FIFO; TSan-clean on single-process dual-thread config (A2) |
 | G3.2 | PENDING | PENDING | | | Asymmetric-speed stress both directions |
 | G3.3 | PENDING | PENDING | | | Wrap-heavy A→B handoff stress |
@@ -62,6 +62,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-10 (iteration 10 — G2.3 PASS both legs; PHASE 2 COMPLETE):** Added `tests/bipbuffer_oversize_test.cpp`: a framed unit > capacity is refused immediately (both write_msg and raw reserve), with a cursor/size snapshot proving ZERO state mutation, tested from empty, partially-filled, and wrapped states; live data drains byte-exact afterward; the exact max_payload (= cap − 8) boundary still fits. One test-authoring bug caught and fixed during the iteration: the wrapped-state section initially reused the previous section's buffer, so its early-wrap setup started from r=w=300 and was correctly refused by the strict `read > n` rule — sections now each use a fresh buffer (test construction fix; the gate's oversize assertions were never touched). No library changes. 9/9 under ASan+TSan, both legs. **Phase 2 done — the BipBuffer arithmetic is fully trusted.** Next objective: **G3.1** — Phase 3, THE HARD ONE: promote cursors to atomics in the shared header, lock-free release/acquire protocol, busy-poll empty/full, two-process ≥1 GB byte-exact FIFO stress; TSan-clean applies to the single-process dual-thread configuration per amendment A2; write the happens-before argument as inline comments for every shared atomic. Budget multiple iterations; the A→B handoff ordering is the expected trouble spot.
 
 - **2026-06-10 (iteration 9 — G2.2 PASS both legs):** Added `tests/bipbuffer_edge_test.cpp`, deterministic scripts with hand-computed cursor expectations for the three named edges: (1) exact-fill after A — write lands exactly on the physical end (`write == cap`), next write early-wraps rather than failing; (2) forced early wrap to B — wrapped cursors verified (w=500/m=800/r=600), payload pointer-identity at offset 0 after handoff, PLUS the two strict-inequality refusals (linear wrap with unit == read refused; wrapped append with unit == read−write refused, unit one less accepted) that guard wrapped-full vs linear-empty aliasing; (3) max-size payload — single message occupying the whole buffer, nothing more accepted while full, clean post-drain wrap, and the SRS 2× shape with two max messages in flight simultaneously. 8/8 under ASan+TSan, both legs. No library changes needed. Next objective: **G2.3** — a write of max_payload + 1 (logically, > usable capacity) fails fast rather than looping or wrapping incorrectly.
 
