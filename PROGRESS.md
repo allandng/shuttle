@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G1.3
+## Current objective: G2.1 (Phases 0–1 complete)
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -16,7 +16,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G0.4 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_pshared_smoke) | 2026-06-10 | macOS pshared condvar park/wake WORKS on 26.5 — no os_sync_wait_on_address fallback needed. posix_spawn role-arg pattern per amendment; also clean under TSan both legs |
 | G1.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_lifecycle_test) | 2026-06-10 | Driver creates; spawned child opens + verifies magic/version; bumped version → distinct kErrBadVersion. macOS rounds shm st_size to page size — see decisions log |
 | G1.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_capacity_test) | 2026-06-10 | Three too-small shapes → kErrCapacityTooSmall; failed create leaves no object; boundary cap == maxp+8 accepted |
-| G1.3 | PENDING | PENDING | | | Leak check: /dev/shm clean (linux); name not re-openable (both) |
+| G1.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_leak_test) | 2026-06-10 | Linux: object visible in /dev/shm while alive, gone after unlink. Both: survives close (FR-5), unlinked name → kErrNotFound, double unlink distinct |
 | G2.1 | PENDING | PENDING | | | ≥100k random write/read pairs, byte-exact FIFO, invariants every op |
 | G2.2 | PENDING | PENDING | | | Edge cases: exact-fill after A, forced early wrap, max-size payload |
 | G2.3 | PENDING | PENDING | | | Oversized write fails fast |
@@ -62,6 +62,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-10 (iteration 7 — G1.3 PASS both legs; PHASE 1 COMPLETE):** Added `shm_object_exists_fs` to the platform seam (Linux: stat of /dev/shm/<name>; macOS: -1 = no filesystem view, callers fall back to behavioral proof) and `tests/leak_test.cpp`: live object visible in /dev/shm (ground truth the check can fail), survives close() per FR-5, gone from /dev/shm after unlink, not re-openable (kErrNotFound) on both platforms, double unlink reports kErrNotFound. 6/6 tests pass under ASan and TSan on both legs. Phase 1 done: lifecycle, header, validation, leak hygiene all gated. Next objective: **G2.1** — Phase 2 BipBuffer logic, single-threaded over a heap buffer, NO shared memory: reserve/commit/read_block/release with the amendment-A1 read/write/watermark invariant (regions A/B strictly derived, never stored), early-wrap rule, 8-byte framing; gate = byte-exact FIFO over ≥100k random write/read pairs with invariants asserted after every op. This is the phase for heavy property testing — invest in the fuzz harness, it is what de-risks Phase 3.
 
 - **2026-06-10 (iteration 6 — G1.2 PASS both legs):** Added `tests/capacity_test.cpp` (single-process; FR-4 needs no second process): capacities of maxp+7, maxp, and 1 against a 64 KB max_payload all fail with the distinct kErrCapacityTooSmall; a failed create leaves no shm object behind (open afterward → kErrNotFound); the exact boundary capacity == max_payload + kFrameHeader succeeds, then closes and unlinks cleanly. No library-code changes needed — the validation landed with G1.1. 5/5 tests pass under ASan and TSan on both legs. Next objective: **G1.3** — leak check (NFR-R2): after create→close→unlink, /dev/shm is clean on Linux and the name cannot be re-opened on either platform.
 

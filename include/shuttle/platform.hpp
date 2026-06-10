@@ -16,8 +16,10 @@
 #endif
 
 #include <pthread.h>
+#include <sys/stat.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 
@@ -87,6 +89,22 @@ inline int cond_timedwait_rel(pthread_cond_t* c, pthread_mutex_t* m,
     rel.tv_sec = static_cast<time_t>(rel_ns / 1000000000ull);
     rel.tv_nsec = static_cast<long>(rel_ns % 1000000000ull);
     return pthread_cond_timedwait_relative_np(c, m, &rel);
+#endif
+}
+
+// Filesystem view of a named shm object, for leak checks (NFR-R2).
+// Linux exposes "/name" as /dev/shm/name — returns 1 if present, 0 if not.
+// macOS has no filesystem view of POSIX shm at all — returns -1
+// ("unobservable"); callers must fall back to open()-fails verification.
+inline int shm_object_exists_fs(const char* name) noexcept {
+#if defined(SHUTTLE_PLATFORM_LINUX)
+    char path[300];
+    std::snprintf(path, sizeof path, "/dev/shm/%s", name + 1);
+    struct stat st;
+    return stat(path, &st) == 0 ? 1 : 0;
+#else
+    (void)name;
+    return -1;
 #endif
 }
 
