@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G2.1 (Phases 0–1 complete)
+## Current objective: G2.2
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -17,7 +17,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G1.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_lifecycle_test) | 2026-06-10 | Driver creates; spawned child opens + verifies magic/version; bumped version → distinct kErrBadVersion. macOS rounds shm st_size to page size — see decisions log |
 | G1.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_capacity_test) | 2026-06-10 | Three too-small shapes → kErrCapacityTooSmall; failed create leaves no object; boundary cap == maxp+8 accepted |
 | G1.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_leak_test) | 2026-06-10 | Linux: object visible in /dev/shm while alive, gone after unlink. Both: survives close (FR-5), unlinked name → kErrNotFound, double unlink distinct |
-| G2.1 | PENDING | PENDING | | | ≥100k random write/read pairs, byte-exact FIFO, invariants every op |
+| G2.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_bipbuffer_test) | 2026-06-10 | 2×100k pairs (roomy 64KB: 1496 wraps; tight 4KB: 19267 wraps), byte-exact FIFO, size/cursor invariants after every op |
 | G2.2 | PENDING | PENDING | | | Edge cases: exact-fill after A, forced early wrap, max-size payload |
 | G2.3 | PENDING | PENDING | | | Oversized write fails fast |
 | G3.1 | PENDING | PENDING | | | ≥1 GB two-process byte-exact FIFO; TSan-clean on single-process dual-thread config (A2) |
@@ -62,6 +62,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-10 (iteration 8 — G2.1 PASS both legs):** Phase 2 BipBuffer landed in `include/shuttle/bipbuffer.hpp`: pure single-threaded logic, amendment-A1 cursor model (read/write/watermark absolute offsets, single-writer each; regions A/B derived only; reserve state producer-private). Key encoded rules: strict `write < read` in all wrapped-space checks (wrapped-full must never alias linear-empty `write == read`), whole-unit early wrap to offset 0, A→B handoff = consumer storing `read = 0` on observing `read == watermark && write < read`, explicit little-endian u64 framing. `kFrameHeader` moved from header.hpp into bipbuffer.hpp (constant relocation only; header.hpp now includes bipbuffer.hpp). `tests/bipbuffer_test.cpp`: model-based property test, payload bytes regenerated from msg index (nothing stored), 100k pairs roomy (64 KB cap, 1496 wraps) + 100k pairs tight (4 KB cap, 19267 wraps), invariants (cursors ≤ cap; wrapped ⇒ read ≤ watermark; derived size == modeled in-flight bytes) after every op, byte-exact FIFO. 7/7 under ASan+TSan, both legs. Next objective: **G2.2** — the three named edge cases: payload exactly filling the space after A; forced early wrap to B; max-size payload.
 
 - **2026-06-10 (iteration 7 — G1.3 PASS both legs; PHASE 1 COMPLETE):** Added `shm_object_exists_fs` to the platform seam (Linux: stat of /dev/shm/<name>; macOS: -1 = no filesystem view, callers fall back to behavioral proof) and `tests/leak_test.cpp`: live object visible in /dev/shm (ground truth the check can fail), survives close() per FR-5, gone from /dev/shm after unlink, not re-openable (kErrNotFound) on both platforms, double unlink reports kErrNotFound. 6/6 tests pass under ASan and TSan on both legs. Phase 1 done: lifecycle, header, validation, leak hygiene all gated. Next objective: **G2.1** — Phase 2 BipBuffer logic, single-threaded over a heap buffer, NO shared memory: reserve/commit/read_block/release with the amendment-A1 read/write/watermark invariant (regions A/B strictly derived, never stored), early-wrap rule, 8-byte framing; gate = byte-exact FIFO over ≥100k random write/read pairs with invariants asserted after every op. This is the phase for heavy property testing — invest in the fuzz harness, it is what de-risks Phase 3.
 

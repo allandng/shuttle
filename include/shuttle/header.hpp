@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "shuttle/bipbuffer.hpp"  // kFrameHeader (transport framing)
 #include "shuttle/platform.hpp"
 
 namespace shuttle {
@@ -24,9 +25,6 @@ constexpr uint32_t kInitReady = 0x52454459;  // "REDY"
 // Hot atomics get a full line each. 128 B = Apple Silicon line size; also
 // correct (2x conservative) on x86 (binding minor amendment).
 constexpr size_t kCacheLine = 128;
-
-// Transport framing: each message is [u64 little-endian length | payload].
-constexpr uint64_t kFrameHeader = 8;
 
 struct alignas(kCacheLine) ChannelHeader {
     // --- cold identity block: written once by the creator, immutable after
