@@ -2,7 +2,9 @@
 
 ## Current objective: G0.2
 
-## Scheduled job: none (manually driven iterations so far)
+## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
+
+Caveats: the job is **session-only** — it lives in the current Claude Code session and dies if that session exits (the scheduler declined the durable flag). It fires only while the session REPL is idle. Per hygiene rules: if expiry is within 24 h at the start of an iteration, re-register and update this line; if the driving session is gone, re-create the job; cancel it (CronDelete) when all gates are PASS.
 
 ## Gate status
 
@@ -43,6 +45,8 @@
 - 2026-06-10 — **Host-wide install: Command Line Tools for Xcode 26.5** (via `softwareupdate -i`). Reason: the prior CLT (Apple clang 17, clang-1700.4.4.1) shipped an ASan runtime incompatible with macOS 26.5 — ANY ASan-instrumented binary (even a one-line C `main`) spun forever pre-`main` inside `wrap_malloc_default_zone` ← `__malloc_init` (confirmed by `sample`; `MallocNanoZone=0` did not help). CLT 26.5 (Apple clang 21, clang-2100.1.1.101) fixes it. If macOS updates again and ASan binaries start hanging at startup with 100% CPU, suspect this same runtime/OS mismatch first and check `softwareupdate --list` for a newer CLT.
 - 2026-06-10 — "Sanitizer presets" realized as Makefile targets + a `SHUTTLE_SAN=off|asan|tsan` CMake cache var with separate build trees (`build/{mac,linux}-{asan,tsan}`), not CMakePresets.json — one command per leg either way, fewer moving parts. ASan build includes UBSan per plan; TSan strictly separate (cannot link both).
 - 2026-06-10 — Linux leg = `ubuntu:24.04` glibc 2.39 arm64 image (`docker/Dockerfile`, built as `shuttle-linux-dev`), run with `--shm-size=512m`, repo bind-mounted at `/work`. `tsan-linux` target pre-wires the `setarch -R` ASLR workaround.
+
+- 2026-06-10 — **Amendment to docs/SHUTTLE_AGENT_PROMPT.md (user-directed, binding):** the G0.4 smoke test and every other multi-process test must launch processes via fork+exec or `posix_spawn` — the driver runs the test binary twice with role arguments. Plain fork without exec is forbidden: TSan on macOS does not support fork-without-exec and the child inherits a broken runtime.
 
 ## Environment verification (iteration zero, 2026-06-09; Docker re-verified 2026-06-10)
 

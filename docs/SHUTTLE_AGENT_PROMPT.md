@@ -120,6 +120,11 @@ the wrap handoff.
   figures.
 - Python wrapper: the borrowed `memoryview` must be invalidated on `release_read` (wrap in
   an object that raises after release); document that Python cannot enforce the borrow.
+- The G0.4 smoke test — and every other multi-process test — must launch its processes via
+  **fork+exec or `posix_spawn`**: the driver runs the test binary twice with role arguments
+  (e.g. `--role=waiter` / `--role=signaler`). Plain `fork` without `exec` is **forbidden**:
+  TSan on macOS does not support fork-without-exec and the child inherits a broken runtime.
+  (Added 2026-06-10; recorded in PROGRESS.md decisions log.)
 
 ---
 
