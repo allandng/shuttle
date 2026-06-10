@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G0.2
+## Current objective: G0.3
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -11,7 +11,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | Gate | mac leg | linux leg | Verified by | Date | Notes |
 |------|---------|-----------|-------------|------|-------|
 | G0.1 | PASS | PASS | `make test-mac` / `make test-linux` (ctest 1/1 Passed, ASan+UBSan) | 2026-06-10 | mac leg required CLT 26.5 update — see decisions log |
-| G0.2 | PENDING | PENDING | | | TSan preset links + runs empty test, both legs (linux: `setarch -R`) |
+| G0.2 | PASS | PASS | `make tsan-mac` / `make tsan-linux` (ctest 1/1 Passed under TSan) | 2026-06-10 | linux leg needed seccomp=unconfined for setarch — see decisions log |
 | G0.3 | PENDING | PENDING | | | 4 KB shm smoke in container with `--shm-size=512m` |
 | G0.4 | PENDING | PENDING | | | Two-process pshared mutex+condvar smoke; mac leg is highest-risk unknown, gates Phase 4 |
 | G1.1 | PENDING | PENDING | | | Create/open, magic+version validation, version-mismatch error |
@@ -47,6 +47,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 - 2026-06-10 — Linux leg = `ubuntu:24.04` glibc 2.39 arm64 image (`docker/Dockerfile`, built as `shuttle-linux-dev`), run with `--shm-size=512m`, repo bind-mounted at `/work`. `tsan-linux` target pre-wires the `setarch -R` ASLR workaround.
 
 - 2026-06-10 — **Amendment to docs/SHUTTLE_AGENT_PROMPT.md (user-directed, binding):** the G0.4 smoke test and every other multi-process test must launch processes via fork+exec or `posix_spawn` — the driver runs the test binary twice with role arguments. Plain fork without exec is forbidden: TSan on macOS does not support fork-without-exec and the child inherits a broken runtime.
+
+- 2026-06-10 — **TSan linux leg runs with `--security-opt seccomp=unconfined`.** Docker's default seccomp profile blocks `personality(2)` with ADDR_NO_RANDOMIZE, so the pre-approved `setarch -R` workaround failed with "Operation not permitted". Note: on Docker Desktop's LinuxKit kernel (`vm.mmap_rnd_bits=18`) gcc-13 TSan happens to work even without `setarch`, but we keep the documented workaround functional (via unconfined seccomp on the TSan target only) so the harness also works on stock Ubuntu kernels (`mmap_rnd_bits=32`) where TSan crashes at startup without it. Dev container running our own code; acceptable.
 
 ## Environment verification (iteration zero, 2026-06-09; Docker re-verified 2026-06-10)
 
