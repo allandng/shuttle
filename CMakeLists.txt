@@ -38,6 +38,13 @@ target_link_libraries(shuttle_bench PRIVATE shuttle_core)
 add_executable(shuttle_shm_smoke tests/shm_smoke.cpp)
 target_link_libraries(shuttle_shm_smoke PRIVATE shuttle_core)
 
+find_package(Threads REQUIRED)
+add_executable(shuttle_pshared_smoke tests/pshared_smoke.cpp)
+target_link_libraries(shuttle_pshared_smoke PRIVATE shuttle_core Threads::Threads)
+
 enable_testing()
 add_test(NAME shuttle_tests COMMAND shuttle_tests)
 add_test(NAME shuttle_shm_smoke COMMAND shuttle_shm_smoke)
+add_test(NAME shuttle_pshared_smoke COMMAND shuttle_pshared_smoke)
+set_tests_properties(shuttle_tests shuttle_shm_smoke shuttle_pshared_smoke
+                     PROPERTIES TIMEOUT 60)

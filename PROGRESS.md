@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G0.4
+## Current objective: G1.1 (Phase 0 complete)
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -13,7 +13,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G0.1 | PASS | PASS | `make test-mac` / `make test-linux` (ctest 1/1 Passed, ASan+UBSan) | 2026-06-10 | mac leg required CLT 26.5 update — see decisions log |
 | G0.2 | PASS | PASS | `make tsan-mac` / `make tsan-linux` (ctest 1/1 Passed under TSan) | 2026-06-10 | linux leg needed seccomp=unconfined for setarch — see decisions log |
 | G0.3 | PASS | PASS | `make test-mac` / `make test-linux` (shuttle_shm_smoke: 4 KB + 128 MB page-touched) | 2026-06-10 | Negative control verified: same binary SIGBUSes in container at default 64 MB /dev/shm |
-| G0.4 | PENDING | PENDING | | | Two-process pshared mutex+condvar smoke; mac leg is highest-risk unknown, gates Phase 4 |
+| G0.4 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_pshared_smoke) | 2026-06-10 | macOS pshared condvar park/wake WORKS on 26.5 — no os_sync_wait_on_address fallback needed. posix_spawn role-arg pattern per amendment; also clean under TSan both legs |
 | G1.1 | PENDING | PENDING | | | Create/open, magic+version validation, version-mismatch error |
 | G1.2 | PENDING | PENDING | | | FR-4 capacity validation error, no crash |
 | G1.3 | PENDING | PENDING | | | Leak check: /dev/shm clean (linux); name not re-openable (both) |
@@ -60,6 +60,12 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-10 (iterations 2–4 — G0.2, G0.3, G0.4 all PASS; PHASE 0 COMPLETE):**
+  - **G0.2:** TSan legs pass. Container hiccup: Docker's default seccomp blocks `personality(2)`, so `setarch -R` failed; fixed with `--security-opt seccomp=unconfined` on the TSan target only (see decisions log — Docker Desktop's kernel has `mmap_rnd_bits=18` so TSan happens to work without setarch, but we keep the workaround functional for stock-Ubuntu kernels).
+  - **G0.3:** `shuttle_shm_smoke` maps/touches/unmaps 4 KB and 128 MB segments on both legs. Negative control verified: the same binary SIGBUSes in a container with the default 64 MB /dev/shm, proving the test actually guards the `--shm-size` gotcha.
+  - **G0.4:** `shuttle_pshared_smoke` — driver posix_spawn's the binary as `waiter`/`signaler` (fork-without-exec forbidden per amendment); waiter parks on a pshared condvar in shm, signaler wakes it; per-run nonce; every wait deadlined (timeout=failure; ctest TIMEOUT 60 as backstop). **PASS on macOS 26.5 natively** — the highest-risk Phase 0 unknown resolved positively; pshared mutex+condvar work cross-process on this host, no `os_sync_wait_on_address` fallback needed. Also PASS in container, and clean under TSan on both legs. `platform.hpp` gained its first real seam functions: `mutex_init_pshared`, `cond_init_pshared_monotonic` (CLOCK_MONOTONIC on Linux), `cond_timedwait_rel` (timedwait vs `pthread_cond_timedwait_relative_np`), `monotonic_ns`.
+  - Next objective: **G1.1** — Phase 1 segment lifecycle: header struct with static_asserts, offsets-not-pointers discipline, create/open/close/unlink, magic+version validation, single-init publication, short-name + one-shot-ftruncate enforcement in the platform seam, `shuttle_inspect` CLI.
 
 - **2026-06-10 (iteration 1 — G0.1 PASS both legs):** Docker now installed and verified (pull + native arm64 run of ubuntu:24.04). Built the Phase 0 skeleton: `CMakeLists.txt` (C++17, three targets `shuttle_core`/`shuttle_tests`/`shuttle_bench`, core free of test/bench deps, `SHUTTLE_SAN` sanitizer config), `include/shuttle/platform.hpp` (the single platform seam, stub), empty test + bench stub, `docker/Dockerfile` (ubuntu:24.04 glibc arm64), `Makefile` with one-command legs `test-mac`/`test-linux`/`tsan-mac`/`tsan-linux` (tsan targets wired but NOT yet verified — that is G0.2). Linux leg passed first try. Mac leg initially HUNG: ASan runtime spin pre-`main` (see decisions log) — fixed by CLT 26.5 update, then `ctest` 1/1 Passed under ASan+UBSan. Both legs re-verified on the final tree. Next objective: **G0.2** — TSan preset links and runs the empty test on both legs (`make tsan-mac`, `make tsan-linux`; linux leg already wired with `setarch -R`).
 
