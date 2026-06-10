@@ -1,7 +1,170 @@
+#include "shuttle/shuttle.hpp"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+
 #include "shuttle/platform.hpp"
 
 namespace shuttle {
 
 const char* platform_name() noexcept { return SHUTTLE_PLATFORM_NAME; }
+
+namespace {
+
+void set_err(int* err, int code) noexcept {
+    if (err != nullptr) *err = code;
+}
+
+constexpr uint64_t kInitWaitNs = 5ull * 1000000000ull;
+
+}  // namespace
+
+Channel* create(const char* name, size_t capacity_bytes,
+                size_t max_payload_bytes, int* err) {
+    if (name == nullptr || name[0] != '/' || capacity_bytes == 0 ||
+        max_payload_bytes == 0) {
+        set_err(err, kErrInvalidArgs);
+        return nullptr;
+    }
+    if (!shm_name_ok(name)) {
+        set_err(err, kErrNameTooLong);
+        return nullptr;
+    }
+    // FR-4: a write that can never be satisfied must be impossible by
+    // construction, or blocking backpressure would park the producer forever.
+    if (capacity_bytes < max_payload_bytes + kFrameHeader) {
+        set_err(err, kErrCapacityTooSmall);
+        return nullptr;
+    }
+
+    int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) {
+        set_err(err, errno == EEXIST ? kErrExists : kErrSys);
+        return nullptr;
+    }
+    const size_t map_len = kDataOffset + capacity_bytes;
+    // One-shot sizing: macOS forbids re-truncating an shm object, so this is
+    // the only ftruncate this object will ever see (platform seam note).
+    if (ftruncate(fd, static_cast<off_t>(map_len)) != 0) {
+        ::close(fd);
+        shm_unlink(name);
+        set_err(err, kErrSys);
+        return nullptr;
+    }
+    void* base =
+        mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (base == MAP_FAILED) {
+        shm_unlink(name);
+        set_err(err, kErrSys);
+        return nullptr;
+    }
+
+    // ftruncate zero-fills, so init_state is already 0 (uninitialized) and
+    // cursors/flags/heartbeats are already 0; set the rest explicitly.
+    auto* h = static_cast<ChannelHeader*>(base);
+    h->magic = kMagic;
+    h->version = kVersion;
+    h->flags = 0;
+    h->data_offset = kDataOffset;
+    h->data_capacity = capacity_bytes;
+    h->max_payload = max_payload_bytes;
+    if (mutex_init_pshared(&h->lock) != 0 ||
+        cond_init_pshared_monotonic(&h->not_empty) != 0 ||
+        cond_init_pshared_monotonic(&h->not_full) != 0) {
+        munmap(base, map_len);
+        shm_unlink(name);
+        set_err(err, kErrSys);
+        return nullptr;
+    }
+    // Publish: openers must not trust any field before this store (App. B #5).
+    h->init_state.store(kInitReady, std::memory_order_release);
+
+    set_err(err, kOk);
+    return new Channel{base, map_len, h};
+}
+
+Channel* open(const char* name, int* err) {
+    if (name == nullptr || name[0] != '/') {
+        set_err(err, kErrInvalidArgs);
+        return nullptr;
+    }
+    int fd = shm_open(name, O_RDWR, 0);
+    if (fd < 0) {
+        set_err(err, errno == ENOENT ? kErrNotFound : kErrSys);
+        return nullptr;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 ||
+        st.st_size < static_cast<off_t>(sizeof(ChannelHeader))) {
+        ::close(fd);
+        set_err(err, kErrCorrupt);
+        return nullptr;
+    }
+    const size_t map_len = static_cast<size_t>(st.st_size);
+    void* base =
+        mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (base == MAP_FAILED) {
+        set_err(err, kErrSys);
+        return nullptr;
+    }
+
+    auto* h = static_cast<ChannelHeader*>(base);
+    // Wait for the creator's release-publish; deadlined so a creator that
+    // died mid-init cannot hang us (timeout = distinct error).
+    const uint64_t deadline = monotonic_ns() + kInitWaitNs;
+    while (h->init_state.load(std::memory_order_acquire) != kInitReady) {
+        if (monotonic_ns() > deadline) {
+            munmap(base, map_len);
+            set_err(err, kErrInitTimeout);
+            return nullptr;
+        }
+        usleep(1000);
+    }
+
+    // FR-3: magic first, then version, distinct errors.
+    if (h->magic != kMagic) {
+        munmap(base, map_len);
+        set_err(err, kErrBadMagic);
+        return nullptr;
+    }
+    if (h->version != kVersion) {
+        munmap(base, map_len);
+        set_err(err, kErrBadVersion);
+        return nullptr;
+    }
+    // NFR-S2: never trust header geometry — everything later indexes off it.
+    // Coverage check is >= not ==: macOS rounds shm st_size up to page size,
+    // so the mapping may legitimately be larger than the claimed geometry.
+    if (h->data_offset != kDataOffset ||
+        h->data_capacity > map_len - kDataOffset ||
+        h->max_payload + kFrameHeader > h->data_capacity) {
+        munmap(base, map_len);
+        set_err(err, kErrCorrupt);
+        return nullptr;
+    }
+
+    set_err(err, kOk);
+    return new Channel{base, map_len, h};
+}
+
+void close(Channel* ch) {
+    if (ch == nullptr) return;
+    munmap(ch->base, ch->map_len);
+    delete ch;
+}
+
+int unlink(const char* name) {
+    if (name == nullptr || name[0] != '/') return kErrInvalidArgs;
+    if (shm_unlink(name) != 0) {
+        return errno == ENOENT ? kErrNotFound : kErrSys;
+    }
+    return kOk;
+}
 
 }  // namespace shuttle

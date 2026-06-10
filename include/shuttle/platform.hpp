@@ -18,11 +18,27 @@
 #include <pthread.h>
 
 #include <cstdint>
+#include <cstring>
 #include <ctime>
 
 namespace shuttle {
 
 const char* platform_name() noexcept;
+
+// macOS caps shm names at PSHMNAMLEN (31) chars including the leading '/';
+// we enforce 30 to stay clear of the off-by-one ambiguity in the docs.
+// Linux allows NAME_MAX-ish (~254). An shm object can also effectively be
+// ftruncate'd only ONCE on macOS — create() sizes it exactly once, at
+// creation, on both platforms, so that divergence never surfaces.
+inline bool shm_name_ok(const char* name) noexcept {
+#if defined(SHUTTLE_PLATFORM_MACOS)
+    constexpr size_t kMax = 30;
+#else
+    constexpr size_t kMax = 254;
+#endif
+    const size_t n = std::strlen(name);
+    return n >= 2 && n <= kMax;
+}
 
 // Process-shared mutex init. Robust attribute (Linux) arrives in Phase 5.
 inline int mutex_init_pshared(pthread_mutex_t* m) noexcept {

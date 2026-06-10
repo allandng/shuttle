@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G1.1 (Phase 0 complete)
+## Current objective: G1.2
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -14,7 +14,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G0.2 | PASS | PASS | `make tsan-mac` / `make tsan-linux` (ctest 1/1 Passed under TSan) | 2026-06-10 | linux leg needed seccomp=unconfined for setarch — see decisions log |
 | G0.3 | PASS | PASS | `make test-mac` / `make test-linux` (shuttle_shm_smoke: 4 KB + 128 MB page-touched) | 2026-06-10 | Negative control verified: same binary SIGBUSes in container at default 64 MB /dev/shm |
 | G0.4 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_pshared_smoke) | 2026-06-10 | macOS pshared condvar park/wake WORKS on 26.5 — no os_sync_wait_on_address fallback needed. posix_spawn role-arg pattern per amendment; also clean under TSan both legs |
-| G1.1 | PENDING | PENDING | | | Create/open, magic+version validation, version-mismatch error |
+| G1.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_lifecycle_test) | 2026-06-10 | Driver creates; spawned child opens + verifies magic/version; bumped version → distinct kErrBadVersion. macOS rounds shm st_size to page size — see decisions log |
 | G1.2 | PENDING | PENDING | | | FR-4 capacity validation error, no crash |
 | G1.3 | PENDING | PENDING | | | Leak check: /dev/shm clean (linux); name not re-openable (both) |
 | G2.1 | PENDING | PENDING | | | ≥100k random write/read pairs, byte-exact FIFO, invariants every op |
@@ -50,6 +50,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 
 - 2026-06-10 — **TSan linux leg runs with `--security-opt seccomp=unconfined`.** Docker's default seccomp profile blocks `personality(2)` with ADDR_NO_RANDOMIZE, so the pre-approved `setarch -R` workaround failed with "Operation not permitted". Note: on Docker Desktop's LinuxKit kernel (`vm.mmap_rnd_bits=18`) gcc-13 TSan happens to work even without `setarch`, but we keep the documented workaround functional (via unconfined seccomp on the TSan target only) so the harness also works on stock Ubuntu kernels (`mmap_rnd_bits=32`) where TSan crashes at startup without it. Dev container running our own code; acceptable.
 
+- 2026-06-10 — **macOS rounds shm object `st_size` up to page size (16 KB on Apple Silicon).** An opener's `fstat` can legitimately see a larger size than the creator's exact `ftruncate` length. Open-time geometry validation (NFR-S2) therefore checks the mapping *covers* the claimed `data_offset + data_capacity` (`>=`), never equality. Any future code deriving capacity from `st_size` instead of the header would be wrong on macOS.
+
 ## Environment verification (iteration zero, 2026-06-09; Docker re-verified 2026-06-10)
 
 | Check | Result |
@@ -60,6 +62,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-10 (iteration 5 — G1.1 PASS both legs):** Phase 1 lifecycle landed: `include/shuttle/header.hpp` (full ChannelHeader per amendment A1 — read/write/watermark single-writer cursors, parking flags, heartbeats, pshared primitives; every hot atomic on its own 128-byte line, offsets static_asserted, layout change = version bump), `include/shuttle/shuttle.hpp` (Err codes + create/open/close/unlink), `src/shuttle.cpp` (O_CREAT|O_EXCL + one-shot ftruncate + mmap + init, release-publish of init_state; opener acquire-spins with 5 s deadline → kErrInitTimeout; magic then version then geometry validation with distinct errors), `shm_name_ok` in the platform seam (30-char macOS cap), `tools/inspect.cpp` (shuttle_inspect header-dump CLI), `tests/proc_util.hpp` (posix_spawn child helper per fork-ban amendment), `tests/lifecycle_test.cpp` (the G1.1 test). One real bug found by the mac leg: geometry equality check vs macOS page-size-rounded `st_size` (decisions log). All 4 tests pass under ASan and TSan on both legs. Next objective: **G1.2** — `create` with `capacity < max_payload + 8` fails with the FR-4 error code, not a crash (validation already implemented in create(); needs its gate test).
 
 - **2026-06-10 (iterations 2–4 — G0.2, G0.3, G0.4 all PASS; PHASE 0 COMPLETE):**
   - **G0.2:** TSan legs pass. Container hiccup: Docker's default seccomp blocks `personality(2)`, so `setarch -R` failed; fixed with `--security-opt seccomp=unconfined` on the TSan target only (see decisions log — Docker Desktop's kernel has `mmap_rnd_bits=18` so TSan happens to work without setarch, but we keep the workaround functional for stock-Ubuntu kernels).
