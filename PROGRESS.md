@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G0.1 — BLOCKED on environment (Docker not installed)
+## Current objective: G0.2
 
 ## Scheduled job: none (manually driven iterations so far)
 
@@ -8,7 +8,7 @@
 
 | Gate | mac leg | linux leg | Verified by | Date | Notes |
 |------|---------|-----------|-------------|------|-------|
-| G0.1 | PENDING | PENDING | | | Empty test builds + runs clean under ASan, both legs |
+| G0.1 | PASS | PASS | `make test-mac` / `make test-linux` (ctest 1/1 Passed, ASan+UBSan) | 2026-06-10 | mac leg required CLT 26.5 update — see decisions log |
 | G0.2 | PENDING | PENDING | | | TSan preset links + runs empty test, both legs (linux: `setarch -R`) |
 | G0.3 | PENDING | PENDING | | | 4 KB shm smoke in container with `--shm-size=512m` |
 | G0.4 | PENDING | PENDING | | | Two-process pshared mutex+condvar smoke; mac leg is highest-risk unknown, gates Phase 4 |
@@ -40,15 +40,21 @@
 - 2026-06-09 — Repo `git init` (branch `main`) at `/Users/allannguyen/shuttle`; `.gitignore` covers `.DS_Store` and `build*/`. Removed an empty stray `shuttle/docs/` directory that predated the repo.
 - 2026-06-09 — Design amendments A1–A4 + minor amendments in `docs/SHUTTLE_AGENT_PROMPT.md` are binding and override the SRS/plan where they conflict (cursor model = read/write/watermark; TSan gates restructured per A2; heartbeat+timedwait primary on both platforms; seq_cst parking protocol; CLOCK_MONOTONIC condvars; 128-byte padding for hot atomics; G0.4 and G5.4 added; UDS baseline added to Phase 7).
 
-## Environment verification (iteration zero, 2026-06-09)
+- 2026-06-10 — **Host-wide install: Command Line Tools for Xcode 26.5** (via `softwareupdate -i`). Reason: the prior CLT (Apple clang 17, clang-1700.4.4.1) shipped an ASan runtime incompatible with macOS 26.5 — ANY ASan-instrumented binary (even a one-line C `main`) spun forever pre-`main` inside `wrap_malloc_default_zone` ← `__malloc_init` (confirmed by `sample`; `MallocNanoZone=0` did not help). CLT 26.5 (Apple clang 21, clang-2100.1.1.101) fixes it. If macOS updates again and ASan binaries start hanging at startup with 100% CPU, suspect this same runtime/OS mismatch first and check `softwareupdate --list` for a newer CLT.
+- 2026-06-10 — "Sanitizer presets" realized as Makefile targets + a `SHUTTLE_SAN=off|asan|tsan` CMake cache var with separate build trees (`build/{mac,linux}-{asan,tsan}`), not CMakePresets.json — one command per leg either way, fewer moving parts. ASan build includes UBSan per plan; TSan strictly separate (cannot link both).
+- 2026-06-10 — Linux leg = `ubuntu:24.04` glibc 2.39 arm64 image (`docker/Dockerfile`, built as `shuttle-linux-dev`), run with `--shm-size=512m`, repo bind-mounted at `/work`. `tsan-linux` target pre-wires the `setarch -R` ASLR workaround.
+
+## Environment verification (iteration zero, 2026-06-09; Docker re-verified 2026-06-10)
 
 | Check | Result |
 |---|---|
 | Xcode CLT | OK — `/Library/Developer/CommandLineTools`, Apple clang 17.0.0, target arm64-apple-darwin25.5.0 |
 | cmake | OK — 4.3.1 |
-| Docker | **MISSING** — no `docker` binary on PATH; no Docker Desktop in /Applications; no colima/podman/OrbStack alternatives found |
-| glibc arm64 base image pull | NOT ATTEMPTED — no Docker runtime |
+| Docker | OK (2026-06-10) — Docker Desktop 29.5.3, server arch arm64 |
+| glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-10 (iteration 1 — G0.1 PASS both legs):** Docker now installed and verified (pull + native arm64 run of ubuntu:24.04). Built the Phase 0 skeleton: `CMakeLists.txt` (C++17, three targets `shuttle_core`/`shuttle_tests`/`shuttle_bench`, core free of test/bench deps, `SHUTTLE_SAN` sanitizer config), `include/shuttle/platform.hpp` (the single platform seam, stub), empty test + bench stub, `docker/Dockerfile` (ubuntu:24.04 glibc arm64), `Makefile` with one-command legs `test-mac`/`test-linux`/`tsan-mac`/`tsan-linux` (tsan targets wired but NOT yet verified — that is G0.2). Linux leg passed first try. Mac leg initially HUNG: ASan runtime spin pre-`main` (see decisions log) — fixed by CLT 26.5 update, then `ctest` 1/1 Passed under ASan+UBSan. Both legs re-verified on the final tree. Next objective: **G0.2** — TSan preset links and runs the empty test on both legs (`make tsan-mac`, `make tsan-linux`; linux leg already wired with `setarch -R`).
 
 - **2026-06-09 (iteration zero):** Read all docs. Verified environment: Xcode CLT and cmake OK; **Docker is not installed on this host** (not merely not running). Standing orders mandate STOP-and-tell-the-user when Docker is unavailable — the Linux leg can never be faked or skipped, and G0.1 cannot pass on both legs without it. Initialized git, created this ledger, ended the iteration with no Phase 0 code written (deliberate: every G0.x gate needs the Linux leg, so writing the CMake skeleton before the container runtime exists risks verifying against an assumption). **User action required:** install and start a Docker runtime (Docker Desktop for Mac, or colima/OrbStack — anything providing a `docker` CLI that runs linux/arm64 containers), able to `docker pull ubuntu:24.04` (glibc arm64, never Alpine) and `docker run --shm-size=512m`. Next iteration: re-verify Docker, pull base image, then begin Phase 0 work toward G0.1 (CMake skeleton with shuttle_core/shuttle_tests/shuttle_bench targets, platform.hpp seam, ASan+UBSan and separate TSan presets, Dockerfile, `make test-mac` / `make test-linux` single commands).
