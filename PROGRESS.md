@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G1.2
+## Current objective: G1.3
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -15,7 +15,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G0.3 | PASS | PASS | `make test-mac` / `make test-linux` (shuttle_shm_smoke: 4 KB + 128 MB page-touched) | 2026-06-10 | Negative control verified: same binary SIGBUSes in container at default 64 MB /dev/shm |
 | G0.4 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_pshared_smoke) | 2026-06-10 | macOS pshared condvar park/wake WORKS on 26.5 — no os_sync_wait_on_address fallback needed. posix_spawn role-arg pattern per amendment; also clean under TSan both legs |
 | G1.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_lifecycle_test) | 2026-06-10 | Driver creates; spawned child opens + verifies magic/version; bumped version → distinct kErrBadVersion. macOS rounds shm st_size to page size — see decisions log |
-| G1.2 | PENDING | PENDING | | | FR-4 capacity validation error, no crash |
+| G1.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_capacity_test) | 2026-06-10 | Three too-small shapes → kErrCapacityTooSmall; failed create leaves no object; boundary cap == maxp+8 accepted |
 | G1.3 | PENDING | PENDING | | | Leak check: /dev/shm clean (linux); name not re-openable (both) |
 | G2.1 | PENDING | PENDING | | | ≥100k random write/read pairs, byte-exact FIFO, invariants every op |
 | G2.2 | PENDING | PENDING | | | Edge cases: exact-fill after A, forced early wrap, max-size payload |
@@ -62,6 +62,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-10 (iteration 6 — G1.2 PASS both legs):** Added `tests/capacity_test.cpp` (single-process; FR-4 needs no second process): capacities of maxp+7, maxp, and 1 against a 64 KB max_payload all fail with the distinct kErrCapacityTooSmall; a failed create leaves no shm object behind (open afterward → kErrNotFound); the exact boundary capacity == max_payload + kFrameHeader succeeds, then closes and unlinks cleanly. No library-code changes needed — the validation landed with G1.1. 5/5 tests pass under ASan and TSan on both legs. Next objective: **G1.3** — leak check (NFR-R2): after create→close→unlink, /dev/shm is clean on Linux and the name cannot be re-opened on either platform.
 
 - **2026-06-10 (iteration 5 — G1.1 PASS both legs):** Phase 1 lifecycle landed: `include/shuttle/header.hpp` (full ChannelHeader per amendment A1 — read/write/watermark single-writer cursors, parking flags, heartbeats, pshared primitives; every hot atomic on its own 128-byte line, offsets static_asserted, layout change = version bump), `include/shuttle/shuttle.hpp` (Err codes + create/open/close/unlink), `src/shuttle.cpp` (O_CREAT|O_EXCL + one-shot ftruncate + mmap + init, release-publish of init_state; opener acquire-spins with 5 s deadline → kErrInitTimeout; magic then version then geometry validation with distinct errors), `shm_name_ok` in the platform seam (30-char macOS cap), `tools/inspect.cpp` (shuttle_inspect header-dump CLI), `tests/proc_util.hpp` (posix_spawn child helper per fork-ban amendment), `tests/lifecycle_test.cpp` (the G1.1 test). One real bug found by the mac leg: geometry equality check vs macOS page-size-rounded `st_size` (decisions log). All 4 tests pass under ASan and TSan on both legs. Next objective: **G1.2** — `create` with `capacity < max_payload + 8` fails with the FR-4 error code, not a crash (validation already implemented in create(); needs its gate test).
 

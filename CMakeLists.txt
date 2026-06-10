@@ -45,6 +45,9 @@ target_link_libraries(shuttle_pshared_smoke PRIVATE shuttle_core Threads::Thread
 add_executable(shuttle_lifecycle_test tests/lifecycle_test.cpp)
 target_link_libraries(shuttle_lifecycle_test PRIVATE shuttle_core Threads::Threads)
 
+add_executable(shuttle_capacity_test tests/capacity_test.cpp)
+target_link_libraries(shuttle_capacity_test PRIVATE shuttle_core Threads::Threads)
+
 add_executable(shuttle_inspect tools/inspect.cpp)
 target_link_libraries(shuttle_inspect PRIVATE shuttle_core)
 
@@ -53,6 +56,7 @@ add_test(NAME shuttle_tests COMMAND shuttle_tests)
 add_test(NAME shuttle_shm_smoke COMMAND shuttle_shm_smoke)
 add_test(NAME shuttle_pshared_smoke COMMAND shuttle_pshared_smoke)
 add_test(NAME shuttle_lifecycle_test COMMAND shuttle_lifecycle_test)
+add_test(NAME shuttle_capacity_test COMMAND shuttle_capacity_test)
 set_tests_properties(shuttle_tests shuttle_shm_smoke shuttle_pshared_smoke
-                     shuttle_lifecycle_test
+                     shuttle_lifecycle_test shuttle_capacity_test
                      PROPERTIES TIMEOUT 60)
