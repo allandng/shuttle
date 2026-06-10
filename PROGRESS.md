@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G2.2
+## Current objective: G2.3
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -18,7 +18,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G1.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_capacity_test) | 2026-06-10 | Three too-small shapes → kErrCapacityTooSmall; failed create leaves no object; boundary cap == maxp+8 accepted |
 | G1.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_leak_test) | 2026-06-10 | Linux: object visible in /dev/shm while alive, gone after unlink. Both: survives close (FR-5), unlinked name → kErrNotFound, double unlink distinct |
 | G2.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_bipbuffer_test) | 2026-06-10 | 2×100k pairs (roomy 64KB: 1496 wraps; tight 4KB: 19267 wraps), byte-exact FIFO, size/cursor invariants after every op |
-| G2.2 | PENDING | PENDING | | | Edge cases: exact-fill after A, forced early wrap, max-size payload |
+| G2.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_bipbuffer_edge_test) | 2026-06-10 | Deterministic scripts w/ hand-computed cursors + pointer-identity wrap proofs; also pins both strict-inequality refusals (wrapped-full vs linear-empty aliasing) |
 | G2.3 | PENDING | PENDING | | | Oversized write fails fast |
 | G3.1 | PENDING | PENDING | | | ≥1 GB two-process byte-exact FIFO; TSan-clean on single-process dual-thread config (A2) |
 | G3.2 | PENDING | PENDING | | | Asymmetric-speed stress both directions |
@@ -62,6 +62,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-10 (iteration 9 — G2.2 PASS both legs):** Added `tests/bipbuffer_edge_test.cpp`, deterministic scripts with hand-computed cursor expectations for the three named edges: (1) exact-fill after A — write lands exactly on the physical end (`write == cap`), next write early-wraps rather than failing; (2) forced early wrap to B — wrapped cursors verified (w=500/m=800/r=600), payload pointer-identity at offset 0 after handoff, PLUS the two strict-inequality refusals (linear wrap with unit == read refused; wrapped append with unit == read−write refused, unit one less accepted) that guard wrapped-full vs linear-empty aliasing; (3) max-size payload — single message occupying the whole buffer, nothing more accepted while full, clean post-drain wrap, and the SRS 2× shape with two max messages in flight simultaneously. 8/8 under ASan+TSan, both legs. No library changes needed. Next objective: **G2.3** — a write of max_payload + 1 (logically, > usable capacity) fails fast rather than looping or wrapping incorrectly.
 
 - **2026-06-10 (iteration 8 — G2.1 PASS both legs):** Phase 2 BipBuffer landed in `include/shuttle/bipbuffer.hpp`: pure single-threaded logic, amendment-A1 cursor model (read/write/watermark absolute offsets, single-writer each; regions A/B derived only; reserve state producer-private). Key encoded rules: strict `write < read` in all wrapped-space checks (wrapped-full must never alias linear-empty `write == read`), whole-unit early wrap to offset 0, A→B handoff = consumer storing `read = 0` on observing `read == watermark && write < read`, explicit little-endian u64 framing. `kFrameHeader` moved from header.hpp into bipbuffer.hpp (constant relocation only; header.hpp now includes bipbuffer.hpp). `tests/bipbuffer_test.cpp`: model-based property test, payload bytes regenerated from msg index (nothing stored), 100k pairs roomy (64 KB cap, 1496 wraps) + 100k pairs tight (4 KB cap, 19267 wraps), invariants (cursors ≤ cap; wrapped ⇒ read ≤ watermark; derived size == modeled in-flight bytes) after every op, byte-exact FIFO. 7/7 under ASan+TSan, both legs. Next objective: **G2.2** — the three named edge cases: payload exactly filling the space after A; forced early wrap to B; max-size payload.
 
