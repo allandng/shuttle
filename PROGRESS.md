@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G3.2
+## Current objective: G3.3
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -21,7 +21,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G2.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_bipbuffer_edge_test) | 2026-06-10 | Deterministic scripts w/ hand-computed cursors + pointer-identity wrap proofs; also pins both strict-inequality refusals (wrapped-full vs linear-empty aliasing) |
 | G2.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_bipbuffer_oversize_test) | 2026-06-10 | Oversize refused immediately with zero cursor mutation, from empty/linear/wrapped; exact max_payload boundary still fits |
 | G3.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_spsc_stress_test + shuttle_spsc_threads_test) | 2026-06-10 | Two-process 40k msgs ≈1.25 GiB byte-exact FIFO (8 s mac / 5 s linux); dual-thread same-code-path config TSan-clean both legs per A2; happens-before argument inline in spsc.hpp |
-| G3.2 | PENDING | PENDING | | | Asymmetric-speed stress both directions |
+| G3.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_spsc_asym_test) | 2026-06-10 | Both directions byte-exact; fast side asserts ≥500 would-block msgs so the full-spin and empty-spin paths are PROVEN engaged, not incidental |
 | G3.3 | PENDING | PENDING | | | Wrap-heavy A→B handoff stress |
 | G4.1 | PENDING | PENDING | | | Idle blocked peer ~0% CPU |
 | G4.2 | PENDING | PENDING | | | Trickle stress ≥100k messages, no lost/extra wakeups |
@@ -62,6 +62,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-10 (iteration 12 — G3.2 PASS both legs):** Added `tests/spsc_asym_test.cpp`: two two-process scenarios over a deliberately small 256 KiB channel — (A) full-speed producer vs consumer throttled 100 µs/msg (buffer saturates, producer spins on FULL) and (B) the reverse (consumer spins on EMPTY). 5000 random-sized messages each way, byte-exact FIFO. Falsifiability: the fast side counts messages where try_* returned kErrWouldBlock at least once and fails the run if fewer than 500 — the spin paths must demonstrably engage. No library changes. 12/12 under ASan+TSan, both legs. Next objective: **G3.3** — targeted A→B-handoff stress: capacity sized so wraps happen every few messages, byte-exact under the A2 TSan configuration (dual-thread mode) as well as two-process.
 
 - **2026-06-10 (iteration 11 — G3.1 PASS both legs):** Phase 3 lock-free data path landed in `include/shuttle/spsc.hpp`: Producer/Consumer over the shared header's atomic cursors, busy-poll on empty/full (cpu_relax + periodic yield via the platform seam), copy-write + zero-copy-borrow read. The normative memory-ordering contract is the file-top comment block (P1 payload publish via write release/acquire; P2 watermark relaxed-store sequenced before write release; C1 free publish via read release/acquire; C2 handoff = single owned-variable store, no torn state; staleness argument: re-loads only under-estimate). Consumer parse validates length against max_payload and available run (NFR-S2) → kErrCorrupt. New error codes kErrMsgTooLarge, kErrWouldBlock. `tests/spsc_stress_test.cpp`: driver/producer/consumer roles via posix_spawn (40k seeded random messages ≈1.25 GiB, byte-exact FIFO, drained-at-end check) + `threads` mode (same producer_loop/consumer_loop functions, two threads, real MAP_SHARED segment, 8k msgs) registered as shuttle_spsc_threads_test — the TSan-attaching config per A2. All 11 tests pass: ASan both legs; TSan both legs clean (two-proc 34 s mac / 23 s linux under TSan; threads 7 s / 4 s). ctest TIMEOUT 300 for the stress pair. Next objective: **G3.2** — asymmetric-speed stress both directions (producer-fast forces backpressure-by-spin; consumer-fast forces empty-spin), byte-exact both ways.
 
