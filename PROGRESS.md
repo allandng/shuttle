@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G5.3
+## Current objective: G5.4
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -28,7 +28,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G4.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_park_latency_test + hotpath variant) | 2026-06-11 | Parked-wake p99: 39 µs mac (p50 7 µs); 198 µs linux container (p50 85 µs, virtualized — label per amendment). Hot path: 0 park-mutex acquisitions both sides over 10k msgs (instance lock counters) |
 | G5.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_crash_heartbeat_test) | 2026-06-11 | SIGKILL mid-reservation+mid-keepalive → victim kErrPeerDead 2.08 s after park (1 s threshold); no premature verdict on live keepaliving peer; uncommitted reservation never surfaces |
 | G5.2 | N/A | PASS | `make test-linux`+`tsan-linux` (shuttle_robust_mutex_test; self-skips on mac) | 2026-06-11 | Holder SIGKILLed mid-lock: seam absorbs EOWNERDEAD (repair=documented no-op → consistent), mutex fully usable after. Buggy-recovery scenario proves ENOTRECOVERABLE is detectable (test can fail) |
-| G5.3 | PENDING | PENDING | | | No shm leak after crashed run once survivor tears down |
+| G5.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_crash_leak_test) | 2026-06-11 | Producer SIGKILLed → survivor kErrPeerDead → close+unlink → object gone, verified from survivor AND independently from driver (/dev/shm on linux; not-openable both) |
 | G5.4 | PENDING | PENDING | | | Kill-while-holding-park-mutex: robust recovery (linux) / trylock-loop escape (mac) |
 | G6.1 | PENDING | PENDING | | | C++ producer ↔ Python consumer, byte-exact borrow path |
 | G6.2 | PENDING | PENDING | | | C++ producer ↔ Rust consumer; use-after-release fails to compile |
@@ -62,6 +62,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-11 (iteration 19 — G5.3 PASS both legs):** Added `tests/crash_leak_test.cpp`: producer SIGKILLed mid-keepalive; survivor consumer detects death via kErrPeerDead (G5.1 machinery), performs the real-application teardown (close + unlink), and verifies the object is gone; the driver then INDEPENDENTLY re-verifies from a second process — /dev/shm clean on Linux (via the seam's fs view), name not re-openable (kErrNotFound) on both platforms. No library changes needed: NFR-R2 after a crash follows from G5.1's detection plus G1.3's unlink semantics. 21/21 ASan+TSan both legs. Next objective: **G5.4** — kill-while-holding-the-park-mutex, end-to-end through the BLOCKING API on both platforms: Linux survivor recovers via robust path while parked; macOS survivor escapes via the trylock loop + heartbeat staleness. The macOS leg needs a way for the trylock loop to give up — currently it loops forever; wire heartbeat staleness into park_until_* around the lock acquisition (the A3 'never a bare lock' completion).
 
 - **2026-06-11 (iteration 18 — G5.2 PASS, linux-only gate):** Robust-mutex hardening behind the seam: `mutex_init_pshared` adds PTHREAD_MUTEX_ROBUST on Linux; new `park_mutex_recover_if_needed` absorbs EOWNERDEAD in both `park_mutex_lock` and the timedwait re-acquisition path (App. B #3 order: repair → consistent → continue; repair is a documented NO-OP because the park mutex guards only the advisory waiting flags and bounded-timedwait condvars — all real state is single-writer outside the critical section by design). New `kHasRobustMutex` capability constant keeps platform #ifdefs out of tests. `tests/robust_mutex_test.cpp` (self-skips on macOS): scenario A — holder child SIGKILLed while owning the mutex; survivor's seam lock returns success and the mutex remains fully serviceable (lock/unlock + ETIMEDOUT timedwait); scenario B — deliberately buggy recovery (unlock without consistent) leaves the mutex ENOTRECOVERABLE, proving the permanently-dead-mutex failure mode is real and the test can fail (plan 5b debugging strategy). 20/20 ASan+TSan both legs (mac unaffected by linux-only attr). Next objective: **G5.3** — no shm leak after a crashed run on either platform once the survivor tears down.
 
