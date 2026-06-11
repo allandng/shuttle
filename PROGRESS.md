@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G4.2
+## Current objective: G4.3
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -24,7 +24,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G3.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_spsc_asym_test) | 2026-06-10 | Both directions byte-exact; fast side asserts ≥500 would-block msgs so the full-spin and empty-spin paths are PROVEN engaged, not incidental |
 | G3.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_spsc_wrap_test + _threads variant) | 2026-06-10 | 16 KiB channel, 2–6 KiB payloads: 57,822 wraps / 200k msgs two-process, byte-exact; dual-thread A2 config TSan-clean; wrap count asserted ≥ N/8 (falsifiable) |
 | G4.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_park_idle_test) | 2026-06-10 | Idle blocked consumer: 1.4 ms CPU over 2.98 s park (0.05%); 250 ms budget vs ~3 s a spin would burn. All Phase 3 stress gates re-run green over the new parking paths |
-| G4.2 | PENDING | PENDING | | | Trickle stress ≥100k messages, no lost/extra wakeups |
+| G4.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_trickle_test) | 2026-06-11 | 100k random-interval msgs; 0 reads hit the 50 ms threshold (max 7.4 ms) — no wake ever lost to the timedwait backstop; exactly N msgs, byte-exact, none extra |
 | G4.3 | PENDING | PENDING | | | µs-scale p99 wake latency; zero mutex touches when peer not parked |
 | G5.1 | PENDING | PENDING | | | SIGKILL mid-reservation → heartbeat-staleness abort (both platforms, per A3) |
 | G5.2 | N/A | PENDING | | | Linux robust mutex: EOWNERDEAD → repair → consistent → unlock |
@@ -62,6 +62,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-11 (iteration 15 — G4.2 PASS both legs):** `tests/trickle_test.cpp`: producer sends 100k small messages at random 0–80 µs intervals so the consumer parks for nearly every one. Lost-wakeup detection is sharp: the 100 ms timedwait backstop would MASK a lost wake as a ~100 ms stall, so every read is timed and >5 reads over 50 ms fails the run — actual result 0 slow reads, max wait 7.4 ms (mac). "No extras" verified: exactly N byte-exact FIFO messages then WouldBlock. Note: linux-container leg takes ~100 s (coarser usleep granularity stretches the trickle), within deadlines. 16/16 under ASan+TSan, both legs. Next objective: **G4.3** — µs-scale p99 wake latency (cross-process CLOCK_MONOTONIC timestamps in payload per minor amendment) + prove the hot path takes zero mutex acquisitions when the peer isn't parked (lock counting).
 
 - **2026-06-10 (iteration 14 — G4.1 PASS both legs):** Phase 4 parking-lot wake landed. `platform.hpp`: `park_mutex_lock` seam — macOS is a trylock loop with 100 µs sleeps (never a bare lock, per A3; heartbeat check slots in Phase 5), Linux plain lock (robust recovery slots in Phase 5b). `spsc.hpp`: blocking write/read now spin briefly (256 iterations) then park; park decision is the A4 Dekker protocol — waiter stores its waiting flag, seq_cst fence, re-checks the predicate; signaler publishes the cursor, seq_cst fence, loads the flag (the PARKING PROTOCOL comment block carries the full argument: in the seq_cst total order one of the two must see the other). Lost-wakeup guard: predicate re-checked under the park mutex before every `cond_timedwait_rel` (always deadlined, 100 ms — A3). Wakes fire from commit (not_empty), release AND the A→B handoff (not_full — the handoff frees space too). Peer-not-parked cost: one fence + one relaxed load, no mutex. try_* paths and all cursor orderings untouched; modifying the gated blocking paths IS Phase 4's planned variable (plan: "replace the busy-poll"), and all Phase 3 gates re-ran green over the new implementation. `tests/park_idle_test.cpp`: idler child self-measures rusage across a 3 s empty-channel blocking read — 1.4 ms CPU (0.05%), wake message byte-exact. 15/15 under ASan+TSan, both legs. Next objective: **G4.2** — trickle stress: one message every random interval, ≥100k messages (will take a while at true trickle pace — size intervals so the run fits ctest TIMEOUT), no lost/extra wakeups.
 
