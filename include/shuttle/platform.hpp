@@ -18,7 +18,9 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -91,6 +93,28 @@ inline int cond_timedwait_rel(pthread_cond_t* c, pthread_mutex_t* m,
     rel.tv_nsec = static_cast<long>(rel_ns % 1000000000ull);
     return pthread_cond_timedwait_relative_np(c, m, &rel);
 #endif
+}
+
+// Park-mutex acquisition (amendment A3): macOS has no robust mutexes and no
+// pthread_mutex_timedlock, so acquiring the park mutex must NEVER be a bare
+// lock — a peer that died holding it would strand us forever. The macOS
+// path is a trylock loop with a short sleep; Phase 5 adds the heartbeat
+// staleness check inside this loop, and Phase 5b adds EOWNERDEAD robust
+// recovery on the Linux path.
+inline int park_mutex_lock(pthread_mutex_t* m) noexcept {
+#if defined(SHUTTLE_PLATFORM_MACOS)
+    for (;;) {
+        const int rc = pthread_mutex_trylock(m);
+        if (rc != EBUSY) return rc;
+        usleep(100);  // Phase 5: heartbeat staleness check joins here
+    }
+#else
+    return pthread_mutex_lock(m);  // Phase 5b: robust EOWNERDEAD handling
+#endif
+}
+
+inline int park_mutex_unlock(pthread_mutex_t* m) noexcept {
+    return pthread_mutex_unlock(m);
 }
 
 // Spin-wait hint for busy-poll loops (Phase 3) — architecture divergence is

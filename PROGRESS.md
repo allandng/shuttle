@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G4.1 (Phases 0–3 complete)
+## Current objective: G4.2
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -23,7 +23,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G3.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_spsc_stress_test + shuttle_spsc_threads_test) | 2026-06-10 | Two-process 40k msgs ≈1.25 GiB byte-exact FIFO (8 s mac / 5 s linux); dual-thread same-code-path config TSan-clean both legs per A2; happens-before argument inline in spsc.hpp |
 | G3.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_spsc_asym_test) | 2026-06-10 | Both directions byte-exact; fast side asserts ≥500 would-block msgs so the full-spin and empty-spin paths are PROVEN engaged, not incidental |
 | G3.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_spsc_wrap_test + _threads variant) | 2026-06-10 | 16 KiB channel, 2–6 KiB payloads: 57,822 wraps / 200k msgs two-process, byte-exact; dual-thread A2 config TSan-clean; wrap count asserted ≥ N/8 (falsifiable) |
-| G4.1 | PENDING | PENDING | | | Idle blocked peer ~0% CPU |
+| G4.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_park_idle_test) | 2026-06-10 | Idle blocked consumer: 1.4 ms CPU over 2.98 s park (0.05%); 250 ms budget vs ~3 s a spin would burn. All Phase 3 stress gates re-run green over the new parking paths |
 | G4.2 | PENDING | PENDING | | | Trickle stress ≥100k messages, no lost/extra wakeups |
 | G4.3 | PENDING | PENDING | | | µs-scale p99 wake latency; zero mutex touches when peer not parked |
 | G5.1 | PENDING | PENDING | | | SIGKILL mid-reservation → heartbeat-staleness abort (both platforms, per A3) |
@@ -62,6 +62,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-10 (iteration 14 — G4.1 PASS both legs):** Phase 4 parking-lot wake landed. `platform.hpp`: `park_mutex_lock` seam — macOS is a trylock loop with 100 µs sleeps (never a bare lock, per A3; heartbeat check slots in Phase 5), Linux plain lock (robust recovery slots in Phase 5b). `spsc.hpp`: blocking write/read now spin briefly (256 iterations) then park; park decision is the A4 Dekker protocol — waiter stores its waiting flag, seq_cst fence, re-checks the predicate; signaler publishes the cursor, seq_cst fence, loads the flag (the PARKING PROTOCOL comment block carries the full argument: in the seq_cst total order one of the two must see the other). Lost-wakeup guard: predicate re-checked under the park mutex before every `cond_timedwait_rel` (always deadlined, 100 ms — A3). Wakes fire from commit (not_empty), release AND the A→B handoff (not_full — the handoff frees space too). Peer-not-parked cost: one fence + one relaxed load, no mutex. try_* paths and all cursor orderings untouched; modifying the gated blocking paths IS Phase 4's planned variable (plan: "replace the busy-poll"), and all Phase 3 gates re-ran green over the new implementation. `tests/park_idle_test.cpp`: idler child self-measures rusage across a 3 s empty-channel blocking read — 1.4 ms CPU (0.05%), wake message byte-exact. 15/15 under ASan+TSan, both legs. Next objective: **G4.2** — trickle stress: one message every random interval, ≥100k messages (will take a while at true trickle pace — size intervals so the run fits ctest TIMEOUT), no lost/extra wakeups.
 
 - **2026-06-10 (iteration 13 — G3.3 PASS both legs; PHASE 3 COMPLETE):** Added `tests/spsc_wrap_test.cpp`: 16 KiB channel with 2–6 KiB payloads so the early-wrap commit (P2) and consumer handoff (C2) fire every ~3 messages. Two-process: 200k msgs, 57,822 wraps, byte-exact FIFO, drained at end; producer counts its own write-cursor backward moves and FAILS below 25k wraps (falsifiable). Dual-thread A2 config (50k msgs) TSan-clean on both legs. No library changes — the spsc.hpp ordering survived the targeted hammering of its hotspot. **Phase 3 done in 3 iterations with zero ordering bugs found** — the Phase 2 property-test investment did its job; the lock-free protocol is now trusted. Next objective: **G4.1** — Phase 4 parking-lot wake: pshared mutex + condvars wired into the blocking paths (timedwait + heartbeat per A3 from day one; seq_cst parking protocol per A4), idle blocked peer at ~0% CPU. Remember: any bug from here is BY CONSTRUCTION a wake bug, not an ordering bug.
 

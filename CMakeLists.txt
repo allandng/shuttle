@@ -69,6 +69,9 @@ target_link_libraries(shuttle_spsc_asym_test PRIVATE shuttle_core Threads::Threa
 add_executable(shuttle_spsc_wrap_test tests/spsc_wrap_test.cpp)
 target_link_libraries(shuttle_spsc_wrap_test PRIVATE shuttle_core Threads::Threads)
 
+add_executable(shuttle_park_idle_test tests/park_idle_test.cpp)
+target_link_libraries(shuttle_park_idle_test PRIVATE shuttle_core Threads::Threads)
+
 add_executable(shuttle_inspect tools/inspect.cpp)
 target_link_libraries(shuttle_inspect PRIVATE shuttle_core)
 
@@ -92,7 +95,8 @@ set_tests_properties(shuttle_tests shuttle_shm_smoke shuttle_pshared_smoke
 add_test(NAME shuttle_spsc_asym_test COMMAND shuttle_spsc_asym_test)
 add_test(NAME shuttle_spsc_wrap_test COMMAND shuttle_spsc_wrap_test)
 add_test(NAME shuttle_spsc_wrap_threads_test COMMAND shuttle_spsc_wrap_test threads)
+add_test(NAME shuttle_park_idle_test COMMAND shuttle_park_idle_test)
 set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_spsc_asym_test shuttle_spsc_wrap_test
-                     shuttle_spsc_wrap_threads_test
+                     shuttle_spsc_wrap_threads_test shuttle_park_idle_test
                      PROPERTIES TIMEOUT 300)

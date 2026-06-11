@@ -48,8 +48,29 @@
 //   or available data (consumer) — failure is spurious "would block",
 //   never corruption.
 //
-// A4's seq_cst parking protocol applies to the Phase 4 waiting flags only;
-// the data-path cursors here stay release/acquire by design.
+// PARKING PROTOCOL (Phase 4, amendments A3/A4) — the park decision is a
+// Dekker-style store->load pattern with a seq_cst fence on BOTH sides:
+//
+//   waiter:  waiting.store(1)            signaler:  cursor.store(release)
+//            fence(seq_cst)                         fence(seq_cst)
+//            recheck cursors                        load waiting flag
+//
+// Claim: the waiter parking AND the signaler skipping the wake cannot both
+// happen for the same publish. In the seq_cst total order, either the
+// waiter's recheck is ordered after the signaler's cursor store (recheck
+// sees the data/space -> waiter does not park), or the signaler's flag
+// load is ordered after the waiter's flag store (signaler sees the flag ->
+// signals). Plain release/acquire permits both loads to read stale values
+// simultaneously — that is the A4 hole this fence pair closes.
+//
+// Belt-and-braces, per A3: even a lost wake cannot strand anyone, because
+// EVERY park is pthread_cond_timedwait with a bounded interval and the
+// predicate is re-checked on each timeout. (Phase 5 adds the heartbeat
+// staleness verdict at those timeouts; Phase 5b adds robust recovery.)
+//
+// The mutex guards nothing but the park/wake handshake itself; when the
+// peer is not parked the publishing side pays one fence + one relaxed
+// load — it never touches the mutex (§2.3).
 // ========================================================================
 
 #include <atomic>
@@ -66,6 +87,13 @@ inline void spin_pause(uint64_t& spins) {
     cpu_relax();
     if ((++spins & 0xFFF) == 0) yield_thread();  // be polite under oversubscription
 }
+
+// Brief adaptive spin before parking: covers the common case where the peer
+// is actively draining/filling, without measurable idle CPU.
+constexpr int kSpinBeforePark = 256;
+// A3: every park is bounded; the predicate (and, from Phase 5, heartbeat
+// staleness) is re-evaluated at least this often.
+constexpr uint64_t kParkTimeoutNs = 100ull * 1000000;  // 100 ms
 }  // namespace detail
 
 class Producer {
@@ -93,17 +121,61 @@ class Producer {
         return kOk;
     }
 
-    // Blocking (busy-poll in Phase 3) framed write.
+    // Blocking framed write: brief spin, then park on not_full (Phase 4).
     int write(const void* payload, uint64_t len) {
+        if (len > h_->max_payload) return kErrMsgTooLarge;  // fail fast, never park
         int rc;
-        uint64_t spins = 0;
-        while ((rc = try_write(payload, len)) == kErrWouldBlock) {
-            detail::spin_pause(spins);
+        for (int s = 0; s < detail::kSpinBeforePark; ++s) {
+            if ((rc = try_write(payload, len)) != kErrWouldBlock) return rc;
+            cpu_relax();
         }
-        return rc;
+        for (;;) {
+            if ((rc = try_write(payload, len)) != kErrWouldBlock) return rc;
+            park_until_space(kFrameHeader + len);
+        }
     }
 
  private:
+    // Park-decision predicate; called with seq_cst semantics established by
+    // the fence in park_until_space (A4).
+    bool can_reserve(uint64_t n) const {
+        const uint64_t w = h_->write.load(std::memory_order_relaxed);
+        const uint64_t r = h_->read.load(std::memory_order_relaxed);
+        if (w >= r) return (cap_ - w >= n) || (r > n);
+        return r - w > n;
+    }
+
+    void park_until_space(uint64_t n) {
+        // Dekker pair, waiter side (see PARKING PROTOCOL block above).
+        h_->producer_waiting.store(1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (can_reserve(n)) {
+            h_->producer_waiting.store(0, std::memory_order_relaxed);
+            return;
+        }
+        park_mutex_lock(&h_->lock);
+        // Lost-wakeup guard (App. B #7): re-check under the lock — the
+        // consumer's wake path takes this same lock, so it cannot signal
+        // between this check and the wait.
+        if (!can_reserve(n)) {
+            cond_timedwait_rel(&h_->not_full, &h_->lock,
+                               detail::kParkTimeoutNs);
+            // Phase 5: heartbeat staleness verdict on timeout goes here.
+        }
+        park_mutex_unlock(&h_->lock);
+        h_->producer_waiting.store(0, std::memory_order_relaxed);
+    }
+
+    // Signaler side of the consumer's Dekker pair; called after every
+    // commit. Peer not parked => one fence + one relaxed load, no mutex.
+    void wake_consumer_if_waiting() {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (h_->consumer_waiting.load(std::memory_order_relaxed) != 0) {
+            park_mutex_lock(&h_->lock);
+            pthread_cond_signal(&h_->not_empty);
+            park_mutex_unlock(&h_->lock);
+        }
+    }
     bool try_reserve(uint64_t n, uint64_t* off, bool* wrap) {
         // write/watermark are producer-owned: relaxed loads observe our own
         // most recent stores. read is consumer-owned: acquire pairs with C1.
@@ -144,6 +216,7 @@ class Producer {
         } else {
             h_->write.store(off + n, std::memory_order_release);  // P1
         }
+        wake_consumer_if_waiting();  // A4 signaler side
     }
 
     ChannelHeader* h_;
@@ -171,6 +244,7 @@ class Consumer {
                 // C2: A->B handoff — single owned-variable update. The freed
                 // high region [m, cap) was fully read before this store.
                 h_->read.store(0, std::memory_order_release);
+                wake_producer_if_waiting();  // handoff frees space too
                 r = 0;
                 // fall through to linear view below
             } else {
@@ -181,14 +255,17 @@ class Consumer {
         return parse(r, w - r, payload, len);
     }
 
-    // Blocking (busy-poll in Phase 3) borrow.
+    // Blocking borrow: brief spin, then park on not_empty (Phase 4).
     int read(const unsigned char** payload, uint64_t* len) {
         int rc;
-        uint64_t spins = 0;
-        while ((rc = try_read(payload, len)) == kErrWouldBlock) {
-            detail::spin_pause(spins);
+        for (int s = 0; s < detail::kSpinBeforePark; ++s) {
+            if ((rc = try_read(payload, len)) != kErrWouldBlock) return rc;
+            cpu_relax();
         }
-        return rc;
+        for (;;) {
+            if ((rc = try_read(payload, len)) != kErrWouldBlock) return rc;
+            park_until_data();
+        }
     }
 
     // C1: publish that the borrowed message's bytes are free to reuse.
@@ -196,9 +273,44 @@ class Consumer {
         const uint64_t r = h_->read.load(std::memory_order_relaxed);
         h_->read.store(r + borrowed_, std::memory_order_release);
         borrowed_ = 0;
+        wake_producer_if_waiting();  // A4 signaler side
     }
 
  private:
+    // Park-decision predicate (under the A4 fence). write != read covers the
+    // wrapped state too; a spurious wake merely retries try_read.
+    bool data_available() const {
+        return h_->write.load(std::memory_order_relaxed) !=
+               h_->read.load(std::memory_order_relaxed);
+    }
+
+    void park_until_data() {
+        // Dekker pair, waiter side (see PARKING PROTOCOL block above).
+        h_->consumer_waiting.store(1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (data_available()) {
+            h_->consumer_waiting.store(0, std::memory_order_relaxed);
+            return;
+        }
+        park_mutex_lock(&h_->lock);
+        // Lost-wakeup guard (App. B #7): re-check under the lock.
+        if (!data_available()) {
+            cond_timedwait_rel(&h_->not_empty, &h_->lock,
+                               detail::kParkTimeoutNs);
+            // Phase 5: heartbeat staleness verdict on timeout goes here.
+        }
+        park_mutex_unlock(&h_->lock);
+        h_->consumer_waiting.store(0, std::memory_order_relaxed);
+    }
+
+    void wake_producer_if_waiting() {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (h_->producer_waiting.load(std::memory_order_relaxed) != 0) {
+            park_mutex_lock(&h_->lock);
+            pthread_cond_signal(&h_->not_full);
+            park_mutex_unlock(&h_->lock);
+        }
+    }
     int parse(uint64_t at, uint64_t avail, const unsigned char** payload,
               uint64_t* len) {
         // Whole-unit reservation: a readable run always starts at a message
