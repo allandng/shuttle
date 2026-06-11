@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G6.2
+## Current objective: G6.3
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -31,7 +31,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G5.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_crash_leak_test) | 2026-06-11 | Producer SIGKILLed → survivor kErrPeerDead → close+unlink → object gone, verified from survivor AND independently from driver (/dev/shm on linux; not-openable both) |
 | G5.4 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_crash_mutex_test) | 2026-06-11 | Peer SIGKILLed holding park mutex, survivor parked in blocking API: kErrPeerDead at 2.52 s mac / 2.63 s linux; linux mutex proven recovered+serviceable after. Mac mechanism = os_sync_wait_on_address (decision below), superseding the trylock-escape design |
 | G6.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_cabi_python_test) | 2026-06-11 | 1500 msgs byte-exact, C++ producer (via frozen C ABI) → Python cffi consumer, zero-copy memoryview over borrowed ptr; stale borrow raises after release per amendment |
-| G6.2 | PENDING | PENDING | | | C++ producer ↔ Rust consumer; use-after-release fails to compile |
+| G6.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_cabi_rust_test) | 2026-06-11 | 1500 msgs byte-exact, zero-copy slice verified in place; compile_fail.rs rejected with exactly E0597 (and the valid wrapper compiles, so the failure is meaningful) |
 | G6.3 | PENDING | PENDING | | | Induced error → correct integer code in all three languages |
 | G7.1 | PENDING | PENDING | | | 50 MB ≥10× vs HTTP AND vs UDS baselines; Docker numbers labeled "virtualized — not headline"; headline NFR-P1 provisional until bare-metal Linux |
 | G7.2 | PENDING | PENDING | | | Profiler: negligible copy/serialize CPU on borrow path |
@@ -58,6 +58,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 - 2026-06-11 — **Host install: `cffi` 2.0.0 into the user site-packages of the python.org Python 3.13** (`python3 -m pip install --user cffi`) — required by the plan's cffi-over-ctypes preference for the Python binding. Container image gains `python3` + `python3-cffi` (Dockerfile).
 - 2026-06-11 — **`libshuttle_c` (the frozen C ABI shared library) is built WITHOUT sanitizers in every preset.** Foreign runtimes (python3) cannot load a sanitizer-instrumented dylib (missing runtime; macOS SIP strips DYLD_INSERT_LIBRARIES from system interpreters, so preloading is not viable). Implemented by moving sanitizer flags onto an INTERFACE target (`shuttle_san`) applied via `link_libraries()` to everything declared after it; `shuttle_c` is declared before and compiles its own copies of the sources. The logic inside is header-only/shared and remains sanitizer-verified through all other targets. NOT a sanitizer suppression — recorded as a build-topology decision.
 
+- 2026-06-11 — **Rust binding declares the C ABI by hand instead of bindgen** (ten frozen, static_asserted signatures; bindgen would drag libclang into the container for no coverage gain — any drift fails the byte-exact integration test). Container image gains `rustc` via apt (1.75; no cargo — zero-dependency single-file builds via plain rustc). Host uses existing rustup rustc 1.94. Revisit bindgen if/when the ABI grows.
+
 ## Environment verification (iteration zero, 2026-06-09; Docker re-verified 2026-06-10)
 
 | Check | Result |
@@ -68,6 +70,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-11 (iteration 22 — G6.2 PASS both legs):** Rust leg of the cross-language proof. `tests/ffi/rust/shuttle.rs`: safe wrapper — `Consumer::acquire_read(&mut self) -> Borrowed<'_>`; the payload slice is tied to the Borrowed's lifetime and Drop performs release_read, so use-after-release AND double-acquire are compile errors by construction. `consumer.rs`: verifies 1500 seeded messages in place (no to_vec — zero-copy preserved). `compile_fail.rs`: the use-after-release proof. `tests/cabi_rust_test.cpp` driver, three stages: (1) wrapper+consumer must compile (so stage 2 is meaningful), (2) compile_fail.rs must fail with exactly E0597 (wrong-reason failures rejected), (3) end-to-end C++-producer→Rust-consumer byte-exact over a live channel, rustc invoked at test time via posix_spawnp with rpath to the unsanitized libshuttle_c. Decision: hand-written extern decls over bindgen (logged above). 24/24 ASan+TSan both legs. Next objective: **G6.3** — induced error (open nonexistent segment) surfaces as the correct integer code in all three languages, no exception/panic escaping the ABI.
 
 - **2026-06-11 (iteration 21 — G6.1 PASS both legs):** Phase 6 C ABI frozen: `include/shuttle/shuttle_c.h` (SHUTTLE_ABI_VERSION 1; SRS §3.1 signatures: create/open/close/unlink, write/read copy path, acquire/commit/acquire/release borrow path, keepalive; SHUTTLE_NONBLOCK flag; error #defines static_asserted against shuttle::Err). `src/shuttle_c.cpp`: every entry point try/catch-wrapped (IF-1), lazy role inference (handle becomes producer/consumer on first use, FR-6), single shared consumer-borrow state so copy-read and acquire-read interoperate; too-small copy-read buffer leaves the message queued. Built as `libshuttle_c` SHARED, unsanitized (decision above). `tests/ffi/py_consumer.py`: cffi ABI-mode binding, blocking acquire_read borrows exposed as memoryview over ffi.buffer (no copy), per-byte verification in place, BorrowedMessage guard raises on use-after-release (minor amendment). `tests/cabi_python_test.cpp`: C++ driver produces 1500 seeded random messages THROUGH the C ABI and posix_spawnp's python3. All four legs re-run on fresh build trees (CMake topology changed): 23/23. Next objective: **G6.2** — C++ producer ↔ Rust consumer byte-exact; Rust wrapper must make use-after-release fail to compile (lifetime on the borrowed slice). Needs rustup/cargo availability check on both legs first.
 

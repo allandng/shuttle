@@ -111,6 +111,13 @@ target_compile_definitions(shuttle_cabi_python_test PRIVATE
     SHUTTLE_C_LIB="$<TARGET_FILE:shuttle_c>"
     PY_CONSUMER="${CMAKE_CURRENT_SOURCE_DIR}/tests/ffi/py_consumer.py")
 
+add_executable(shuttle_cabi_rust_test tests/cabi_rust_test.cpp)
+target_link_libraries(shuttle_cabi_rust_test PRIVATE shuttle_c shuttle_core Threads::Threads)
+target_compile_definitions(shuttle_cabi_rust_test PRIVATE
+    SHUTTLE_C_LIBDIR="$<TARGET_FILE_DIR:shuttle_c>"
+    RUST_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/ffi/rust"
+    RUST_OUT_DIR="${CMAKE_CURRENT_BINARY_DIR}")
+
 add_executable(shuttle_inspect tools/inspect.cpp)
 target_link_libraries(shuttle_inspect PRIVATE shuttle_core)
 
@@ -143,6 +150,7 @@ add_test(NAME shuttle_robust_mutex_test COMMAND shuttle_robust_mutex_test)
 add_test(NAME shuttle_crash_leak_test COMMAND shuttle_crash_leak_test)
 add_test(NAME shuttle_crash_mutex_test COMMAND shuttle_crash_mutex_test)
 add_test(NAME shuttle_cabi_python_test COMMAND shuttle_cabi_python_test)
+add_test(NAME shuttle_cabi_rust_test COMMAND shuttle_cabi_rust_test)
 set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_spsc_asym_test shuttle_spsc_wrap_test
                      shuttle_spsc_wrap_threads_test shuttle_park_idle_test
@@ -150,4 +158,5 @@ set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_park_hotpath_test shuttle_crash_heartbeat_test
                      shuttle_robust_mutex_test shuttle_crash_leak_test
                      shuttle_crash_mutex_test shuttle_cabi_python_test
+                     shuttle_cabi_rust_test
                      PROPERTIES TIMEOUT 300)
