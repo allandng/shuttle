@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G6.3
+## Current objective: G7.1 (Phases 0–6 complete)
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -32,7 +32,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G5.4 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_crash_mutex_test) | 2026-06-11 | Peer SIGKILLed holding park mutex, survivor parked in blocking API: kErrPeerDead at 2.52 s mac / 2.63 s linux; linux mutex proven recovered+serviceable after. Mac mechanism = os_sync_wait_on_address (decision below), superseding the trylock-escape design |
 | G6.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_cabi_python_test) | 2026-06-11 | 1500 msgs byte-exact, C++ producer (via frozen C ABI) → Python cffi consumer, zero-copy memoryview over borrowed ptr; stale borrow raises after release per amendment |
 | G6.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_cabi_rust_test) | 2026-06-11 | 1500 msgs byte-exact, zero-copy slice verified in place; compile_fail.rs rejected with exactly E0597 (and the valid wrapper compiles, so the failure is meaningful) |
-| G6.3 | PENDING | PENDING | | | Induced error → correct integer code in all three languages |
+| G6.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_cabi_errors_test) | 2026-06-11 | open-nonexistent → −4, bad capacity → −8, bad name → −1, unlink-missing → −4, empty nonblock read → −12, oversize write → −11; C++/Python/Rust all return ints, nothing thrown/panicked |
 | G7.1 | PENDING | PENDING | | | 50 MB ≥10× vs HTTP AND vs UDS baselines; Docker numbers labeled "virtualized — not headline"; headline NFR-P1 provisional until bare-metal Linux |
 | G7.2 | PENDING | PENDING | | | Profiler: negligible copy/serialize CPU on borrow path |
 | G7.3 | PENDING | PENDING | | | µs-scale wake latency under load, consistent with G4.3 |
@@ -70,6 +70,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-11 (iteration 23 — G6.3 PASS both legs; PHASE 6 COMPLETE):** Added `tests/cabi_errors_test.cpp` + `tests/ffi/err_probe.py` + `tests/ffi/rust/err_probe.rs`. C++ leg covers six induced errors across the code space (NOT_FOUND, CAPACITY_TOO_SMALL, INVALID_ARGS, WOULD_BLOCK, MSG_TOO_LARGE) through the C ABI; Python (cffi) and Rust (safe wrapper, compiled at test time) each verify the nonexistent-open arrives as integer −4 with clean exit — a raise/panic would exit nonzero, so clean completion IS the no-exception proof. 25/25 ASan+TSan both legs. **Phase 6 done: the ABI is frozen and proven from C++, Python, and Rust.** Next objective: **G7.1** — Phase 7 headline benchmark: 50 MB payload end-to-end latency ≥10× lower than BOTH baselines (raw-binary localhost HTTP per D7, and Unix domain socket per the minor amendment); also the 16 KB frame stream workload; warm-up + many iterations, median and p99; CLOCK_MONOTONIC timestamps in payload. Reminder: numbers measured in Docker are labeled "virtualized — not headline figures"; native macOS numbers reportable as macOS-dev figures; headline NFR-P1 claim stays provisional until bare-metal Linux. Benchmarks need an UNSANITIZED build of the bench binary (sanitizer overhead would invalidate the comparison) — plan a `bench` preset or reuse the unsanitized-target pattern from libshuttle_c.
 
 - **2026-06-11 (iteration 22 — G6.2 PASS both legs):** Rust leg of the cross-language proof. `tests/ffi/rust/shuttle.rs`: safe wrapper — `Consumer::acquire_read(&mut self) -> Borrowed<'_>`; the payload slice is tied to the Borrowed's lifetime and Drop performs release_read, so use-after-release AND double-acquire are compile errors by construction. `consumer.rs`: verifies 1500 seeded messages in place (no to_vec — zero-copy preserved). `compile_fail.rs`: the use-after-release proof. `tests/cabi_rust_test.cpp` driver, three stages: (1) wrapper+consumer must compile (so stage 2 is meaningful), (2) compile_fail.rs must fail with exactly E0597 (wrong-reason failures rejected), (3) end-to-end C++-producer→Rust-consumer byte-exact over a live channel, rustc invoked at test time via posix_spawnp with rpath to the unsanitized libshuttle_c. Decision: hand-written extern decls over bindgen (logged above). 24/24 ASan+TSan both legs. Next objective: **G6.3** — induced error (open nonexistent segment) surfaces as the correct integer code in all three languages, no exception/panic escaping the ABI.
 
