@@ -45,14 +45,49 @@ inline bool shm_name_ok(const char* name) noexcept {
     return n >= 2 && n <= kMax;
 }
 
-// Process-shared mutex init. Robust attribute (Linux) arrives in Phase 5.
+// True where PTHREAD_MUTEX_ROBUST / EOWNERDEAD semantics exist (FR-18).
+#if defined(SHUTTLE_PLATFORM_LINUX)
+constexpr bool kHasRobustMutex = true;
+#else
+constexpr bool kHasRobustMutex = false;
+#endif
+
+// Process-shared mutex init; on Linux additionally ROBUST, so a peer dying
+// while holding it hands EOWNERDEAD to the next locker instead of
+// deadlocking it (FR-18). macOS has no robust attribute — its safety net is
+// the trylock loop + heartbeat (A3).
 inline int mutex_init_pshared(pthread_mutex_t* m) noexcept {
     pthread_mutexattr_t a;
     int rc = pthread_mutexattr_init(&a);
     if (rc != 0) return rc;
     rc = pthread_mutexattr_setpshared(&a, PTHREAD_PROCESS_SHARED);
+#if defined(SHUTTLE_PLATFORM_LINUX)
+    if (rc == 0) rc = pthread_mutexattr_setrobust(&a, PTHREAD_MUTEX_ROBUST);
+#endif
     if (rc == 0) rc = pthread_mutex_init(m, &a);
     pthread_mutexattr_destroy(&a);
+    return rc;
+}
+
+// EOWNERDEAD recovery (Linux, App. B #3): we now OWN the lock the dead peer
+// held. Repair protocol — repair state, THEN pthread_mutex_consistent, THEN
+// continue/unlock; consistent-before-repair (or unlock-without-consistent)
+// makes the mutex permanently ENOTRECOVERABLE. Repair here is deliberately
+// a no-op because the park mutex guards only the park/wake handshake:
+// the waiting flags are advisory and owner-cleared (a dead peer's stale
+// flag merely causes one spurious signal), the condvars need no repair
+// (every waiter is on a bounded timedwait per A3), and all data-path state
+// is owned single-writer OUTSIDE the critical section by design (§2.3).
+inline int park_mutex_recover_if_needed(pthread_mutex_t* m, int rc) noexcept {
+#if defined(SHUTTLE_PLATFORM_LINUX)
+    if (rc == EOWNERDEAD) {
+        // (no state to repair — see comment above)
+        pthread_mutex_consistent(m);
+        return 0;  // we hold a now-consistent lock
+    }
+#else
+    (void)m;
+#endif
     return rc;
 }
 
@@ -86,7 +121,10 @@ inline int cond_timedwait_rel(pthread_cond_t* c, pthread_mutex_t* m,
         ts.tv_sec += 1;
         ts.tv_nsec -= 1000000000L;
     }
-    return pthread_cond_timedwait(c, m, &ts);
+    // Re-acquisition inside timedwait can also surface EOWNERDEAD if the
+    // peer died holding the robust mutex; recover identically.
+    return park_mutex_recover_if_needed(m,
+                                        pthread_cond_timedwait(c, m, &ts));
 #else
     timespec rel;
     rel.tv_sec = static_cast<time_t>(rel_ns / 1000000000ull);
@@ -106,10 +144,10 @@ inline int park_mutex_lock(pthread_mutex_t* m) noexcept {
     for (;;) {
         const int rc = pthread_mutex_trylock(m);
         if (rc != EBUSY) return rc;
-        usleep(100);  // Phase 5: heartbeat staleness check joins here
+        usleep(100);  // G5.4: caller-level heartbeat staleness bounds this
     }
 #else
-    return pthread_mutex_lock(m);  // Phase 5b: robust EOWNERDEAD handling
+    return park_mutex_recover_if_needed(m, pthread_mutex_lock(m));
 #endif
 }
 
