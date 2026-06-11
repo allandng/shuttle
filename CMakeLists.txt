@@ -39,6 +39,14 @@ add_library(shuttle_c SHARED src/shuttle_c.cpp src/shuttle.cpp)
 target_include_directories(shuttle_c PUBLIC include)
 target_link_libraries(shuttle_c PRIVATE Threads::Threads)
 
+# Benchmark binary (Phase 7): also UNsanitized — instrumentation overhead
+# would invalidate the transport-ratio comparison (NFR-P1). Compiled -O2
+# regardless of the default Debug build type, for the same reason.
+add_executable(shuttle_bench bench/bench_main.cpp src/shuttle.cpp)
+target_include_directories(shuttle_bench PRIVATE include)
+target_compile_options(shuttle_bench PRIVATE -O2)
+target_link_libraries(shuttle_bench PRIVATE Threads::Threads)
+
 link_libraries(shuttle_san)  # every target below is sanitizer-instrumented
 
 # Core library: must stay free of any test/bench dependency.
@@ -47,9 +55,6 @@ target_include_directories(shuttle_core PUBLIC include)
 
 add_executable(shuttle_tests tests/test_main.cpp)
 target_link_libraries(shuttle_tests PRIVATE shuttle_core)
-
-add_executable(shuttle_bench bench/bench_main.cpp)
-target_link_libraries(shuttle_bench PRIVATE shuttle_core)
 
 add_executable(shuttle_shm_smoke tests/shm_smoke.cpp)
 target_link_libraries(shuttle_shm_smoke PRIVATE shuttle_core)
@@ -161,6 +166,7 @@ add_test(NAME shuttle_crash_mutex_test COMMAND shuttle_crash_mutex_test)
 add_test(NAME shuttle_cabi_python_test COMMAND shuttle_cabi_python_test)
 add_test(NAME shuttle_cabi_rust_test COMMAND shuttle_cabi_rust_test)
 add_test(NAME shuttle_cabi_errors_test COMMAND shuttle_cabi_errors_test)
+add_test(NAME shuttle_bench_g71 COMMAND shuttle_bench)
 set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_spsc_asym_test shuttle_spsc_wrap_test
                      shuttle_spsc_wrap_threads_test shuttle_park_idle_test
@@ -169,4 +175,5 @@ set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_robust_mutex_test shuttle_crash_leak_test
                      shuttle_crash_mutex_test shuttle_cabi_python_test
                      shuttle_cabi_rust_test shuttle_cabi_errors_test
+                     shuttle_bench_g71
                      PROPERTIES TIMEOUT 300)

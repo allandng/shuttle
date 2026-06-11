@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G7.1 (Phases 0–6 complete)
+## Current objective: G7.2
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -33,7 +33,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G6.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_cabi_python_test) | 2026-06-11 | 1500 msgs byte-exact, C++ producer (via frozen C ABI) → Python cffi consumer, zero-copy memoryview over borrowed ptr; stale borrow raises after release per amendment |
 | G6.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_cabi_rust_test) | 2026-06-11 | 1500 msgs byte-exact, zero-copy slice verified in place; compile_fail.rs rejected with exactly E0597 (and the valid wrapper compiles, so the failure is meaningful) |
 | G6.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_cabi_errors_test) | 2026-06-11 | open-nonexistent → −4, bad capacity → −8, bad name → −1, unlink-missing → −4, empty nonblock read → −12, oversize write → −11; C++/Python/Rust all return ints, nothing thrown/panicked |
-| G7.1 | PENDING | PENDING | | | 50 MB ≥10× vs HTTP AND vs UDS baselines; Docker numbers labeled "virtualized — not headline"; headline NFR-P1 provisional until bare-metal Linux |
+| G7.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_bench_g71) | 2026-06-11 | 50 MB median: mac-native (dev figures) 5 µs vs UDS 9287/HTTP 8495 µs = 1857×/1699×; linux container (VIRTUALIZED — not headline) 24 µs vs 11628/13056 µs = 482×/541×. Both ≥10× (and ≥50× stretch). Headline NFR-P1 claim remains PROVISIONAL until bare-metal Linux |
 | G7.2 | PENDING | PENDING | | | Profiler: negligible copy/serialize CPU on borrow path |
 | G7.3 | PENDING | PENDING | | | µs-scale wake latency under load, consistent with G4.3 |
 
@@ -70,6 +70,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-11 (iteration 24 — G7.1 PASS both legs):** Headline benchmark landed in `bench/bench_main.cpp` (rewrote the Phase 0 stub): three transports under one driver — Shuttle borrow path, raw-binary UDS, and a hand-rolled minimal HTTP/1.1 baseline (keep-alive, Content-Length framing, TCP_NODELAY, 4 MB socket buffers — the least wasteful HTTP per D7). Producers fill the whole payload then stamp CLOCK_MONOTONIC into the head, so generation cost is identically excluded; consumers record commit→payload-held deltas; 3 warmup discarded, 20 iters, median+p99. Built UNSANITIZED at -O2 (same opt-out as libshuttle_c; sanitizer overhead would corrupt the ratios) and auto-labels container runs via /.dockerenv. Results: mac-native 50 MB median 5 µs (p99 8) vs UDS 9.29 ms / HTTP 8.50 ms → 1857×/1699×; linux-container (virtualized) 24.1 µs (p99 29.4) vs 11.6 ms / 13.1 ms → 482×/541×. 16 KB stream throughput: shuttle ≈13.6 GB/s vs UDS ≈7 GB/s vs HTTP 0.6–0.9 GB/s. NFR-P1 satisfied against BOTH baselines on both legs; headline claim provisional until bare-metal Linux (labeling per amendment). 26/26 ASan+TSan both legs. Next objective: **G7.2** — profiler evidence that the borrow path spends negligible CPU copying/serializing (NFR-P2): consumer reads producer bytes in place.
 
 - **2026-06-11 (iteration 23 — G6.3 PASS both legs; PHASE 6 COMPLETE):** Added `tests/cabi_errors_test.cpp` + `tests/ffi/err_probe.py` + `tests/ffi/rust/err_probe.rs`. C++ leg covers six induced errors across the code space (NOT_FOUND, CAPACITY_TOO_SMALL, INVALID_ARGS, WOULD_BLOCK, MSG_TOO_LARGE) through the C ABI; Python (cffi) and Rust (safe wrapper, compiled at test time) each verify the nonexistent-open arrives as integer −4 with clean exit — a raise/panic would exit nonzero, so clean completion IS the no-exception proof. 25/25 ASan+TSan both legs. **Phase 6 done: the ABI is frozen and proven from C++, Python, and Rust.** Next objective: **G7.1** — Phase 7 headline benchmark: 50 MB payload end-to-end latency ≥10× lower than BOTH baselines (raw-binary localhost HTTP per D7, and Unix domain socket per the minor amendment); also the 16 KB frame stream workload; warm-up + many iterations, median and p99; CLOCK_MONOTONIC timestamps in payload. Reminder: numbers measured in Docker are labeled "virtualized — not headline figures"; native macOS numbers reportable as macOS-dev figures; headline NFR-P1 claim stays provisional until bare-metal Linux. Benchmarks need an UNSANITIZED build of the bench binary (sanitizer overhead would invalidate the comparison) — plan a `bench` preset or reuse the unsanitized-target pattern from libshuttle_c.
 
