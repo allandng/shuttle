@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         make \
         util-linux \
+        python3 \
+        python3-cffi \
     && rm -rf /var/lib/apt/lists/*
 
 # Known issue: gcc-13 TSan is incompatible with Ubuntu 24.04's default ASLR
