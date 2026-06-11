@@ -60,6 +60,9 @@ target_link_libraries(shuttle_bipbuffer_edge_test PRIVATE shuttle_core)
 add_executable(shuttle_bipbuffer_oversize_test tests/bipbuffer_oversize_test.cpp)
 target_link_libraries(shuttle_bipbuffer_oversize_test PRIVATE shuttle_core)
 
+add_executable(shuttle_spsc_stress_test tests/spsc_stress_test.cpp)
+target_link_libraries(shuttle_spsc_stress_test PRIVATE shuttle_core Threads::Threads)
+
 add_executable(shuttle_inspect tools/inspect.cpp)
 target_link_libraries(shuttle_inspect PRIVATE shuttle_core)
 
@@ -73,8 +76,12 @@ add_test(NAME shuttle_leak_test COMMAND shuttle_leak_test)
 add_test(NAME shuttle_bipbuffer_test COMMAND shuttle_bipbuffer_test)
 add_test(NAME shuttle_bipbuffer_edge_test COMMAND shuttle_bipbuffer_edge_test)
 add_test(NAME shuttle_bipbuffer_oversize_test COMMAND shuttle_bipbuffer_oversize_test)
+add_test(NAME shuttle_spsc_stress_test COMMAND shuttle_spsc_stress_test)
+add_test(NAME shuttle_spsc_threads_test COMMAND shuttle_spsc_stress_test threads)
 set_tests_properties(shuttle_tests shuttle_shm_smoke shuttle_pshared_smoke
                      shuttle_lifecycle_test shuttle_capacity_test
                      shuttle_leak_test shuttle_bipbuffer_test
                      shuttle_bipbuffer_edge_test shuttle_bipbuffer_oversize_test
                      PROPERTIES TIMEOUT 60)
+set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
+                     PROPERTIES TIMEOUT 300)

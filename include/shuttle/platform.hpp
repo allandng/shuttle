@@ -16,6 +16,7 @@
 #endif
 
 #include <pthread.h>
+#include <sched.h>
 #include <sys/stat.h>
 
 #include <cstdint>
@@ -91,6 +92,20 @@ inline int cond_timedwait_rel(pthread_cond_t* c, pthread_mutex_t* m,
     return pthread_cond_timedwait_relative_np(c, m, &rel);
 #endif
 }
+
+// Spin-wait hint for busy-poll loops (Phase 3) — architecture divergence is
+// also confined to this seam file.
+inline void cpu_relax() noexcept {
+#if defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#elif defined(__x86_64__)
+    asm volatile("pause" ::: "memory");
+#else
+    // no hint available; plain spin
+#endif
+}
+
+inline void yield_thread() noexcept { sched_yield(); }
 
 // Filesystem view of a named shm object, for leak checks (NFR-R2).
 // Linux exposes "/name" as /dev/shm/name — returns 1 if present, 0 if not.

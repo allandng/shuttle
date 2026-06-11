@@ -22,6 +22,8 @@ enum Err : int {
     kErrCapacityTooSmall = -8,  // FR-4: capacity < max_payload + framing
     kErrInitTimeout = -9,       // opener: creator never published init
     kErrCorrupt = -10,          // NFR-S2: header fields fail validation
+    kErrMsgTooLarge = -11,      // payload > max_payload: fail fast (§2.2)
+    kErrWouldBlock = -12,       // non-blocking op cannot proceed (IF-3)
 };
 
 // Local (per-process) handle; never stored in the segment.
