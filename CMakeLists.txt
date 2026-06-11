@@ -75,6 +75,12 @@ target_link_libraries(shuttle_park_idle_test PRIVATE shuttle_core Threads::Threa
 add_executable(shuttle_trickle_test tests/trickle_test.cpp)
 target_link_libraries(shuttle_trickle_test PRIVATE shuttle_core Threads::Threads)
 
+add_executable(shuttle_park_latency_test tests/park_latency_test.cpp)
+target_link_libraries(shuttle_park_latency_test PRIVATE shuttle_core Threads::Threads)
+
+add_executable(shuttle_crash_heartbeat_test tests/crash_heartbeat_test.cpp)
+target_link_libraries(shuttle_crash_heartbeat_test PRIVATE shuttle_core Threads::Threads)
+
 add_executable(shuttle_inspect tools/inspect.cpp)
 target_link_libraries(shuttle_inspect PRIVATE shuttle_core)
 
@@ -100,8 +106,12 @@ add_test(NAME shuttle_spsc_wrap_test COMMAND shuttle_spsc_wrap_test)
 add_test(NAME shuttle_spsc_wrap_threads_test COMMAND shuttle_spsc_wrap_test threads)
 add_test(NAME shuttle_park_idle_test COMMAND shuttle_park_idle_test)
 add_test(NAME shuttle_trickle_test COMMAND shuttle_trickle_test)
+add_test(NAME shuttle_park_latency_test COMMAND shuttle_park_latency_test)
+add_test(NAME shuttle_park_hotpath_test COMMAND shuttle_park_latency_test hotpath)
+add_test(NAME shuttle_crash_heartbeat_test COMMAND shuttle_crash_heartbeat_test)
 set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_spsc_asym_test shuttle_spsc_wrap_test
                      shuttle_spsc_wrap_threads_test shuttle_park_idle_test
-                     shuttle_trickle_test
+                     shuttle_trickle_test shuttle_park_latency_test
+                     shuttle_park_hotpath_test shuttle_crash_heartbeat_test
                      PROPERTIES TIMEOUT 300)

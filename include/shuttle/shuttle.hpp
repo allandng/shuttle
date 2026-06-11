@@ -24,6 +24,7 @@ enum Err : int {
     kErrCorrupt = -10,          // NFR-S2: header fields fail validation
     kErrMsgTooLarge = -11,      // payload > max_payload: fail fast (§2.2)
     kErrWouldBlock = -12,       // non-blocking op cannot proceed (IF-3)
+    kErrPeerDead = -13,         // blocked wait aborted: peer heartbeat stale
 };
 
 // Local (per-process) handle; never stored in the segment.

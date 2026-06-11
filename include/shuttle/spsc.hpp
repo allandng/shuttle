@@ -91,22 +91,59 @@ inline void spin_pause(uint64_t& spins) {
 // Brief adaptive spin before parking: covers the common case where the peer
 // is actively draining/filling, without measurable idle CPU.
 constexpr int kSpinBeforePark = 256;
-// A3: every park is bounded; the predicate (and, from Phase 5, heartbeat
-// staleness) is re-evaluated at least this often.
+// A3: every park is bounded; the predicate and heartbeat staleness are
+// re-evaluated at least this often.
 constexpr uint64_t kParkTimeoutNs = 100ull * 1000000;  // 100 ms
+
+// HEARTBEAT LIVENESS (Phase 5, amendment A3 — primary on BOTH platforms).
+// Each side bumps its own heartbeat on every successful operation, on every
+// park iteration, and via keepalive(). A BLOCKED wait samples the peer's
+// heartbeat at each timedwait timeout; if it has not advanced within the
+// staleness threshold, the wait aborts with kErrPeerDead instead of
+// blocking forever. The threshold is process-local policy (constructor
+// parameter), NOT segment state.
+//
+// Documented limitation: a peer that is alive but makes no Shuttle calls at
+// all is indistinguishable from a dead one. Applications with sparse
+// traffic must call keepalive() periodically (or raise the threshold).
+constexpr uint64_t kDefaultStaleNs = 5ull * 1000000000ull;  // 5 s
+}  // namespace detail
+
+namespace detail {
+// Tracks whether a peer's heartbeat is advancing; process-local.
+struct StaleTracker {
+    uint64_t last_hb = 0;
+    uint64_t last_change_ns = 0;
+    bool stale(uint64_t hb_now, uint64_t threshold_ns) {
+        const uint64_t now = monotonic_ns();
+        if (last_change_ns == 0 || hb_now != last_hb) {
+            last_hb = hb_now;
+            last_change_ns = now;
+            return false;
+        }
+        return now - last_change_ns > threshold_ns;
+    }
+};
 }  // namespace detail
 
 class Producer {
  public:
-    explicit Producer(Channel* ch)
+    explicit Producer(Channel* ch,
+                      uint64_t stale_threshold_ns = detail::kDefaultStaleNs)
         : h_(ch->hdr),
           data_(static_cast<unsigned char*>(
               resolve(ch->base, ch->hdr->data_offset))),
-          cap_(ch->hdr->data_capacity) {}
+          cap_(ch->hdr->data_capacity),
+          stale_ns_(stale_threshold_ns) {}
+
+    // A3: announce liveness without transferring data. Sparse-traffic
+    // producers must call this periodically or the peer may declare us dead.
+    void keepalive() { bump_heartbeat(); }
 
     // Non-blocking framed write (copy path).
     // kOk | kErrWouldBlock | kErrMsgTooLarge (fail fast, never blocks: G2.3).
     int try_write(const void* payload, uint64_t len) {
+        if (res_active_) return kErrInvalidArgs;  // outstanding acquire owns the next span
         if (len > h_->max_payload) return kErrMsgTooLarge;
         const uint64_t n = kFrameHeader + len;
         uint64_t off = 0;
@@ -121,7 +158,8 @@ class Producer {
         return kOk;
     }
 
-    // Blocking framed write: brief spin, then park on not_full (Phase 4).
+    // Blocking framed write: brief spin, then park on not_full.
+    // kOk | kErrMsgTooLarge | kErrPeerDead (consumer heartbeat went stale).
     int write(const void* payload, uint64_t len) {
         if (len > h_->max_payload) return kErrMsgTooLarge;  // fail fast, never park
         int rc;
@@ -131,8 +169,52 @@ class Producer {
         }
         for (;;) {
             if ((rc = try_write(payload, len)) != kErrWouldBlock) return rc;
-            park_until_space(kFrameHeader + len);
+            const int prc = park_until_space(kFrameHeader + len);
+            if (prc != kOk) return prc;
         }
+    }
+
+    // Zero-copy borrow path, producer side (IF-2 / FR-10): reserve a
+    // contiguous writable span; publish nothing until commit_write. The
+    // reservation is process-local state (A1) — a producer that dies
+    // mid-reservation leaves NO shared-state inconsistency behind.
+    int try_acquire_write(void** ptr, uint64_t len) {
+        if (res_active_ || ptr == nullptr) return kErrInvalidArgs;
+        if (len > h_->max_payload) return kErrMsgTooLarge;
+        uint64_t off = 0;
+        bool wrap = false;
+        if (!try_reserve(kFrameHeader + len, &off, &wrap)) {
+            return kErrWouldBlock;
+        }
+        res_off_ = off;
+        res_len_ = len;
+        res_wrap_ = wrap;
+        res_active_ = true;
+        *ptr = data_ + off + kFrameHeader;
+        return kOk;
+    }
+
+    int acquire_write(void** ptr, uint64_t len) {
+        int rc;
+        for (;;) {
+            if ((rc = try_acquire_write(ptr, len)) != kErrWouldBlock)
+                return rc;
+            const int prc = park_until_space(kFrameHeader + len);
+            if (prc != kOk) return prc;
+        }
+    }
+
+    // Publish actual_len (<= reserved) bytes of the acquired span (FR-10).
+    int commit_write(uint64_t actual_len) {
+        if (!res_active_ || actual_len > res_len_) return kErrInvalidArgs;
+        unsigned char* dst = data_ + res_off_;
+        for (unsigned i = 0; i < 8; ++i) {
+            dst[i] =
+                static_cast<unsigned char>((actual_len >> (8 * i)) & 0xFF);
+        }
+        res_active_ = false;
+        commit(kFrameHeader + actual_len, res_off_, res_wrap_);
+        return kOk;
     }
 
  private:
@@ -145,14 +227,24 @@ class Producer {
         return r - w > n;
     }
 
-    void park_until_space(uint64_t n) {
+    // kOk after a wake/timeout (caller retries), kErrPeerDead if the
+    // consumer's heartbeat has gone stale (A3).
+    int park_until_space(uint64_t n) {
+        bump_heartbeat();  // we are alive, even while blocked
         // Dekker pair, waiter side (see PARKING PROTOCOL block above).
         h_->producer_waiting.store(1, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (can_reserve(n)) {
             h_->producer_waiting.store(0, std::memory_order_relaxed);
-            return;
+            return kOk;
         }
+        if (peer_stale_.stale(
+                h_->consumer_heartbeat.load(std::memory_order_relaxed),
+                stale_ns_)) {
+            h_->producer_waiting.store(0, std::memory_order_relaxed);
+            return kErrPeerDead;
+        }
+        ++lock_count_;
         park_mutex_lock(&h_->lock);
         // Lost-wakeup guard (App. B #7): re-check under the lock — the
         // consumer's wake path takes this same lock, so it cannot signal
@@ -160,10 +252,17 @@ class Producer {
         if (!can_reserve(n)) {
             cond_timedwait_rel(&h_->not_full, &h_->lock,
                                detail::kParkTimeoutNs);
-            // Phase 5: heartbeat staleness verdict on timeout goes here.
         }
         park_mutex_unlock(&h_->lock);
         h_->producer_waiting.store(0, std::memory_order_relaxed);
+        return kOk;  // staleness is re-evaluated on the next iteration
+    }
+
+    void bump_heartbeat() {
+        // single-writer: plain load+store, never an RMW
+        h_->producer_heartbeat.store(
+            h_->producer_heartbeat.load(std::memory_order_relaxed) + 1,
+            std::memory_order_relaxed);
     }
 
     // Signaler side of the consumer's Dekker pair; called after every
@@ -171,11 +270,20 @@ class Producer {
     void wake_consumer_if_waiting() {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (h_->consumer_waiting.load(std::memory_order_relaxed) != 0) {
+            ++lock_count_;
             park_mutex_lock(&h_->lock);
             pthread_cond_signal(&h_->not_empty);
             park_mutex_unlock(&h_->lock);
         }
     }
+
+ public:
+    // Process-local count of park-mutex acquisitions by this handle; the
+    // G4.3 hot-path proof: stays 0 while the peer never parks.
+    uint64_t locks_taken() const { return lock_count_; }
+
+ private:
+    uint64_t lock_count_ = 0;
     bool try_reserve(uint64_t n, uint64_t* off, bool* wrap) {
         // write/watermark are producer-owned: relaxed loads observe our own
         // most recent stores. read is consumer-owned: acquire pairs with C1.
@@ -217,19 +325,32 @@ class Producer {
             h_->write.store(off + n, std::memory_order_release);  // P1
         }
         wake_consumer_if_waiting();  // A4 signaler side
+        bump_heartbeat();
     }
 
     ChannelHeader* h_;
     unsigned char* data_;
     uint64_t cap_;
+    uint64_t stale_ns_;
+    detail::StaleTracker peer_stale_;
+    // Outstanding zero-copy reservation (process-local per A1).
+    uint64_t res_off_ = 0;
+    uint64_t res_len_ = 0;
+    bool res_wrap_ = false;
+    bool res_active_ = false;
 };
 
 class Consumer {
  public:
-    explicit Consumer(Channel* ch)
+    explicit Consumer(Channel* ch,
+                      uint64_t stale_threshold_ns = detail::kDefaultStaleNs)
         : h_(ch->hdr),
           data_(static_cast<unsigned char*>(
-              resolve(ch->base, ch->hdr->data_offset))) {}
+              resolve(ch->base, ch->hdr->data_offset))),
+          stale_ns_(stale_threshold_ns) {}
+
+    // A3: announce liveness without consuming data.
+    void keepalive() { bump_heartbeat(); }
 
     // Non-blocking zero-copy borrow of the next message. At most one
     // outstanding borrow; must be paired with release().
@@ -255,7 +376,8 @@ class Consumer {
         return parse(r, w - r, payload, len);
     }
 
-    // Blocking borrow: brief spin, then park on not_empty (Phase 4).
+    // Blocking borrow: brief spin, then park on not_empty.
+    // kOk | kErrCorrupt | kErrPeerDead (producer heartbeat went stale).
     int read(const unsigned char** payload, uint64_t* len) {
         int rc;
         for (int s = 0; s < detail::kSpinBeforePark; ++s) {
@@ -264,7 +386,8 @@ class Consumer {
         }
         for (;;) {
             if ((rc = try_read(payload, len)) != kErrWouldBlock) return rc;
-            park_until_data();
+            const int prc = park_until_data();
+            if (prc != kOk) return prc;
         }
     }
 
@@ -274,6 +397,7 @@ class Consumer {
         h_->read.store(r + borrowed_, std::memory_order_release);
         borrowed_ = 0;
         wake_producer_if_waiting();  // A4 signaler side
+        bump_heartbeat();
     }
 
  private:
@@ -284,33 +408,58 @@ class Consumer {
                h_->read.load(std::memory_order_relaxed);
     }
 
-    void park_until_data() {
+    // kOk after a wake/timeout (caller retries), kErrPeerDead if the
+    // producer's heartbeat has gone stale (A3).
+    int park_until_data() {
+        bump_heartbeat();  // we are alive, even while blocked
         // Dekker pair, waiter side (see PARKING PROTOCOL block above).
         h_->consumer_waiting.store(1, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (data_available()) {
             h_->consumer_waiting.store(0, std::memory_order_relaxed);
-            return;
+            return kOk;
         }
+        if (peer_stale_.stale(
+                h_->producer_heartbeat.load(std::memory_order_relaxed),
+                stale_ns_)) {
+            h_->consumer_waiting.store(0, std::memory_order_relaxed);
+            return kErrPeerDead;
+        }
+        ++lock_count_;
         park_mutex_lock(&h_->lock);
         // Lost-wakeup guard (App. B #7): re-check under the lock.
         if (!data_available()) {
             cond_timedwait_rel(&h_->not_empty, &h_->lock,
                                detail::kParkTimeoutNs);
-            // Phase 5: heartbeat staleness verdict on timeout goes here.
         }
         park_mutex_unlock(&h_->lock);
         h_->consumer_waiting.store(0, std::memory_order_relaxed);
+        return kOk;  // staleness is re-evaluated on the next iteration
+    }
+
+    void bump_heartbeat() {
+        // single-writer: plain load+store, never an RMW
+        h_->consumer_heartbeat.store(
+            h_->consumer_heartbeat.load(std::memory_order_relaxed) + 1,
+            std::memory_order_relaxed);
     }
 
     void wake_producer_if_waiting() {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (h_->producer_waiting.load(std::memory_order_relaxed) != 0) {
+            ++lock_count_;
             park_mutex_lock(&h_->lock);
             pthread_cond_signal(&h_->not_full);
             park_mutex_unlock(&h_->lock);
         }
     }
+
+ public:
+    // Process-local count of park-mutex acquisitions by this handle (G4.3).
+    uint64_t locks_taken() const { return lock_count_; }
+
+ private:
+    uint64_t lock_count_ = 0;
     int parse(uint64_t at, uint64_t avail, const unsigned char** payload,
               uint64_t* len) {
         // Whole-unit reservation: a readable run always starts at a message
@@ -332,6 +481,8 @@ class Consumer {
     ChannelHeader* h_;
     unsigned char* data_;
     uint64_t borrowed_ = 0;  // consumer-private span of the active borrow
+    uint64_t stale_ns_;
+    detail::StaleTracker peer_stale_;
 };
 
 }  // namespace shuttle
