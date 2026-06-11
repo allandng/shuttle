@@ -20,11 +20,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+
+#if defined(__APPLE__)
+#include <os/os_sync_wait_on_address.h>
+#endif
 
 namespace shuttle {
 
@@ -153,6 +158,69 @@ inline int park_mutex_lock(pthread_mutex_t* m) noexcept {
 
 inline int park_mutex_unlock(pthread_mutex_t* m) noexcept {
     return pthread_mutex_unlock(m);
+}
+
+// ---------------------------------------------------------------------
+// Cross-process park/wake on a 64-bit cursor (the Phase 4/5 slow path).
+//
+// The waiter sleeps until the watched cursor differs from `seen` or the
+// timeout elapses; the waker pokes the address after publishing. Two
+// implementations:
+//
+//   macOS: os_sync_wait_on_address (14.4+, SHARED flag for cross-process).
+//     Chosen over the pshared condvar because a condvar wait can only
+//     return by re-acquiring its mutex — a bare lock that a trylock loop
+//     cannot protect. A peer SIGKILLed inside its (tiny) critical section
+//     would strand a survivor already inside cond_timedwait forever.
+//     Wait-on-address holds NOTHING: there is no ownership to die with,
+//     and the value comparison is atomic with the sleep (no lost wakeup).
+//
+//   Linux: robust pshared mutex + condvar. The cursor==seen recheck under
+//     the lock is the lost-wakeup guard; EOWNERDEAD on either the lock or
+//     the timedwait re-acquisition is absorbed by the recovery above.
+//
+// Both paths are bounded (A3): callers re-evaluate predicates and peer
+// heartbeats at least every timeout_ns.
+// ---------------------------------------------------------------------
+inline int park_wait_cursor(std::atomic<uint64_t>* cursor, uint64_t seen,
+                            pthread_mutex_t* mu, pthread_cond_t* cv,
+                            uint64_t timeout_ns) noexcept {
+#if defined(SHUTTLE_PLATFORM_MACOS)
+    (void)mu;
+    (void)cv;
+    const int rc = os_sync_wait_on_address_with_timeout(
+        static_cast<void*>(cursor), seen, sizeof(uint64_t),
+        OS_SYNC_WAIT_ON_ADDRESS_SHARED, OS_CLOCK_MACH_ABSOLUTE_TIME,
+        timeout_ns);
+    // >=0: woken (value is the number of remaining waiters). <0: errno is
+    // ETIMEDOUT / EINTR / EAGAIN(value already changed) — all "retry".
+    return rc >= 0 ? 0 : errno;
+#else
+    int rc = park_mutex_lock(mu);
+    if (rc != 0) return rc;
+    if (cursor->load(std::memory_order_relaxed) == seen) {
+        cond_timedwait_rel(cv, mu, timeout_ns);  // EOWNERDEAD-aware
+    }
+    park_mutex_unlock(mu);
+    return 0;
+#endif
+}
+
+inline void park_wake_cursor(std::atomic<uint64_t>* cursor,
+                             pthread_mutex_t* mu, pthread_cond_t* cv) noexcept {
+#if defined(SHUTTLE_PLATFORM_MACOS)
+    (void)mu;
+    (void)cv;
+    os_sync_wake_by_address_any(static_cast<void*>(cursor), sizeof(uint64_t),
+                                OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+#else
+    // Signal under the lock so the waiter's recheck-then-wait is atomic
+    // with respect to this signal (no lost wakeup).
+    if (park_mutex_lock(mu) == 0) {
+        pthread_cond_signal(cv);
+        park_mutex_unlock(mu);
+    }
+#endif
 }
 
 // Spin-wait hint for busy-poll loops (Phase 3) — architecture divergence is

@@ -231,6 +231,9 @@ class Producer {
     // consumer's heartbeat has gone stale (A3).
     int park_until_space(uint64_t n) {
         bump_heartbeat();  // we are alive, even while blocked
+        // Snapshot the watched cursor BEFORE the predicate: if the consumer
+        // advances read after this load, park_wait_cursor returns at once.
+        const uint64_t r_seen = h_->read.load(std::memory_order_relaxed);
         // Dekker pair, waiter side (see PARKING PROTOCOL block above).
         h_->producer_waiting.store(1, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -245,15 +248,11 @@ class Producer {
             return kErrPeerDead;
         }
         ++lock_count_;
-        park_mutex_lock(&h_->lock);
-        // Lost-wakeup guard (App. B #7): re-check under the lock — the
-        // consumer's wake path takes this same lock, so it cannot signal
-        // between this check and the wait.
-        if (!can_reserve(n)) {
-            cond_timedwait_rel(&h_->not_full, &h_->lock,
-                               detail::kParkTimeoutNs);
-        }
-        park_mutex_unlock(&h_->lock);
+        // Sleep until the consumer publishes ANY progress on read (the
+        // lost-wakeup guard lives inside the seam: cursor recheck under the
+        // robust lock on Linux; value-atomic kernel wait on macOS).
+        park_wait_cursor(&h_->read, r_seen, &h_->lock, &h_->not_full,
+                         detail::kParkTimeoutNs);
         h_->producer_waiting.store(0, std::memory_order_relaxed);
         return kOk;  // staleness is re-evaluated on the next iteration
     }
@@ -271,9 +270,7 @@ class Producer {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (h_->consumer_waiting.load(std::memory_order_relaxed) != 0) {
             ++lock_count_;
-            park_mutex_lock(&h_->lock);
-            pthread_cond_signal(&h_->not_empty);
-            park_mutex_unlock(&h_->lock);
+            park_wake_cursor(&h_->write, &h_->lock, &h_->not_empty);
         }
     }
 
@@ -412,6 +409,8 @@ class Consumer {
     // producer's heartbeat has gone stale (A3).
     int park_until_data() {
         bump_heartbeat();  // we are alive, even while blocked
+        // Snapshot the watched cursor BEFORE the predicate (see producer).
+        const uint64_t w_seen = h_->write.load(std::memory_order_relaxed);
         // Dekker pair, waiter side (see PARKING PROTOCOL block above).
         h_->consumer_waiting.store(1, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -426,13 +425,9 @@ class Consumer {
             return kErrPeerDead;
         }
         ++lock_count_;
-        park_mutex_lock(&h_->lock);
-        // Lost-wakeup guard (App. B #7): re-check under the lock.
-        if (!data_available()) {
-            cond_timedwait_rel(&h_->not_empty, &h_->lock,
-                               detail::kParkTimeoutNs);
-        }
-        park_mutex_unlock(&h_->lock);
+        // Sleep until the producer publishes ANY progress on write.
+        park_wait_cursor(&h_->write, w_seen, &h_->lock, &h_->not_empty,
+                         detail::kParkTimeoutNs);
         h_->consumer_waiting.store(0, std::memory_order_relaxed);
         return kOk;  // staleness is re-evaluated on the next iteration
     }
@@ -448,9 +443,7 @@ class Consumer {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (h_->producer_waiting.load(std::memory_order_relaxed) != 0) {
             ++lock_count_;
-            park_mutex_lock(&h_->lock);
-            pthread_cond_signal(&h_->not_full);
-            park_mutex_unlock(&h_->lock);
+            park_wake_cursor(&h_->read, &h_->lock, &h_->not_full);
         }
     }
 

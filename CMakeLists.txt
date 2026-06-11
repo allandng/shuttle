@@ -87,6 +87,9 @@ target_link_libraries(shuttle_robust_mutex_test PRIVATE shuttle_core Threads::Th
 add_executable(shuttle_crash_leak_test tests/crash_leak_test.cpp)
 target_link_libraries(shuttle_crash_leak_test PRIVATE shuttle_core Threads::Threads)
 
+add_executable(shuttle_crash_mutex_test tests/crash_mutex_test.cpp)
+target_link_libraries(shuttle_crash_mutex_test PRIVATE shuttle_core Threads::Threads)
+
 add_executable(shuttle_inspect tools/inspect.cpp)
 target_link_libraries(shuttle_inspect PRIVATE shuttle_core)
 
@@ -117,10 +120,12 @@ add_test(NAME shuttle_park_hotpath_test COMMAND shuttle_park_latency_test hotpat
 add_test(NAME shuttle_crash_heartbeat_test COMMAND shuttle_crash_heartbeat_test)
 add_test(NAME shuttle_robust_mutex_test COMMAND shuttle_robust_mutex_test)
 add_test(NAME shuttle_crash_leak_test COMMAND shuttle_crash_leak_test)
+add_test(NAME shuttle_crash_mutex_test COMMAND shuttle_crash_mutex_test)
 set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_spsc_asym_test shuttle_spsc_wrap_test
                      shuttle_spsc_wrap_threads_test shuttle_park_idle_test
                      shuttle_trickle_test shuttle_park_latency_test
                      shuttle_park_hotpath_test shuttle_crash_heartbeat_test
                      shuttle_robust_mutex_test shuttle_crash_leak_test
+                     shuttle_crash_mutex_test
                      PROPERTIES TIMEOUT 300)

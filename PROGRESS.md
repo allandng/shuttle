@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G5.4
+## Current objective: G6.1 (Phases 0–5 complete)
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -29,7 +29,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G5.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_crash_heartbeat_test) | 2026-06-11 | SIGKILL mid-reservation+mid-keepalive → victim kErrPeerDead 2.08 s after park (1 s threshold); no premature verdict on live keepaliving peer; uncommitted reservation never surfaces |
 | G5.2 | N/A | PASS | `make test-linux`+`tsan-linux` (shuttle_robust_mutex_test; self-skips on mac) | 2026-06-11 | Holder SIGKILLed mid-lock: seam absorbs EOWNERDEAD (repair=documented no-op → consistent), mutex fully usable after. Buggy-recovery scenario proves ENOTRECOVERABLE is detectable (test can fail) |
 | G5.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_crash_leak_test) | 2026-06-11 | Producer SIGKILLed → survivor kErrPeerDead → close+unlink → object gone, verified from survivor AND independently from driver (/dev/shm on linux; not-openable both) |
-| G5.4 | PENDING | PENDING | | | Kill-while-holding-park-mutex: robust recovery (linux) / trylock-loop escape (mac) |
+| G5.4 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_crash_mutex_test) | 2026-06-11 | Peer SIGKILLed holding park mutex, survivor parked in blocking API: kErrPeerDead at 2.52 s mac / 2.63 s linux; linux mutex proven recovered+serviceable after. Mac mechanism = os_sync_wait_on_address (decision below), superseding the trylock-escape design |
 | G6.1 | PENDING | PENDING | | | C++ producer ↔ Python consumer, byte-exact borrow path |
 | G6.2 | PENDING | PENDING | | | C++ producer ↔ Rust consumer; use-after-release fails to compile |
 | G6.3 | PENDING | PENDING | | | Induced error → correct integer code in all three languages |
@@ -52,6 +52,9 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 
 - 2026-06-10 — **macOS rounds shm object `st_size` up to page size (16 KB on Apple Silicon).** An opener's `fstat` can legitimately see a larger size than the creator's exact `ftruncate` length. Open-time geometry validation (NFR-S2) therefore checks the mapping *covers* the claimed `data_offset + data_capacity` (`>=`), never equality. Any future code deriving capacity from `st_size` instead of the header would be wrong on macOS.
 
+- 2026-06-11 — **macOS parking switched from pshared condvar to `os_sync_wait_on_address` (14.4+, SHARED flag), per the pre-authorized fallback in the standing orders.** Reason: the trylock-loop-escape design cannot work — a survivor inside `pthread_cond_timedwait` can only return by re-acquiring the mutex, and that internal re-acquisition is a bare lock no trylock loop can protect; a peer SIGKILLed inside its tiny park/wake critical section would strand the survivor forever. Wait-on-address holds nothing (no ownership to die with) and compares the watched value atomically with the sleep (no lost wakeup). Implementation: seam functions `park_wait_cursor`/`park_wake_cursor` — waiters sleep until the peer's cursor (write for consumer, read for producer) changes from a pre-park snapshot; Linux keeps robust mutex + condvar with cursor-recheck-under-lock. Side effect: mac G4.3 wake latency re-measured over os_sync — p50 8 µs, p99 421 µs (was 39 µs via condvar; still well under the 1 ms budget; gate remains PASS on re-run).
+- 2026-06-11 — **Open flake observation (single occurrence):** the first linux ASan suite run after the os_sync rework reported shuttle_trickle_test and shuttle_park_latency_test FAILED, but the failure output was lost (LastTest.log overwritten by the verifying re-run before capture). Subsequent evidence: 11 consecutive passes (full suite re-run + direct runs + 4 dedicated repeat rounds), and the new Linux wait guard is mechanically equal-or-stronger than the old (cursor==snapshot recheck under the same lock the waker signals under). NOT suppressed — both tests remain at full strength. If either fails again on any leg: STOP, copy `build/<leg>/Testing/Temporary/LastTest.log` BEFORE any re-run, and treat as a live lost-wakeup investigation.
+
 ## Environment verification (iteration zero, 2026-06-09; Docker re-verified 2026-06-10)
 
 | Check | Result |
@@ -62,6 +65,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-11 (iteration 20 — G5.4 PASS both legs; PHASE 5 COMPLETE):** Kill-while-holding-the-park-mutex, end-to-end through the blocking API. Designing the gate exposed that the planned macOS trylock-loop escape was unsound (cond_timedwait re-acquisition is an unprotectable bare lock) — replaced macOS parking with `os_sync_wait_on_address` per the pre-authorized fallback (decision logged above; seam: park_wait_cursor/park_wake_cursor; spsc park paths now snapshot the peer cursor pre-park and sleep until it changes). `tests/crash_mutex_test.cpp`: crasher writes marker, LOCKS the park mutex, keepalives while holding it; driver SIGKILLs at ~1 s with the victim parked in read(); victim aborts kErrPeerDead at 2.52 s (mac) / 2.63 s (linux), bounded [1.5 s, 8 s]; on linux the driver then locks/unlocks the orphaned mutex through the seam, proving robust recovery left it serviceable. Full regression green over the reworked parking: 22/22 ASan+TSan both legs (one unexplained initial linux failure of trickle+latency — see flake observation in decisions; 11 consecutive passes since). Next objective: **G6.1** — Phase 6: freeze the extern "C" ABI (wrap entry points, no exceptions across the boundary, versioned header for bindgen/cffi), then C++ producer ↔ Python consumer byte-exact over the borrow path (cffi, zero-copy memoryview with release-invalidation per the minor amendment).
 
 - **2026-06-11 (iteration 19 — G5.3 PASS both legs):** Added `tests/crash_leak_test.cpp`: producer SIGKILLed mid-keepalive; survivor consumer detects death via kErrPeerDead (G5.1 machinery), performs the real-application teardown (close + unlink), and verifies the object is gone; the driver then INDEPENDENTLY re-verifies from a second process — /dev/shm clean on Linux (via the seam's fs view), name not re-openable (kErrNotFound) on both platforms. No library changes needed: NFR-R2 after a crash follows from G5.1's detection plus G1.3's unlink semantics. 21/21 ASan+TSan both legs. Next objective: **G5.4** — kill-while-holding-the-park-mutex, end-to-end through the BLOCKING API on both platforms: Linux survivor recovers via robust path while parked; macOS survivor escapes via the trylock loop + heartbeat staleness. The macOS leg needs a way for the trylock loop to give up — currently it loops forever; wire heartbeat staleness into park_until_* around the lock acquisition (the A3 'never a bare lock' completion).
 
