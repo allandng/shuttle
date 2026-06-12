@@ -54,6 +54,12 @@ target_include_directories(shuttle_nocopy_cpu_test PRIVATE include)
 target_compile_options(shuttle_nocopy_cpu_test PRIVATE -O2)
 target_link_libraries(shuttle_nocopy_cpu_test PRIVATE Threads::Threads)
 
+# G7.3 wake-under-load latency: unsanitized + -O2 (latency measurement).
+add_executable(shuttle_wake_under_load_test tests/wake_under_load_test.cpp src/shuttle.cpp)
+target_include_directories(shuttle_wake_under_load_test PRIVATE include)
+target_compile_options(shuttle_wake_under_load_test PRIVATE -O2)
+target_link_libraries(shuttle_wake_under_load_test PRIVATE Threads::Threads)
+
 link_libraries(shuttle_san)  # every target below is sanitizer-instrumented
 
 # Core library: must stay free of any test/bench dependency.
@@ -175,6 +181,7 @@ add_test(NAME shuttle_cabi_rust_test COMMAND shuttle_cabi_rust_test)
 add_test(NAME shuttle_cabi_errors_test COMMAND shuttle_cabi_errors_test)
 add_test(NAME shuttle_bench_g71 COMMAND shuttle_bench)
 add_test(NAME shuttle_nocopy_cpu_test COMMAND shuttle_nocopy_cpu_test)
+add_test(NAME shuttle_wake_under_load_test COMMAND shuttle_wake_under_load_test)
 set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_spsc_asym_test shuttle_spsc_wrap_test
                      shuttle_spsc_wrap_threads_test shuttle_park_idle_test
@@ -184,4 +191,5 @@ set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_crash_mutex_test shuttle_cabi_python_test
                      shuttle_cabi_rust_test shuttle_cabi_errors_test
                      shuttle_bench_g71 shuttle_nocopy_cpu_test
+                     shuttle_wake_under_load_test
                      PROPERTIES TIMEOUT 300)

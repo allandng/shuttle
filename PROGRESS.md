@@ -1,10 +1,48 @@
 # Shuttle Build Ledger
 
-## Current objective: G7.3
+## BUILD COMPLETE — all 27 gates PASS on every applicable leg (2026-06-11)
 
-## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
+Phases 0–7 done in 26 loop iterations over three days (2026-06-09 → 06-11),
+zero escalations, no BLOCKED.md ever written. Final suite: 28 tests green
+under ASan and TSan on macOS (native) and Linux (glibc arm64 container).
 
-Caveats: the job is **session-only** — it lives in the current Claude Code session and dies if that session exits (the scheduler declined the durable flag). It fires only while the session REPL is idle. Per hygiene rules: if expiry is within 24 h at the start of an iteration, re-register and update this line; if the driving session is gone, re-create the job; cancel it (CronDelete) when all gates are PASS.
+**Headline results** (NFR-P1/P2/P3; labeling per the binding amendments):
+- 50 MB end-to-end latency: 5 µs median native macOS (vs UDS 9.3 ms = 1857×,
+  HTTP 8.5 ms = 1699×); 24 µs in the container (482×/541×, VIRTUALIZED —
+  not headline figures). Requirement was ≥10×, stretch 50×.
+  **The headline NFR-P1 claim remains PROVISIONAL until run on bare-metal
+  Linux** — the harness is ready: `make test-linux` on any glibc box.
+- Borrow-path copy CPU: 0.03–0.08% of the UDS copy baseline for identical
+  bytes; borrowed pointers proven in-place within the consumer's mapping.
+- Wake latency: p50 3 µs / p99 4 µs under 20k-frames/s load (native);
+  59.5/221.8 µs virtualized. Parked-wake (G4.3): p50 7-8 µs.
+
+**What was built:** C++17 SPSC shared-memory channel — BipBuffer with the
+A1 read/write/watermark cursor model, lock-free release/acquire data path
+(happens-before contract written inline in spsc.hpp), seq_cst Dekker
+parking with bounded timedwaits, heartbeat liveness with kErrPeerDead
+(primary on both platforms), robust-mutex recovery on Linux,
+os_sync_wait_on_address parking on macOS (ledger decision superseding the
+trylock-escape design), frozen C ABI v1 (shuttle_c.h) with Python cffi and
+Rust bindings (zero-copy on both; Rust enforces the borrow at compile
+time), and the three-transport benchmark harness.
+
+**Remaining known items (not gate failures):**
+- Bare-metal Linux benchmark run to convert the provisional NFR-P1
+  headline into a final claim.
+- One unexplained single-occurrence linux trickle/latency suite failure on
+  2026-06-11 (output lost; 11 clean repeats since; capture instructions in
+  the decisions log stand if it ever recurs).
+- NFR-M2 (single consolidated API/layout/ordering reference doc) is an
+  S-priority SRS item not covered by any gate; the inline contracts in
+  spsc.hpp/header.hpp/shuttle_c.h are the current source of truth.
+
+## Scheduled job: CANCELLED 2026-06-11 (job 2fdb3d70) — all gates pass; the
+hourly loop is no longer registered.
+
+## Current objective: none — build complete
+
+(Job history: `2fdb3d70`, hourly at :23, created 2026-06-10, cancelled 2026-06-11 on completion.)
 
 ## Gate status
 
@@ -35,7 +73,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G6.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_cabi_errors_test) | 2026-06-11 | open-nonexistent → −4, bad capacity → −8, bad name → −1, unlink-missing → −4, empty nonblock read → −12, oversize write → −11; C++/Python/Rust all return ints, nothing thrown/panicked |
 | G7.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_bench_g71) | 2026-06-11 | 50 MB median: mac-native (dev figures) 5 µs vs UDS 9287/HTTP 8495 µs = 1857×/1699×; linux container (VIRTUALIZED — not headline) 24 µs vs 11628/13056 µs = 482×/541×. Both ≥10× (and ≥50× stretch). Headline NFR-P1 claim remains PROVISIONAL until bare-metal Linux |
 | G7.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_nocopy_cpu_test) | 2026-06-11 | Consumer CPU for 2 GB via borrow path: 0.22 ms mac / 0.42 ms linux = 0.03% / 0.08% of UDS copy baseline (700 / 506 ms); every borrowed ptr verified inside the consumer's data-region mapping (in-place proof) |
-| G7.3 | PENDING | PENDING | | | µs-scale wake latency under load, consistent with G4.3 |
+| G7.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_wake_under_load_test) | 2026-06-11 | 20k×16 KB @ ~20k frames/s: p50/p99/max = 3/4/30 µs native, 59.5/221.8/9192 µs virtualized — within the G4.3 budgets (p50<100 µs, p99<1 ms) on both legs |
 
 ## Decisions log
 
@@ -70,6 +108,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-11 (iteration 26 — G7.3 PASS both legs; ALL GATES PASS — BUILD COMPLETE):** `tests/wake_under_load_test.cpp` (unsanitized -O2): 20,000 measured 16 KB frames at ~20k frames/s offered load (~320 MB/s); consumer drains each frame in ~1 µs and parks between frames, so nearly every receipt is a genuine under-load wake. Native macOS: p50 3 µs / p99 4 µs / max 30 µs — tighter than G4.3's gently-paced 7-8 µs p50 (warm caches under sustained streaming). Container: 59.5/221.8 µs (virtualized label). Both legs within the G4.3 consistency budgets. 28/28 ASan+TSan both legs. Hourly job 2fdb3d70 cancelled per hygiene rules; final summary written at the top of this ledger. Loop terminated: all gates pass.
 
 - **2026-06-11 (iteration 25 — G7.2 PASS both legs):** NFR-P2 proven via `tests/nocopy_cpu_test.cpp` (unsanitized -O2, same opt-out as the bench): the Shuttle consumer drains 40×50 MB touching two bytes per payload while getrusage accounts its CPU — 0.22 ms total on mac (5.6 µs/msg) and 0.42 ms in the container (10.6 µs/msg) vs the UDS copy baseline's 700/506 ms for identical bytes: **0.03–0.08% of the copy baseline's CPU**, asserted ≤5% (falsifiable: any hidden memcpy in the borrow path trips it). In-place proof: every borrowed pointer asserted within the consumer's own mapping of the data region. **Incident, fully explained:** the first mac TSan suite run had 2 test timeouts (bipbuffer_test, spsc_threads_test). Evidence preserved (/tmp/g72-mac-tsan-LastTest.log): the "hung" single-threaded bipbuffer_test had actually PRINTED ITS SUCCESS OUTPUT before being killed, and host load was 100–156 — an Xcode + iOS 26.5 simulator-runtime install/first-boot was running concurrently on this Mac (CoreSimulator/diskimagesiod processes timestamped exactly to the window). No orphaned test processes found. After load settled (<8), clean re-run: 27/27 with normal timings (10.2 s / 6.8 s). Exogenous host contention, not a product or test bug; no gate weakened. Next objective: **G7.3** — µs-scale wake latency under load, consistent with G4.3 (the final gate).
 
