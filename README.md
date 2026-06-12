@@ -1,5 +1,7 @@
 # Shuttle
 
+[![CI](https://github.com/allandng/shuttle/actions/workflows/ci.yml/badge.svg)](https://github.com/allandng/shuttle/actions/workflows/ci.yml)
+
 **A zero-copy shared-memory IPC framework for local AI workloads.** C++17 core, lock-free SPSC data path, crash-resilient, with a frozen C ABI driven from Python and Rust.
 
 In a loom, the shuttle carries the thread back and forth across the warp. Here it carries 50 MB tensors between processes in microseconds.

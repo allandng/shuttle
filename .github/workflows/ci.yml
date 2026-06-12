@@ -1,0 +1,54 @@
+# Linux CI: builds and runs the correctness suite natively on glibc x86_64
+# runners, under ASan/UBSan and TSan.
+#
+# Performance-MEASUREMENT tests are excluded here (-E filter below): they
+# assert latency percentiles / CPU ratios that are only meaningful on
+# controlled hardware, and shared CI runners produce arbitrary numbers.
+# Those gates were verified on the project's two-platform harness (see
+# PROGRESS.md); CI guards correctness, lifecycle, crash recovery, the
+# lock-free protocol, and the cross-language FFI.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PERF_TESTS: "bench_g71|park_latency|wake_under_load|nocopy_cpu|trickle"
+
+jobs:
+  linux-asan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ cmake python3-cffi rustc
+      - name: Configure + build (ASan/UBSan)
+        run: |
+          cmake -B build/ci-asan -DSHUTTLE_SAN=asan
+          cmake --build build/ci-asan -j
+      - name: Test
+        run: ctest --test-dir build/ci-asan --output-on-failure -E "$PERF_TESTS"
+
+  linux-tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ cmake python3-cffi rustc
+      - name: Lower ASLR entropy for gcc TSan
+        # gcc-13 TSan is incompatible with mmap_rnd_bits=32 (the runner
+        # default): "unexpected memory mapping" at startup. Documented
+        # workaround, same one the local harness applies via setarch -R.
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Configure + build (TSan)
+        run: |
+          cmake -B build/ci-tsan -DSHUTTLE_SAN=tsan
+          cmake --build build/ci-tsan -j
+      - name: Test
+        run: ctest --test-dir build/ci-tsan --output-on-failure -E "$PERF_TESTS"
