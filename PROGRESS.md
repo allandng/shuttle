@@ -1,6 +1,6 @@
 # Shuttle Build Ledger
 
-## Current objective: G7.2
+## Current objective: G7.3
 
 ## Scheduled job: id `2fdb3d70`, hourly at :23 (cron `23 * * * *`), created 2026-06-10, auto-expires 2026-06-17 (~13:45 ET)
 
@@ -34,7 +34,7 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | G6.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_cabi_rust_test) | 2026-06-11 | 1500 msgs byte-exact, zero-copy slice verified in place; compile_fail.rs rejected with exactly E0597 (and the valid wrapper compiles, so the failure is meaningful) |
 | G6.3 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_cabi_errors_test) | 2026-06-11 | open-nonexistent → −4, bad capacity → −8, bad name → −1, unlink-missing → −4, empty nonblock read → −12, oversize write → −11; C++/Python/Rust all return ints, nothing thrown/panicked |
 | G7.1 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_bench_g71) | 2026-06-11 | 50 MB median: mac-native (dev figures) 5 µs vs UDS 9287/HTTP 8495 µs = 1857×/1699×; linux container (VIRTUALIZED — not headline) 24 µs vs 11628/13056 µs = 482×/541×. Both ≥10× (and ≥50× stretch). Headline NFR-P1 claim remains PROVISIONAL until bare-metal Linux |
-| G7.2 | PENDING | PENDING | | | Profiler: negligible copy/serialize CPU on borrow path |
+| G7.2 | PASS | PASS | `make test-mac`+`tsan-mac` / `make test-linux`+`tsan-linux` (shuttle_nocopy_cpu_test) | 2026-06-11 | Consumer CPU for 2 GB via borrow path: 0.22 ms mac / 0.42 ms linux = 0.03% / 0.08% of UDS copy baseline (700 / 506 ms); every borrowed ptr verified inside the consumer's data-region mapping (in-place proof) |
 | G7.3 | PENDING | PENDING | | | µs-scale wake latency under load, consistent with G4.3 |
 
 ## Decisions log
@@ -70,6 +70,8 @@ Caveats: the job is **session-only** — it lives in the current Claude Code ses
 | glibc arm64 base image pull | OK (2026-06-10) — `ubuntu:24.04` pulls and runs natively: `uname -m` = aarch64, glibc 2.39 |
 
 ## Session notes (newest first)
+
+- **2026-06-11 (iteration 25 — G7.2 PASS both legs):** NFR-P2 proven via `tests/nocopy_cpu_test.cpp` (unsanitized -O2, same opt-out as the bench): the Shuttle consumer drains 40×50 MB touching two bytes per payload while getrusage accounts its CPU — 0.22 ms total on mac (5.6 µs/msg) and 0.42 ms in the container (10.6 µs/msg) vs the UDS copy baseline's 700/506 ms for identical bytes: **0.03–0.08% of the copy baseline's CPU**, asserted ≤5% (falsifiable: any hidden memcpy in the borrow path trips it). In-place proof: every borrowed pointer asserted within the consumer's own mapping of the data region. **Incident, fully explained:** the first mac TSan suite run had 2 test timeouts (bipbuffer_test, spsc_threads_test). Evidence preserved (/tmp/g72-mac-tsan-LastTest.log): the "hung" single-threaded bipbuffer_test had actually PRINTED ITS SUCCESS OUTPUT before being killed, and host load was 100–156 — an Xcode + iOS 26.5 simulator-runtime install/first-boot was running concurrently on this Mac (CoreSimulator/diskimagesiod processes timestamped exactly to the window). No orphaned test processes found. After load settled (<8), clean re-run: 27/27 with normal timings (10.2 s / 6.8 s). Exogenous host contention, not a product or test bug; no gate weakened. Next objective: **G7.3** — µs-scale wake latency under load, consistent with G4.3 (the final gate).
 
 - **2026-06-11 (iteration 24 — G7.1 PASS both legs):** Headline benchmark landed in `bench/bench_main.cpp` (rewrote the Phase 0 stub): three transports under one driver — Shuttle borrow path, raw-binary UDS, and a hand-rolled minimal HTTP/1.1 baseline (keep-alive, Content-Length framing, TCP_NODELAY, 4 MB socket buffers — the least wasteful HTTP per D7). Producers fill the whole payload then stamp CLOCK_MONOTONIC into the head, so generation cost is identically excluded; consumers record commit→payload-held deltas; 3 warmup discarded, 20 iters, median+p99. Built UNSANITIZED at -O2 (same opt-out as libshuttle_c; sanitizer overhead would corrupt the ratios) and auto-labels container runs via /.dockerenv. Results: mac-native 50 MB median 5 µs (p99 8) vs UDS 9.29 ms / HTTP 8.50 ms → 1857×/1699×; linux-container (virtualized) 24.1 µs (p99 29.4) vs 11.6 ms / 13.1 ms → 482×/541×. 16 KB stream throughput: shuttle ≈13.6 GB/s vs UDS ≈7 GB/s vs HTTP 0.6–0.9 GB/s. NFR-P1 satisfied against BOTH baselines on both legs; headline claim provisional until bare-metal Linux (labeling per amendment). 26/26 ASan+TSan both legs. Next objective: **G7.2** — profiler evidence that the borrow path spends negligible CPU copying/serializing (NFR-P2): consumer reads producer bytes in place.
 
