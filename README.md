@@ -36,7 +36,17 @@ Shuttle replaces that path for same-host communication: one region of physical R
 
 ## Quick start
 
-Requirements: macOS (Apple silicon) with Xcode CLT + CMake, and Docker Desktop for the Linux leg. The FFI tests additionally use `python3` + `cffi` and `rustc` (both preinstalled in the provided container image).
+The production target is Linux, and that path needs nothing exotic: a C++17 compiler, CMake (>= 3.25), and the standard build tools. Build and run the full correctness suite under AddressSanitizer/UBSan:
+
+```sh
+cmake -B build -DSHUTTLE_SAN=asan
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+This is the path CI proves on `ubuntu-24.04` (g++, cmake). The cross-language FFI tests additionally need `python3` + `cffi` and `rustc`. Swap `-DSHUTTLE_SAN=asan` for `-DSHUTTLE_SAN=tsan` to get the ThreadSanitizer build — a separate tree, since ASan and TSan cannot be linked into the same binary. A handful of tests measure latency percentiles and CPU ratios and are only meaningful on quiet, controlled hardware; CI excludes them on shared runners with `ctest -E "bench_g71|park_latency|wake_under_load|nocopy_cpu|trickle"`, and you should too on a busy machine.
+
+The project also ships a two-platform harness driven by `make`, which builds and runs the same suite natively on macOS (Apple silicon) *and* inside a glibc Linux container under both sanitizers:
 
 ```sh
 make test-mac     # native build + full test suite under ASan/UBSan
@@ -66,13 +76,42 @@ run_inference(p, len);                              /* read in place */
 shuttle_release_read(ch);
 ```
 
+Full function-by-function reference: [docs/API.md](docs/API.md).
+
 The benchmark harness (`shuttle_bench`, built unsanitized at `-O2`) runs all three transports over identical workloads and prints the table above, labeling container runs as virtualized.
+
+## Using Shuttle in your project
+
+Shuttle is dependency-free (no third-party libraries), so consuming it is deliberately plain. Point a CMake project at this tree with `add_subdirectory` (or `FetchContent`) and link one of two targets:
+
+- **`shuttle_c`** — the shared library exposing the frozen C ABI (`shuttle/shuttle_c.h`). This is the boundary the Python and Rust bindings link against.
+- **`shuttle_core`** — the static library for the C++ API (headers under `include/shuttle/`).
+
+Both targets declare their headers as `PUBLIC` include directories, so a linking consumer inherits the `include/` path automatically — no manual `target_include_directories` needed:
+
+```cmake
+cmake_minimum_required(VERSION 3.25)
+project(my_app LANGUAGES C CXX)
+
+add_subdirectory(path/to/shuttle shuttle_build)
+
+add_executable(my_app main.c)
+target_link_libraries(my_app PRIVATE shuttle_c)   # or shuttle_core for the C++ API
+```
+
+```c
+#include <shuttle/shuttle_c.h>   /* resolved via the inherited include path */
+```
+
+Because the library has no external dependencies, vendoring `include/` + `src/` straight into your own build is an equally legitimate option; if you go that route (or build without CMake), add `-Iinclude` and compile `src/shuttle.cpp` (plus `src/shuttle_c.cpp` for the C ABI) yourself.
+
+For opt-in transparent huge pages on the segment, create the channel with `shuttle_create_ex(name, cap, maxp, SHUTTLE_CREATE_HUGEPAGES, &err)` — an additive C ABI v1.1 symbol (advisory `madvise` on Linux, no-op elsewhere); see [docs/API.md](docs/API.md).
 
 ## Verification
 
-The build was driven gate-by-gate through an 8-phase plan ([docs/Shuttle_Implementation_Plan.md](docs/Shuttle_Implementation_Plan.md)) with one rule: **one new variable per phase** — data-structure logic proven before concurrency, concurrency before IPC, ordering before wake mechanics, wake before crash recovery. All 27 gates passed on both platforms; the complete ledger with per-gate evidence, dated decisions, and the failures encountered along the way is in [PROGRESS.md](PROGRESS.md).
+The build was driven gate-by-gate with one rule: **one new variable per phase** — data-structure logic proven before concurrency, concurrency before IPC, ordering before wake mechanics, wake before crash recovery. The test suite is the standing evidence, and it stands alone.
 
-Highlights of what the suite (28 tests, ASan + TSan clean on both legs) actually proves:
+Highlights of what the suite (29 tests, ASan + TSan clean on both legs) actually proves:
 
 - 200k-pair randomized property test of the BipBuffer with invariants checked after every operation (19k+ wraps in the tight configuration).
 - ≥1 GiB two-process byte-exact FIFO stress; asymmetric-speed stress with the spin paths *proven engaged*; a wrap-heavy stress that fires the delicate A→B handoff 57k times.
@@ -89,7 +128,7 @@ Highlights of what the suite (28 tests, ASan + TSan clean on both legs) actually
 
 ## Scope (v1.0)
 
-Same-host, single-producer/single-consumer, one-way channels. Cross-machine transport, Windows, MPMC/pub-sub, and payload schemas are explicitly out of scope (see [docs/Shuttle_SRS.md](docs/Shuttle_SRS.md)). macOS crash recovery is best-effort by design (no robust mutexes exist there); Linux is the hard-guarantee platform.
+Same-host, single-producer/single-consumer, one-way channels. Cross-machine transport, Windows, MPMC/pub-sub, and payload schemas are explicitly out of scope. macOS crash recovery is best-effort by design (no robust mutexes exist there); Linux is the hard-guarantee platform. Proposed directions past v1 — and why each stays out of it — are triaged in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Repository layout
 
@@ -98,8 +137,7 @@ include/shuttle/   header.hpp (segment layout), bipbuffer.hpp (core logic),
                    spsc.hpp (lock-free path + parking), platform.hpp (the ONLY
                    file allowed to #ifdef on platform), shuttle_c.h (C ABI v1)
 src/               lifecycle (shm_open/mmap/validate) + C ABI implementation
-tests/             28 gate tests; tests/ffi/ holds the Python + Rust bindings
+tests/             29 gate tests; tests/ffi/ holds the Python + Rust bindings
 bench/             three-transport benchmark harness
-docs/              SRS, implementation plan, build directive
-PROGRESS.md        the complete build ledger: every gate, decision, and dead end
+docs/              API.md (frozen C ABI reference), ROADMAP.md (post-v1 triage)
 ```
