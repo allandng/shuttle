@@ -1,0 +1,25 @@
+# Publish a GitHub Release when a version tag (v*) is pushed. The annotated
+# tag's message becomes the release notes (--notes-from-tag), so notes are
+# curated at tag time and live in git history, not in this file.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub release from tag annotation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "Shuttle $GITHUB_REF_NAME" \
+            --notes-from-tag
