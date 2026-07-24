@@ -4,9 +4,9 @@
 # Performance-MEASUREMENT tests are excluded here (-E filter below): they
 # assert latency percentiles / CPU ratios that are only meaningful on
 # controlled hardware, and shared CI runners produce arbitrary numbers.
-# Those gates were verified on the project's two-platform harness (see
-# PROGRESS.md); CI guards correctness, lifecycle, crash recovery, the
-# lock-free protocol, and the cross-language FFI.
+# Those gates were verified on the project's two-platform harness; CI guards
+# correctness, lifecycle, crash recovery, the lock-free protocol, and the
+# cross-language FFI.
 name: CI
 
 on:
