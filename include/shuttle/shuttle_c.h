@@ -8,12 +8,17 @@
  * copy-read returns the non-negative payload length on success).
  *
  * Changing any signature, constant, or semantic here is an ABI break and
- * requires bumping SHUTTLE_ABI_VERSION.
+ * requires bumping SHUTTLE_ABI_VERSION. The v1 surface (the 10 functions
+ * below shuttle_create..shuttle_keepalive) is FROZEN and unchanged; the
+ * v1.1 additions (shuttle_create_ex + SHUTTLE_CREATE_* below) are strictly
+ * additive — new symbols only, no existing signature or semantic touched —
+ * so SHUTTLE_ABI_VERSION stays 1 (old binaries keep linking and running).
  */
 #ifndef SHUTTLE_C_H
 #define SHUTTLE_C_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,15 +42,29 @@ extern "C" {
 #define SHUTTLE_ERR_WOULD_BLOCK (-12)
 #define SHUTTLE_ERR_PEER_DEAD (-13)
 
-/* Flags (IF-3): blocking is the default; OR in SHUTTLE_NONBLOCK for
- * try-semantics ("would block" instead of parking). */
+/* Per-op flags (IF-3): blocking is the default; OR in SHUTTLE_NONBLOCK for
+ * try-semantics ("would block" instead of parking). Passed to the read/write
+ * entry points. */
 #define SHUTTLE_NONBLOCK 0x1
+
+/* Create-flags (v1.1): a SEPARATE namespace from the per-op flags above —
+ * these are passed only to shuttle_create_ex's create_flags word, never to
+ * read/write. Opt-in and additive; unknown bits are masked off by the
+ * implementation. SHUTTLE_CREATE_HUGEPAGES advises transparent huge pages on
+ * the segment (advisory; effective only where the kernel THP policy permits). */
+#define SHUTTLE_CREATE_HUGEPAGES 0x1
 
 typedef struct shuttle_channel shuttle_channel;
 
 /* --- lifecycle (FR-1..FR-5) --- */
 shuttle_channel* shuttle_create(const char* name, size_t capacity_bytes,
                                 size_t max_payload_bytes, int* err);
+/* v1.1 additive extension: as shuttle_create, plus a create_flags word
+ * (SHUTTLE_CREATE_* bits). shuttle_create(name, cap, maxp, err) is exactly
+ * shuttle_create_ex(name, cap, maxp, 0, err). */
+shuttle_channel* shuttle_create_ex(const char* name, size_t capacity_bytes,
+                                   size_t max_payload_bytes,
+                                   uint32_t create_flags, int* err);
 shuttle_channel* shuttle_open(const char* name, int* err);
 void shuttle_close(shuttle_channel* ch);
 int shuttle_unlink(const char* name);

@@ -25,6 +25,9 @@ static_assert(SHUTTLE_ERR_CORRUPT == shuttle::kErrCorrupt);
 static_assert(SHUTTLE_ERR_MSG_TOO_LARGE == shuttle::kErrMsgTooLarge);
 static_assert(SHUTTLE_ERR_WOULD_BLOCK == shuttle::kErrWouldBlock);
 static_assert(SHUTTLE_ERR_PEER_DEAD == shuttle::kErrPeerDead);
+// Create-flag bits are a separate namespace from the per-op flags, but the C
+// value must still track the C++ header bit exactly.
+static_assert(SHUTTLE_CREATE_HUGEPAGES == shuttle::kFlagHugePages);
 
 struct shuttle_channel {
     shuttle::Channel* ch = nullptr;
@@ -71,12 +74,14 @@ int ensure_borrow(shuttle_channel* h, int flags) {
 
 extern "C" {
 
-shuttle_channel* shuttle_create(const char* name, size_t capacity_bytes,
-                                size_t max_payload_bytes, int* err) {
+shuttle_channel* shuttle_create_ex(const char* name, size_t capacity_bytes,
+                                   size_t max_payload_bytes,
+                                   uint32_t create_flags, int* err) {
     try {
         int e = 0;
-        shuttle::Channel* ch =
-            shuttle::create(name, capacity_bytes, max_payload_bytes, &e);
+        shuttle::Channel* ch = shuttle::create(name, capacity_bytes,
+                                               max_payload_bytes, &e,
+                                               create_flags);
         set_err(err, e);
         if (ch == nullptr) return nullptr;
         return new shuttle_channel{ch, nullptr, nullptr, nullptr, 0, false};
@@ -84,6 +89,13 @@ shuttle_channel* shuttle_create(const char* name, size_t capacity_bytes,
         set_err(err, SHUTTLE_ERR_SYS);
         return nullptr;
     }
+}
+
+// Frozen v1 signature: unchanged behavior, now the create_flags=0 case of the
+// additive v1.1 entry point.
+shuttle_channel* shuttle_create(const char* name, size_t capacity_bytes,
+                                size_t max_payload_bytes, int* err) {
+    return shuttle_create_ex(name, capacity_bytes, max_payload_bytes, 0, err);
 }
 
 shuttle_channel* shuttle_open(const char* name, int* err) {

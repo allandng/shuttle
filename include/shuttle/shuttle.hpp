@@ -36,8 +36,10 @@ struct Channel {
 
 // FR-1: shm_open(O_CREAT|O_EXCL) + one-shot ftruncate + mmap + header init,
 // publishing init last with a release store. Owner-only permissions (NFR-S1).
+// create_flags carries opt-in create-time bits (kFlagHugePages); unknown bits
+// are masked off. Defaulted for source-compatibility with pre-flags callers.
 Channel* create(const char* name, size_t capacity_bytes,
-                size_t max_payload_bytes, int* err);
+                size_t max_payload_bytes, int* err, uint32_t create_flags = 0);
 
 // FR-2/FR-3: attach without re-init; waits for init publication, then
 // validates magic, version, and header sanity (NFR-S2).
