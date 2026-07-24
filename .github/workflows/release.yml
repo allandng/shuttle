@@ -1,11 +1,21 @@
-# Publish a GitHub Release when a version tag (v*) is pushed. The annotated
-# tag's message becomes the release notes (--notes-from-tag), so notes are
-# curated at tag time and live in git history, not in this file.
+# Publish a GitHub Release. Two triggers:
+#   - push of a version tag (v*): the annotated tag's message becomes the
+#     release notes (--notes-from-tag), curated at tag time.
+#   - workflow_dispatch with a tag input: creates the tag at the dispatched
+#     ref and publishes the release, taking notes from
+#     .github/releases/<tag>.md when that file exists (falling back to
+#     GitHub's generated notes). This path exists for environments that can
+#     push branches but not tags.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (created at the dispatched ref if it does not exist)"
+        required: true
 
 permissions:
   contents: write
@@ -15,11 +25,22 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Create GitHub release from tag annotation
+      - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --verify-tag \
-            --title "Shuttle $GITHUB_REF_NAME" \
-            --notes-from-tag
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            NOTES=".github/releases/${INPUT_TAG}.md"
+            if [ -f "$NOTES" ]; then
+              gh release create "$INPUT_TAG" --target "$GITHUB_SHA" \
+                --title "Shuttle $INPUT_TAG" --notes-file "$NOTES"
+            else
+              gh release create "$INPUT_TAG" --target "$GITHUB_SHA" \
+                --title "Shuttle $INPUT_TAG" --generate-notes
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag \
+              --title "Shuttle $GITHUB_REF_NAME" --notes-from-tag
+          fi
