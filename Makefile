@@ -8,8 +8,8 @@
 # segments implied by 50 MB payloads + the SRS 2x capacity rule; ftruncate/
 # mmap would fail with a confusing ENOSPC/EINVAL.
 #
-# setarch -R on linux TSan runs: gcc-13 TSan vs Ubuntu 24.04 ASLR entropy
-# workaround (documented in PROGRESS.md; pre-approved, not a suppression).
+# setarch -R on linux TSan runs: gcc-13 TSan is incompatible with Ubuntu
+# 24.04's default ASLR entropy, so the TSan leg runs under setarch -R.
 # setarch needs personality(2), which Docker's default seccomp profile blocks
 # (ADDR_NO_RANDOMIZE arg is not on the allowlist), so the TSan leg runs with
 # seccomp=unconfined. Dev harness running our own code only.
