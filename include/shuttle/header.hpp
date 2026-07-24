@@ -22,6 +22,13 @@ constexpr uint32_t kVersion = 1;
 // init_state values: 0 (zero-filled segment) = uninitialized.
 constexpr uint32_t kInitReady = 0x52454459;  // "REDY"
 
+// Create-flag bits for ChannelHeader::flags. Contract: the creator writes the
+// full flags word ONCE, in the cold identity block, before the release-store
+// that publishes init_state; it is immutable thereafter. Openers must IGNORE
+// unknown bits — flags is an additive extension point, so new bits carry no
+// kVersion bump (an old opener simply doesn't act on a bit it doesn't know).
+constexpr uint32_t kFlagHugePages = 0x1;  // creator advised MADV_HUGEPAGE
+
 // Hot atomics get a full line each. 128 B = Apple Silicon line size; also
 // correct (2x conservative) on x86 (binding minor amendment).
 constexpr size_t kCacheLine = 128;

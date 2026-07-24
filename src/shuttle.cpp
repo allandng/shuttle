@@ -24,7 +24,7 @@ constexpr uint64_t kInitWaitNs = 5ull * 1000000000ull;
 }  // namespace
 
 Channel* create(const char* name, size_t capacity_bytes,
-                size_t max_payload_bytes, int* err) {
+                size_t max_payload_bytes, int* err, uint32_t create_flags) {
     if (name == nullptr || name[0] != '/' || capacity_bytes == 0 ||
         max_payload_bytes == 0) {
         set_err(err, kErrInvalidArgs);
@@ -64,12 +64,20 @@ Channel* create(const char* name, size_t capacity_bytes,
         return nullptr;
     }
 
+    // Opt-in THP: advise the fresh mapping before it is touched. Advisory and
+    // masked to known bits — an unknown flag must never be persisted (openers
+    // trust that flags carries only bits they may act on).
+    const uint32_t flags = create_flags & kFlagHugePages;
+    if (flags & kFlagHugePages) advise_huge_pages(base, map_len);
+
     // ftruncate zero-fills, so init_state is already 0 (uninitialized) and
-    // cursors/flags/heartbeats are already 0; set the rest explicitly.
+    // cursors/heartbeats are already 0; set the rest explicitly. flags is part
+    // of the cold identity block: written once here, before the init_state
+    // release-store publish, and immutable after (single-init contract).
     auto* h = static_cast<ChannelHeader*>(base);
     h->magic = kMagic;
     h->version = kVersion;
-    h->flags = 0;
+    h->flags = flags;
     h->data_offset = kDataOffset;
     h->data_capacity = capacity_bytes;
     h->max_payload = max_payload_bytes;
@@ -148,6 +156,11 @@ Channel* open(const char* name, int* err) {
         set_err(err, kErrCorrupt);
         return nullptr;
     }
+
+    // The opener's mapping is independent of the creator's; if the creator
+    // opted into huge pages, advise this mapping too (advisory, ignores
+    // unknown bits per the flags contract). Only after the header is trusted.
+    if (h->flags & kFlagHugePages) advise_huge_pages(base, map_len);
 
     set_err(err, kOk);
     return new Channel{base, map_len, h};

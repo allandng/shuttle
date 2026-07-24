@@ -17,6 +17,7 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -48,6 +49,22 @@ inline bool shm_name_ok(const char* name) noexcept {
 #endif
     const size_t n = std::strlen(name);
     return n >= 2 && n <= kMax;
+}
+
+// Advise the kernel that a mapping is a good candidate for transparent huge
+// pages (opt-in, FR create-flag kFlagHugePages). Purely advisory: on Linux it
+// takes effect only where the THP shmem policy permits — e.g.
+// /sys/kernel/mm/transparent_hugepage/shmem_enabled set to "advise" or
+// "always" — and a kernel that disallows it returns a harmless EINVAL we
+// deliberately drop. Never a correctness dependency; a no-op on macOS, which
+// has no THP knob. Both creator and opener call this on their own mapping.
+inline void advise_huge_pages(void* base, size_t len) noexcept {
+#if defined(SHUTTLE_PLATFORM_LINUX)
+    (void)madvise(base, len, MADV_HUGEPAGE);  // result ignored by design
+#else
+    (void)base;
+    (void)len;
+#endif
 }
 
 // True where PTHREAD_MUTEX_ROBUST / EOWNERDEAD semantics exist (FR-18).
