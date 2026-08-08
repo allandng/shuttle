@@ -281,6 +281,89 @@ impl Channel {
         Ok(Channel { ch })
     }
 
+    /// Create a channel whose segment is a **file** at `path` (v1.4).
+    ///
+    /// The bytes live in an ordinary file instead of a POSIX shm object, so
+    /// `capacity` is bounded by the filesystem rather than by RAM (or by
+    /// `/dev/shm`) and the OS page cache decides which pages stay resident.
+    /// Nothing else about the channel changes: same framing, same header, same
+    /// crash story — on Linux a peer that dies holding the park mutex still
+    /// hands the survivor `EOWNERDEAD`, which the library recovers from, and the
+    /// heartbeat still bounds every blocking wait.
+    ///
+    /// `path` must be **absolute**. A relative or empty path is
+    /// [`Error::InvalidArgs`], because a channel's identity must not depend on
+    /// which directory each peer was started in. There is no shm-style
+    /// name-length limit; the filesystem's own limit arrives as
+    /// [`Error::NameTooLong`].
+    ///
+    /// Durability is an explicit **non-goal**: the library never calls `msync`.
+    /// The file is a transport medium, not a database.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgs`], [`Error::CapacityTooSmall`], [`Error::Exists`]
+    /// (the file is already there — unlink it deliberately and retry; it is
+    /// never truncated), [`Error::NotFound`] (the parent directory does not
+    /// exist), [`Error::NameTooLong`], [`Error::Sys`].
+    pub fn create_file(path: &str, capacity: usize, max_payload: usize) -> Result<Channel> {
+        Channel::create_file_with(path, capacity, max_payload, CreateFlags::NONE)
+    }
+
+    /// [`Channel::create_file`] with create-time flags.
+    ///
+    /// The same bits as [`Channel::create_with`] with one exception:
+    /// [`CreateFlags::HUGETLB_2MB`] / [`CreateFlags::HUGETLB_1GB`] are rejected
+    /// with [`Error::InvalidArgs`], because a hugetlbfs backing and a
+    /// caller-chosen path name two different segments and neither may be
+    /// silently dropped. `SHUTTLE_CREATE_FILE_BACKED` (`0x20`) is set for you —
+    /// it is the one flag that cannot be requested through
+    /// [`Channel::create_with`], which has nowhere to put a path.
+    pub fn create_file_with(
+        path: &str,
+        capacity: usize,
+        max_payload: usize,
+        flags: CreateFlags,
+    ) -> Result<Channel> {
+        let cpath = c_name(path)?;
+        let mut err: i32 = 0;
+        // SAFETY: cpath is a valid NUL-terminated string alive across the call;
+        // err is a valid out-param. The C layer never throws.
+        let ch = unsafe {
+            sys::shuttle_create_file(cpath.as_ptr(), capacity, max_payload, flags.bits(), &mut err)
+        };
+        if ch.is_null() {
+            return Err(Error::from_code(err));
+        }
+        Ok(Channel { ch })
+    }
+
+    /// Attach to the file-backed channel in the file at `path` (v1.4).
+    ///
+    /// The same bounded init wait and the same header validation
+    /// [`Channel::open`] performs — which matters more here, because a file
+    /// survives a reboot and can therefore hold a stale segment (or something
+    /// that is not a segment at all). Those checks are what turn that into
+    /// [`Error::Corrupt`] or [`Error::InitTimeout`] rather than garbage.
+    pub fn open_file(path: &str) -> Result<Channel> {
+        let cpath = c_name(path)?;
+        let mut err: i32 = 0;
+        // SAFETY: as in create_file_with.
+        let ch = unsafe { sys::shuttle_open_file(cpath.as_ptr(), &mut err) };
+        if ch.is_null() {
+            return Err(Error::from_code(err));
+        }
+        Ok(Channel { ch })
+    }
+
+    /// Remove a file-backed segment's file (v1.4). Existing mappings stay valid
+    /// until closed, exactly as for a name.
+    pub fn unlink_file(path: &str) -> Result<()> {
+        let cpath = c_name(path)?;
+        // SAFETY: cpath is a valid NUL-terminated string alive across the call.
+        check(unsafe { sys::shuttle_unlink_file(cpath.as_ptr()) })
+    }
+
     /// Attach to an existing channel.
     ///
     /// Waits (bounded, 5 s) for the creator's readiness publication, then
@@ -821,8 +904,10 @@ impl<'a> Drop for Borrowed<'a> {
     }
 }
 
-/// A channel name as a C string. Rejects an interior NUL the same way the C
-/// layer rejects a malformed name.
+/// A channel name — or, for the file-backed entry points, a path — as a C
+/// string. Rejects an interior NUL the same way the C layer rejects a malformed
+/// name; every other rule (leading `/`, length, absoluteness) is the C layer's
+/// to enforce, so that one implementation decides them.
 fn c_name(name: &str) -> Result<CString> {
     CString::new(name).map_err(|_| Error::InvalidArgs)
 }

@@ -96,6 +96,42 @@ struct Channel {
 Channel* create(const char* name, size_t capacity_bytes,
                 size_t max_payload_bytes, int* err, uint32_t create_flags = 0);
 
+// FILE-BACKED create (v1.4). Identical to create() in every respect except
+// where the segment object lives: `path` is an ABSOLUTE filesystem path
+// (open(O_CREAT|O_EXCL|O_RDWR, 0600) + one-shot ftruncate) instead of an shm
+// name, so capacity is bounded by the filesystem rather than by RAM and the
+// page cache decides which pages are resident. The segment's CONTENTS — header,
+// framing, cursors, park block — are byte-for-byte what create() writes.
+//
+// The path IS the identifier: there is no shm-name length limit (the
+// filesystem's own limit applies and reports itself as kErrNameTooLong), and a
+// relative path is kErrInvalidArgs rather than being resolved against a working
+// directory the two peers need not share.
+//
+// create_flags takes the same known bits as create() with one exception: the
+// hugetlb bits are REJECTED with kErrInvalidArgs, because a hugetlbfs backing
+// and a caller-chosen path name two different segments and neither can be
+// silently dropped. kFlagFileBacked (0x20) is set by this function and
+// persisted; it cannot be requested through create().
+//
+// Errors: create()'s set (minus kErrNoHugePages, unreachable here), plus
+// kErrNotFound when the parent directory does not exist.
+Channel* create_file(const char* path, size_t capacity_bytes,
+                     size_t max_payload_bytes, int* err,
+                     uint32_t create_flags = 0);
+
+// FILE-BACKED open (v1.4): attach to the segment in the file at `path`. The
+// same init-spin and the same validate_header the shm path uses — a file that
+// holds anything else is refused by exactly those checks, which matters more
+// here than for shm because a FILE survives a reboot and can therefore be a
+// stale segment from a previous boot (docs/API.md, "Stale files").
+Channel* open_file(const char* path, int* err);
+
+// FILE-BACKED unlink (v1.4): remove the file. Live mappings survive (POSIX
+// unlink semantics), exactly as for a name. kOk / kErrInvalidArgs /
+// kErrNotFound / kErrSys.
+int unlink_file(const char* path);
+
 // FR-3 / NFR-S2: the pure, post-map half of open()'s validation — magic,
 // version, and the version-selected geometry — over an already-mapped byte
 // range [base, base + map_len). No syscalls, no I/O, no global state: it only

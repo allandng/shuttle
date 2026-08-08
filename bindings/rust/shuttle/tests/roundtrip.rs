@@ -517,6 +517,184 @@ fn aligned_and_stats_compose() {
     let _ = Channel::unlink(&name);
 }
 
+// --- v1.4 surface: file-backed channels ------------------------------------
+
+/// A temp directory that removes itself, so a failing test cannot leave a
+/// segment file behind. Built by hand rather than with a crate: this repo adds
+/// no dependencies.
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new() -> TempDir {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "shuttle-rs-fb-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&path).expect("temp dir");
+        TempDir { path }
+    }
+
+    /// An absolute path for a segment file inside this directory.
+    fn seg(&self, tag: &str) -> String {
+        self.path
+            .join(format!("{}.seg", tag))
+            .to_str()
+            .expect("utf-8 temp path")
+            .to_string()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[test]
+fn file_backed_channel_roundtrips() {
+    let dir = TempDir::new();
+    let path = dir.seg("roundtrip");
+    let mut producer = Channel::create_file(&path, CAPACITY, MAX_PAYLOAD)
+        .expect("create_file")
+        .into_producer();
+    let mut consumer = Channel::open_file(&path).expect("open_file").into_consumer();
+
+    // The segment really is that file, sized for the geometry it claims.
+    let meta = std::fs::metadata(&path).expect("stat");
+    assert!(meta.len() >= CAPACITY as u64);
+
+    let payload: Vec<u8> = (0..9999u32).map(|i| (i % 251) as u8).collect();
+    producer.write(&payload).expect("write");
+    {
+        // Zero-copy, straight out of a file mapping.
+        let msg = consumer.acquire_read().expect("acquire_read");
+        assert_eq!(msg.as_slice(), &payload[..]);
+    }
+    // ...and the producer's borrow path over the same backing.
+    {
+        let mut res = producer.acquire_write(4096).expect("acquire_write");
+        res.as_mut_slice().fill(0x5A);
+        res.commit_all().expect("commit");
+    }
+    assert_eq!(consumer.read_owned().expect("read"), vec![0x5Au8; 4096]);
+
+    drop(consumer);
+    drop(producer);
+    Channel::unlink_file(&path).expect("unlink_file");
+    assert!(!std::path::Path::new(&path).exists());
+    // Unlinking twice is NotFound, exactly as for a name.
+    assert!(matches!(
+        Channel::unlink_file(&path),
+        Err(Error::NotFound)
+    ));
+}
+
+#[test]
+fn file_backed_and_stats_compose() {
+    let dir = TempDir::new();
+    let path = dir.seg("stats");
+    let mut producer = Channel::create_file_with(&path, CAPACITY, MAX_PAYLOAD, CreateFlags::STATS)
+        .expect("create_file")
+        .into_producer();
+    let mut consumer = Channel::open_file(&path).expect("open_file").into_consumer();
+
+    let lengths = [1usize, 1000, 65536];
+    for &n in &lengths {
+        producer.write(&vec![0xC3u8; n]).expect("write");
+        let msg = consumer.acquire_read().expect("acquire_read");
+        assert_eq!(msg.len(), n);
+    }
+    let stats = consumer.stats().expect("stats");
+    let total: u64 = lengths.iter().map(|n| *n as u64).sum();
+    assert_eq!(stats.msgs_written, lengths.len() as u64);
+    assert_eq!(stats.bytes_written, total);
+    assert_eq!(stats.bytes_read, total);
+    let _ = Channel::unlink_file(&path);
+}
+
+#[test]
+fn open_file_missing_is_not_found() {
+    let dir = TempDir::new();
+    assert!(matches!(
+        Channel::open_file(&dir.seg("nope")),
+        Err(Error::NotFound)
+    ));
+    assert!(matches!(
+        Channel::unlink_file(&dir.seg("nope")),
+        Err(Error::NotFound)
+    ));
+}
+
+#[test]
+fn creating_a_file_backed_channel_twice_is_exists() {
+    let dir = TempDir::new();
+    let path = dir.seg("twice");
+    let _first = Channel::create_file(&path, CAPACITY, MAX_PAYLOAD).expect("create_file");
+    let size = std::fs::metadata(&path).expect("stat").len();
+    assert!(matches!(
+        Channel::create_file(&path, CAPACITY, MAX_PAYLOAD),
+        Err(Error::Exists)
+    ));
+    // The existing file is untouched — that refusal is the stale-file recovery
+    // point, not a truncate-and-retry.
+    assert_eq!(std::fs::metadata(&path).expect("stat").len(), size);
+    let _ = Channel::unlink_file(&path);
+}
+
+#[test]
+fn non_absolute_paths_are_invalid_args() {
+    for bad in ["relative/chan.seg", "chan.seg", ""] {
+        assert!(matches!(
+            Channel::create_file(bad, CAPACITY, MAX_PAYLOAD),
+            Err(Error::InvalidArgs)
+        ));
+        assert!(matches!(Channel::open_file(bad), Err(Error::InvalidArgs)));
+        assert!(matches!(Channel::unlink_file(bad), Err(Error::InvalidArgs)));
+    }
+}
+
+#[test]
+fn file_backed_rejects_hugetlb_bits() {
+    // A hugetlbfs backing and a caller-chosen path name two different segments.
+    let dir = TempDir::new();
+    for flags in [CreateFlags::HUGETLB_2MB, CreateFlags::HUGETLB_1GB] {
+        let path = dir.seg("hugetlb");
+        assert!(matches!(
+            Channel::create_file_with(&path, CAPACITY, MAX_PAYLOAD, flags),
+            Err(Error::InvalidArgs)
+        ));
+        assert!(!std::path::Path::new(&path).exists());
+    }
+}
+
+#[test]
+fn create_with_masks_the_file_backed_bit() {
+    // The documented asymmetry: 0x20 is not selectable through create_with,
+    // which takes an shm name and has nowhere to put a path. It is masked off
+    // silently, per the unknown-bit rule — not an error.
+    let name = unique_name();
+    let mut producer = Channel::create_with(
+        &name,
+        CAPACITY,
+        MAX_PAYLOAD,
+        CreateFlags::from_bits(shuttle_sys::SHUTTLE_CREATE_FILE_BACKED),
+    )
+    .expect("create")
+    .into_producer();
+    producer.write(b"an ordinary shm channel").expect("write");
+    let mut consumer = Channel::open(&name).expect("open").into_consumer();
+    let msg = consumer.acquire_read().expect("acquire_read");
+    assert_eq!(msg.as_slice(), b"an ordinary shm channel");
+    drop(msg);
+    drop(consumer);
+    drop(producer);
+    let _ = Channel::unlink(&name);
+}
+
 #[test]
 fn unknown_create_bits_are_masked_not_rejected() {
     // An older library must tolerate a flag it does not implement.

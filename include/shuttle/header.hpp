@@ -88,6 +88,24 @@ constexpr uint32_t kFlagStats = 0x8;
 // huge page: 0x10 composes with the hugetlb backings and with kFlagStats.
 constexpr uint32_t kFlagAlignedSpans = 0x10;
 
+// FILE-BACKED SEGMENT (v1.4): the channel's bytes live in an ordinary file at
+// an absolute path (SegBacking::kFile in platform.hpp) instead of a POSIX shm
+// object, so capacity is bounded by the filesystem rather than by RAM and the
+// page cache decides what is resident.
+//
+// Persisted but INFORMATIONAL, exactly like the hugetlb bits — an opener takes
+// no action on it. It cannot: the opener already had to name the file to reach
+// the segment at all, and the framing and geometry are identical to an shm
+// segment's. The bit exists so tools, tests, and peers can SEE what the creator
+// asked for (`inspect` prints it, and P3's prefetch gates on it).
+//
+// It is also the one bit that is NOT selected through create()/create_ex: those
+// take an shm NAME, and there is no path to put in it, so they mask 0x20 off
+// like any other bit they do not implement. The file-backed symbols
+// (shuttle::create_file / shuttle_create_file) set it themselves. Asymmetric on
+// purpose, and documented in docs/API.md.
+constexpr uint32_t kFlagFileBacked = 0x20;
+
 // Hot atomics get a full line each. 128 B = Apple Silicon line size; also
 // correct (2x conservative) on x86 (binding minor amendment).
 constexpr size_t kCacheLine = 128;

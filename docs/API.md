@@ -24,7 +24,10 @@ The ten functions `shuttle_create` .. `shuttle_keepalive` are frozen v1.
 `shuttle_create_ex` is an additive v1.1 symbol and `shuttle_get_stats` an
 additive v1.2 symbol (new symbols only, no existing signature or semantic
 touched); v1.3 adds only the `SHUTTLE_DROP_NEWEST` flag bit and the
-`SHUTTLE_DROPPED` return, both opt-in. The ABI version stays `1`.
+`SHUTTLE_DROPPED` return, both opt-in. v1.4 adds the
+`SHUTTLE_CREATE_ALIGNED_SPANS` flag and the three path-typed lifecycle symbols
+`shuttle_create_file` / `shuttle_open_file` / `shuttle_unlink_file`, all
+additive. The ABI version stays `1`.
 
 ---
 
@@ -227,6 +230,51 @@ reason: there, the header shape really did change).
 | `0x18` (`\|STATS`) | v2 header, `data_offset` = `round_up(1536, page)` = 4096; byte counters still count **payload** bytes, never the padded stride |
 | `0x12` / `0x14` (`\|HUGETLB_*`) | hugetlbfs-backed, alignment unit stays the **system** page |
 | `0x11` (`\|HUGEPAGES`) | THP advice, unchanged and still advisory |
+
+### shuttle_create_file / shuttle_open_file / shuttle_unlink_file
+
+```c
+#define SHUTTLE_CREATE_FILE_BACKED 0x20   /* persisted, informational */
+shuttle_channel* shuttle_create_file(const char* path, size_t capacity_bytes,
+                                     size_t max_payload_bytes,
+                                     uint32_t create_flags, int* err);
+shuttle_channel* shuttle_open_file(const char* path, int* err);
+int shuttle_unlink_file(const char* path);
+```
+
+The same three lifecycle operations against a segment that lives in a **file**
+instead of in the POSIX shm namespace (v1.4, additive: three new symbols, no
+existing signature or semantic touched). Capacity is then bounded by the
+filesystem rather than by RAM or by `/dev/shm`'s tmpfs limit, and the OS page
+cache decides which pages are resident — a 256 GB channel on a 16 GB box is an
+ordinary thing to create. See **File-backed channels** below for the backing's
+own rules: the crash story, stale files, and the durability non-goal.
+
+`shuttle_close`, and every read/write/stats entry point, are shared: a handle is
+a handle whatever backs it.
+
+- **The path is the identifier.** It must be **absolute** (`path[0] == '/'`);
+  NULL, `""`, and relative paths are all `INVALID_ARGS`, because a channel's
+  identity must not depend on which directory each peer was started in. Paths
+  are not decorated in any way — the file is exactly where you said.
+- **No shm name limit.** The 30/254-character shm rules do not apply; the
+  filesystem's own limit does, and it surfaces as `NAME_TOO_LONG`.
+- **`create_flags`** takes the same bits as `shuttle_create_ex` — `STATS`,
+  `ALIGNED_SPANS`, `HUGEPAGES` are all legal and compose — with one exception:
+  `SHUTTLE_CREATE_HUGETLB_2MB` / `_1GB` are **rejected** with `INVALID_ARGS`. A
+  hugetlbfs backing and a caller-chosen path name two different segments;
+  honoring one would mean ignoring the other, and neither may be dropped
+  silently. `SHUTTLE_CREATE_FILE_BACKED` (`0x20`) is set for you.
+- **Errors** (`shuttle_create_file`, via `*err`): `INVALID_ARGS` (path rules
+  above, zero size, a hugetlb bit), `CAPACITY_TOO_SMALL` (unchanged — the FR-4
+  rule is not relaxed by the backing), `EXISTS` (the file is already there; it
+  is **never** truncated — see the stale-file recipe), `NOT_FOUND` (the parent
+  directory does not exist), `NAME_TOO_LONG`, `SYS`.
+- **Errors** (`shuttle_open_file`): `INVALID_ARGS`, `NOT_FOUND`, then exactly
+  what `shuttle_open` reports — `INIT_TIMEOUT`, `BAD_MAGIC`, `BAD_VERSION`,
+  `CORRUPT`, `SYS`. The validation is not weakened for files.
+- **Errors** (`shuttle_unlink_file`): `SHUTTLE_OK`, `INVALID_ARGS`, `NOT_FOUND`,
+  `SYS`. Live mappings survive, as with `shuttle_unlink`.
 
 ### shuttle_open
 
@@ -455,7 +503,11 @@ the two can never drift.
 - **create / open**: exactly one creator (`shuttle_create[_ex]`, `O_CREAT|O_EXCL`)
   and any number of openers (`shuttle_open`). The channel is SPSC: one producer,
   one consumer. Roles are bound lazily — a handle becomes a producer on its
-  first write/acquire-write, a consumer on its first read/acquire-read.
+  first write/acquire-write, a consumer on its first read/acquire-read. The
+  path-typed trio (`shuttle_create_file` / `shuttle_open_file` /
+  `shuttle_unlink_file`, v1.4) is the same lifecycle against a segment that
+  lives in a file; everything in this section applies to it except the shm
+  name rules, which a path replaces. See **File-backed channels**.
 - **close**: unmaps and frees the local handle only; the named object persists.
 - **unlink**: removes the named object; live mappings stay valid until closed.
 - **Name constraints**: must begin with `/`, contain at least one further
@@ -469,6 +521,168 @@ the two can never drift.
   `CAPACITY_TOO_SMALL`.
 - **One-shot sizing**: the segment is `ftruncate`d exactly once, at creation, on
   both platforms (macOS forbids re-truncating an shm object). It never grows.
+
+---
+
+## File-backed channels (v1.4)
+
+`shuttle_create_file` / `shuttle_open_file` / `shuttle_unlink_file` put a
+channel's segment in an ordinary file at an absolute path instead of a POSIX shm
+object. One sentence for why: **an shm segment is bounded by RAM (and by
+`/dev/shm`), a file is bounded by the filesystem**, so a channel can be far
+larger than physical memory and the OS page cache decides what is resident. That
+is the shape a weights-streaming or KV-cache workload wants — a large backing
+store consumed through a small resident window.
+
+Everything else is deliberately identical. The segment a file-backed create
+writes is byte-for-byte the segment an shm create writes: same header, same
+`data_offset`, same framing, same cursors, same park block. Both peers `mmap`
+the object `MAP_SHARED` and everything above this section applies unchanged.
+
+**Three namespaces now.** A default segment is an shm object (`/name`), a
+hugetlb segment is a file the library names on a hugetlbfs mount, and a
+file-backed segment is a file **you** named. The first two are found by
+`shuttle_open`'s probe; the third is not part of that probe and never will be —
+its identifier is a path, not a name, and the two cannot be told apart by
+inspection. That is why these are separate symbols rather than a flag on
+`shuttle_create_ex`: the caller always knows which kind of identifier it holds,
+and saying so by calling a different function makes it a compile-time fact.
+
+### Crash story — re-argued for this backing, and measured
+
+The three mechanisms, each re-examined rather than assumed to carry over:
+
+- **Heartbeats work identically, by construction.** They are two atomics in the
+  segment, and the segment is a `MAP_SHARED` mapping either way. Nothing about
+  a heartbeat touches the object it is backed by. A blocking wait therefore
+  still aborts with `PEER_DEAD` when the peer's heartbeat goes stale, at both
+  crash kill points. **Observed** (`tests/filebacked_test.cpp`, cases c and d):
+  a producer SIGKILLed mid-reservation, and one SIGKILLed while holding the park
+  mutex, each left the survivor's blocked read returning `SHUTTLE_ERR_PEER_DEAD`
+  ~2.5 s after parking against a 1.5 s threshold. No deadlock, and no phantom
+  data from the dead peer's uncommitted reservation.
+
+- **Robust-mutex recovery works identically on Linux — measured, not inferred.**
+  The concern was real: `PTHREAD_MUTEX_ROBUST` is implemented by a per-thread
+  robust list the kernel walks at task exit, and it was worth confirming that
+  the list works on a mutex living in a *file* mapping rather than a tmpfs one.
+  It does. With a peer SIGKILLed while owning the park mutex, a raw
+  `pthread_mutex_lock` on that mutex **returns `EOWNERDEAD` (130)** — observed
+  directly in `tests/filebacked_test.cpp` case (e), which takes the lock raw
+  precisely so the seam's recovery cannot hide the code being measured. After
+  the standard repair (`pthread_mutex_consistent`, then unlock) the mutex is
+  fully serviceable — lock/unlock cycles, a condvar `timedwait`, and further
+  transfers over the same mapping all behave normally. The same test also runs
+  the deliberately buggy recovery (unlock *without* `pthread_mutex_consistent`)
+  and confirms it leaves the mutex `ENOTRECOVERABLE`, so the positive result
+  cannot be a test that passes for the wrong reason.
+
+  **The file-backed crash story on Linux is therefore the shm crash story, with
+  nothing subtracted.**
+
+- **macOS is unchanged and still best-effort.** There are no robust mutexes
+  there for any backing, and the park path holds nothing
+  (`os_sync_wait_on_address`), so the heartbeat is the whole guarantee — exactly
+  as for shm. Nothing about file backing makes that better or worse.
+
+### Stale files, and the recovery recipe
+
+This is the one genuinely new failure mode, and it comes from the good property:
+**a file survives a reboot; an shm object does not.** So a file-backed segment
+can be left over from a previous boot, complete with a valid header, plausible
+cursors, and heartbeats from processes that no longer exist.
+
+What the library does about it:
+
+- `shuttle_open_file` applies **exactly** the checks `shuttle_open` applies —
+  the size floor, the bounded (5 s) wait for the creator's readiness
+  publication, then full header validation. A file holding anything else fails
+  one of them: garbage that never publishes readiness costs 5 s and returns
+  `INIT_TIMEOUT`; a wrong or damaged header returns `BAD_MAGIC`,
+  `BAD_VERSION`, or `CORRUPT`. Nothing is trusted because it was in a file you
+  named.
+- `shuttle_create_file` **refuses an existing file** with `EXISTS` and leaves it
+  untouched. It never truncates: silently reusing a file could pull a live
+  peer's segment out from under it, and after a reboot there is no way to tell
+  the two cases apart from inside the process.
+
+The recipe, therefore — an explicit operator action, not an automatic one:
+
+```c
+int rc = shuttle_unlink_file("/var/lib/app/chan.seg");  /* deliberate */
+if (rc != SHUTTLE_OK && rc != SHUTTLE_ERR_NOT_FOUND) return rc;
+ch = shuttle_create_file("/var/lib/app/chan.seg", cap, maxp, 0, &err);
+```
+
+Startup code that wants to be self-healing should unlink-then-create as above,
+and should do it only where it *owns* the path. A supervisor that cannot be sure
+no peer is running must not: the unlink is what makes it safe, and unlinking a
+file another process still maps leaves that process running against a segment
+nobody else can reach.
+
+### Durability is an explicit non-goal
+
+**The library never calls `msync`, and never will on this path.** The file is a
+transport medium, not a database. What is on disk after a crash is whatever the
+kernel had written back, at whatever granularity it chose, with no ordering
+guarantee of any kind between the payload bytes and the cursors that describe
+them. A segment recovered off disk and reopened is *not* a queue you can resume
+— it is bytes whose consistency nobody promised. Treat a file-backed segment
+exactly like an shm one: the channel's contents mean something only while both
+peers are alive.
+
+If a persistence use case ever lands, it needs its own design (ordering,
+barriers, a recovery protocol), not an `msync` call bolted onto this one.
+
+### Residency, honestly
+
+The page cache owns residency, which cuts both ways: pages are faulted in on
+first touch and written back and reclaimed under pressure, so a channel far
+larger than RAM works — but a ring the producer has just marched through is
+*dirty file pages*, and those stay resident until the kernel decides otherwise.
+Measured while streaming 512 MB through a 256 MB file-backed channel with at
+most 8 messages in flight, this process's RSS went from 8 MB to 265 MB (ASan
+test build, `tests/filebacked_test.cpp` case b, on an otherwise idle box): the
+whole ring, because the whole ring had just been written. The guarantee is that
+the kernel *can* reclaim it, not that it will have done so at any given moment.
+Size the channel for the working set you want, not for the largest file you can
+create.
+
+### Combining flags
+
+| Combination | Result |
+|---|---|
+| file only (`0x20`) | v1 header, ordinary framing, segment in your file |
+| `\|STATS` (`0x28`) | v2 header with counters; identical semantics |
+| `\|ALIGNED_SPANS` (`0x30`) | page-aligned payload spans out of a file mapping |
+| `\|HUGEPAGES` (`0x21`) | THP advice, still advisory and still a harmless no-op where the kernel declines |
+| `\|HUGETLB_2MB` / `_1GB` | **`INVALID_ARGS`** — a hugetlbfs backing and a path name two different segments |
+
+### The `0x20` asymmetry
+
+`SHUTTLE_CREATE_FILE_BACKED` is the one create-flag you never pass to
+`shuttle_create_ex`. Selecting this backing means supplying a *path*, and
+`shuttle_create_ex`'s parameter is an shm *name* with shm name rules — there is
+nowhere to put one. So the backing is chosen by **calling
+`shuttle_create_file`**, which sets the bit itself.
+
+Passed to `shuttle_create_ex` anyway, `0x20` is masked off and ignored — not an
+error — exactly like any other bit that entry point does not implement, per the
+unknown-bit rule in **Segment layout**. The bit is persisted and
+**informational**: an opener takes no action on it (it had to name the file to
+attach at all), and it exists so tools and peers can see what the creator asked
+for.
+
+### Platform support
+
+POSIX only this pass. On **Windows** the argument checks still apply (a
+malformed path is still `INVALID_ARGS`), and any call that gets past them
+returns `SHUTTLE_ERR_SYS` — the platform seam reports `ENOTSUP` — having created
+nothing. A **documented parity gap**, in the same class as the absent
+robust-mutex recovery there. The Windows form would be `CreateFileW` plus a `CreateFileMappingW` on
+that handle instead of on `INVALID_HANDLE_VALUE`; it is not attempted here
+because the experimental Windows backend has no crash-recovery story to test it
+against. See the README's Scope section and `docs/ROADMAP.md`.
 
 ---
 
@@ -612,9 +826,13 @@ masks `create_flags` down to the bits it actually implements, so an unknown (or
 merely reserved-and-unimplemented) bit is never persisted into a segment.
 Recorded bits: `SHUTTLE_CREATE_HUGEPAGES` = `0x1`,
 `SHUTTLE_CREATE_HUGETLB_2MB` = `0x2`, `SHUTTLE_CREATE_HUGETLB_1GB` = `0x4`,
-`SHUTTLE_CREATE_STATS` = `0x8`, `SHUTTLE_CREATE_ALIGNED_SPANS` = `0x10`. The
-hugetlb bits are persisted but informational — an opener takes no action on
-them, because the segment's location already determines its page size.
+`SHUTTLE_CREATE_STATS` = `0x8`, `SHUTTLE_CREATE_ALIGNED_SPANS` = `0x10`,
+`SHUTTLE_CREATE_FILE_BACKED` = `0x20`. The hugetlb and file-backed bits are
+persisted but informational — an opener takes no action on them, because the
+segment's location already determines its page size (hugetlb) or was named by
+the opener itself (file). `0x20` is also the one bit `shuttle_create_ex` cannot
+set: it is selected by calling `shuttle_create_file`, and is masked off like any
+unknown bit if passed to `shuttle_create_ex` (see **File-backed channels**).
 
 **Version gate**: `flags` is ignorable, `version` is not. A version selects the
 physical size of the header, so an opener that does not recognize one cannot
@@ -641,6 +859,7 @@ The two exceptions and their verdicts:
 |---|---|---|
 | `SHUTTLE_CREATE_STATS` (`0x8`) | header SIZE (layout version 1 → 2) | `BAD_VERSION` |
 | `SHUTTLE_CREATE_ALIGNED_SPANS` (`0x10`) | `data_offset` + frame layout | `CORRUPT` |
+| `SHUTTLE_CREATE_FILE_BACKED` (`0x20`) | nothing on the segment — only where it lives | opens normally (it named the file) |
 | everything else | nothing an opener must act on | opens normally |
 
 ---

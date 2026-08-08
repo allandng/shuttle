@@ -16,6 +16,184 @@ void set_err(int* err, int code) noexcept {
 
 constexpr uint64_t kInitWaitNs = 5ull * 1000000000ull;
 
+// Everything create() decided before the segment object existed, plus the one
+// thing the two namespaces disagree about (`file`: is `id` an shm name or an
+// absolute path, i.e. which unlink undoes it). Passed to publish_segment below
+// so that create() and create_file() share ONE copy of the publication
+// protocol — the ordering of the cold identity block, the park-primitive init,
+// and the release-store is the part no second implementation may drift from.
+struct SegPlan {
+    const char* id;  // shm name, or absolute path when `file`
+    bool file;
+    uint32_t version;
+    uint32_t flags;
+    uint64_t data_offset;
+    uint64_t capacity;
+    uint64_t max_payload;
+    bool advise_thp;    // opt-in THP advice on the fresh mapping
+    int map_fail_code;  // what a failed seg_map means for this backing
+};
+
+// Destroy a partially-created segment through the namespace it lives in.
+void destroy_segment(const SegPlan& p) noexcept {
+    if (p.file) {
+        (void)seg_unlink_file(p.id);
+    } else {
+        (void)seg_unlink(p.id);
+    }
+}
+
+// POSIX errno -> Err for the path-typed entry points. The shm mapping cannot be
+// reused verbatim: a path has a parent directory (ENOENT/ENOTDIR = "that
+// directory is not there", which is a NotFound, not an opaque syscall failure)
+// and a filesystem-imposed length limit, which is the same class of problem
+// kErrNameTooLong already names for shm. No existing symbol's mapping changes.
+int file_err(int e) noexcept {
+    switch (e) {
+        case EEXIST:
+            return kErrExists;
+        case ENOENT:
+        case ENOTDIR:
+            return kErrNotFound;
+        case ENAMETOOLONG:
+            return kErrNameTooLong;
+        default:
+            return kErrSys;
+    }
+}
+
+// The half of create() that does not care HOW the segment object was obtained:
+// map it, advise THP if asked, write the cold identity block, initialize the
+// park primitives, and publish readiness with the release store. `seg` is a
+// live handle to an object already sized to `map_len`. On any failure the
+// object is unmapped, closed, and removed through its own namespace, and
+// nothing is left behind.
+Channel* publish_segment(SegHandle seg, size_t map_len, const SegPlan& p,
+                         int* err) {
+    void* base = seg_map(seg, map_len);
+    if (base == nullptr) {
+        seg_close(seg);
+        destroy_segment(p);
+        set_err(err, p.map_fail_code);
+        return nullptr;
+    }
+    // POSIX drops the handle now (kSegInvalid); Windows RETAINS it in the
+    // Channel — a named section vanishes with its last handle (seam decides).
+    const SegHandle seg_keep = seg_keep_after_map(seg);
+
+    // Opt-in THP: advise the fresh mapping before it is touched. Advisory and
+    // masked to known bits — an unknown flag must never be persisted (openers
+    // trust that flags carries only bits they may act on). The caller decides
+    // whether the advice is meaningful for this backing at all (it is not on a
+    // hugetlbfs file, whose pages are huge by construction).
+    if (p.advise_thp) advise_huge_pages(base, map_len);
+
+    // Creation zero-fills, so init_state is already 0 (uninitialized) and
+    // cursors/heartbeats are already 0 — and so are the v2 stats lines, which
+    // therefore need no explicit initialization. Set the rest explicitly.
+    // flags is part of the cold identity block: written once here, before the
+    // init_state release-store publish, and immutable after (single-init).
+    auto* h = static_cast<ChannelHeader*>(base);
+    h->magic = kMagic;
+    h->version = p.version;
+    h->flags = p.flags;
+    h->data_offset = p.data_offset;
+    h->data_capacity = p.capacity;
+    h->max_payload = p.max_payload;
+    if (mutex_init_pshared(&h->park.lock) != 0 ||
+        cond_init_pshared_monotonic(&h->park.not_empty) != 0 ||
+        cond_init_pshared_monotonic(&h->park.not_full) != 0) {
+        seg_unmap(base, map_len);
+        seg_close(
+            seg_keep);  // release the retained handle (Windows); no-op POSIX
+        destroy_segment(p);
+        set_err(err, kErrSys);
+        return nullptr;
+    }
+    // Publish: openers must not trust any field before this store (App. B #5).
+    h->init_state.store(kInitReady, std::memory_order_release);
+
+    set_err(err, kOk);
+    return new Channel{base, map_len, h, seg_keep};
+}
+
+// The counterpart for the opening side: everything after the segment handle
+// exists — size it, map it, wait for the creator's publication, validate, and
+// re-advise THP. Shared by open() and open_file(), which differ ONLY in how
+// they got `seg`. Consumes the handle: it is closed on every failure path.
+Channel* attach_segment(SegHandle seg, int* err) {
+    // An unreadable size (-1) and a too-small object are the same verdict:
+    // whatever is behind this handle, it is not a channel. The bar is the
+    // SMALLEST header any known version has (v1) — the version is not readable
+    // until the object is mapped, and a legitimately small v1 segment must not
+    // be rejected just because the v2 header is bigger. The per-version
+    // geometry check below is what enforces the actual size requirement.
+    const int64_t seg_len = seg_size(seg);
+    if (seg_len < static_cast<int64_t>(kDataOffsetV1)) {
+        seg_close(seg);
+        set_err(err, kErrCorrupt);
+        return nullptr;
+    }
+    const size_t map_len = static_cast<size_t>(seg_len);
+    void* base = seg_map(seg, map_len);
+    if (base == nullptr) {
+        seg_close(seg);
+        set_err(err, kErrSys);
+        return nullptr;
+    }
+    // POSIX drops the handle now (kSegInvalid); Windows RETAINS it (seam).
+    const SegHandle seg_keep = seg_keep_after_map(seg);
+
+    auto* h = static_cast<ChannelHeader*>(base);
+    // Wait for the creator's release-publish; deadlined so a creator that
+    // died mid-init cannot hang us (timeout = distinct error). This is also the
+    // guard that keeps a STALE FILE (a file-backed segment left by a previous
+    // boot, or any other file entirely) from hanging an opener forever: garbage
+    // that never says kInitReady costs 5 s and then kErrInitTimeout.
+    const uint64_t deadline = monotonic_ns() + kInitWaitNs;
+    while (h->init_state.load(std::memory_order_acquire) != kInitReady) {
+        if (monotonic_ns() > deadline) {
+            seg_unmap(base, map_len);
+            seg_close(
+                seg_keep);  // release retained handle (Windows); no-op POSIX
+            set_err(err, kErrInitTimeout);
+            return nullptr;
+        }
+        sleep_us(1000);
+    }
+
+    // FR-3 / NFR-S2: magic, version, geometry. Pure and self-contained, so it
+    // lives in validate_header() where a fuzzer can reach it directly; the
+    // codes and their precedence are exactly what this block reported inline.
+    const int verdict = validate_header(base, map_len);
+    if (verdict != kOk) {
+        seg_unmap(base, map_len);
+        seg_close(seg_keep);  // release retained handle (Windows); no-op POSIX
+        set_err(err, verdict);
+        return nullptr;
+    }
+
+    // The opener's mapping is independent of the creator's; if the creator
+    // opted into THP, advise this mapping too (advisory, ignores unknown bits
+    // per the flags contract). Only after the header is trusted.
+    //
+    // An explicitly hugetlb-backed segment needs NOTHING here: seg_open found
+    // the file on the hugetlbfs mount, and a MAP_SHARED mapping of such a file
+    // is huge-page backed by virtue of the file's filesystem — MAP_HUGETLB is
+    // an ANONYMOUS-mapping flag and has no role on this path. So the hugetlb
+    // bits are read only to suppress the meaningless THP advice.
+    // (kFlagFileBacked needs nothing here either, and for the same shape of
+    // reason: the opener named the file to get here, and a MAP_SHARED mapping
+    // of it is all the backing requires.)
+    const bool seg_is_hugetlb =
+        (h->flags & (kFlagHugeTLB2M | kFlagHugeTLB1G)) != 0;
+    if ((h->flags & kFlagHugePages) && !seg_is_hugetlb)
+        advise_huge_pages(base, map_len);
+
+    set_err(err, kOk);
+    return new Channel{base, map_len, h, seg_keep};
+}
+
 }  // namespace
 
 Channel* create(const char* name, size_t capacity_bytes,
@@ -111,59 +289,94 @@ Channel* create(const char* name, size_t capacity_bytes,
         set_err(err, code);
         return nullptr;
     }
-    void* base = seg_map(seg, map_len);
-    if (base == nullptr) {
-        seg_close(seg);
-        (void)seg_unlink(name);
-        // hugetlbfs reserves its pages at MMAP time, not at create/ftruncate
-        // time: this is where a box with no free huge pages actually fails
-        // (ENOMEM). It is the same "cannot deliver" verdict as above.
-        set_err(err, explicit_huge ? kErrNoHugePages : kErrSys);
+    // THP advice is skipped when the segment is already on explicit huge pages:
+    // advice about promoting normal pages is meaningless for a mapping whose
+    // pages are huge by construction (the kernel would just return EINVAL).
+    // Both bits are still persisted: the hugetlb bit is informational — an
+    // opener needs no action from it, because seg_open finds the hugetlbfs file
+    // and the file's inode already dictates the page size.
+    //
+    // hugetlbfs reserves its pages at MMAP time, not at create/ftruncate time,
+    // so a box with no free huge pages fails inside publish_segment's map step
+    // (ENOMEM) — the same "cannot deliver" verdict as above, which is why the
+    // plan carries its own map_fail_code.
+    const SegPlan plan{name,
+                       false,
+                       version,
+                       flags,
+                       data_offset,
+                       capacity_bytes,
+                       max_payload_bytes,
+                       (flags & kFlagHugePages) != 0 && !explicit_huge,
+                       explicit_huge ? kErrNoHugePages : kErrSys};
+    return publish_segment(seg, map_len, plan, err);
+}
+
+Channel* create_file(const char* path, size_t capacity_bytes,
+                     size_t max_payload_bytes, int* err,
+                     uint32_t create_flags) {
+    // The path IS the identifier (see the declaration). Absolute only, and no
+    // length rule of our own — an over-long path is the filesystem's verdict,
+    // reported as kErrNameTooLong by file_err. A NULL or empty path fails the
+    // leading-'/' test, so both land here.
+    if (!seg_path_ok(path) || capacity_bytes == 0 || max_payload_bytes == 0) {
+        set_err(err, kErrInvalidArgs);
         return nullptr;
     }
-    // POSIX drops the handle now (kSegInvalid); Windows RETAINS it in the
-    // Channel — a named section vanishes with its last handle (seam decides).
-    const SegHandle seg_keep = seg_keep_after_map(seg);
-
-    // Opt-in THP: advise the fresh mapping before it is touched. Advisory and
-    // masked to known bits — an unknown flag must never be persisted (openers
-    // trust that flags carries only bits they may act on). Skipped when the
-    // segment is already on explicit huge pages: advice about promoting normal
-    // pages is meaningless for a mapping whose pages are huge by construction
-    // (the kernel would just return EINVAL). Both bits are still persisted:
-    // the hugetlb bit is informational — an opener needs no action from it,
-    // because seg_open finds the hugetlbfs file and the file's inode already
-    // dictates the page size.
-    if ((flags & kFlagHugePages) && !explicit_huge)
-        advise_huge_pages(base, map_len);
-
-    // Creation zero-fills, so init_state is already 0 (uninitialized) and
-    // cursors/heartbeats are already 0 — and so are the v2 stats lines, which
-    // therefore need no explicit initialization. Set the rest explicitly.
-    // flags is part of the cold identity block: written once here, before the
-    // init_state release-store publish, and immutable after (single-init).
-    auto* h = static_cast<ChannelHeader*>(base);
-    h->magic = kMagic;
-    h->version = version;
-    h->flags = flags;
-    h->data_offset = data_offset;
-    h->data_capacity = capacity_bytes;
-    h->max_payload = max_payload_bytes;
-    if (mutex_init_pshared(&h->park.lock) != 0 ||
-        cond_init_pshared_monotonic(&h->park.not_empty) != 0 ||
-        cond_init_pshared_monotonic(&h->park.not_full) != 0) {
-        seg_unmap(base, map_len);
-        seg_close(
-            seg_keep);  // release the retained handle (Windows); no-op POSIX
-        (void)seg_unlink(name);
-        set_err(err, kErrSys);
+    // A hugetlbfs backing and a caller-chosen path name two different segments:
+    // honoring one means ignoring the other, and neither may be dropped
+    // silently. Checked against the RAW create_flags, before masking, so the
+    // request is refused rather than quietly turned into a plain file.
+    if ((create_flags & (kFlagHugeTLB2M | kFlagHugeTLB1G)) != 0) {
+        set_err(err, kErrInvalidArgs);
         return nullptr;
     }
-    // Publish: openers must not trust any field before this store (App. B #5).
-    h->init_state.store(kInitReady, std::memory_order_release);
+    // Known-bits mask for THIS entry point: the layout/framing/advice bits,
+    // plus kFlagFileBacked, which this path SETS rather than accepts (passing
+    // it is legal and redundant; not passing it changes nothing). The two
+    // hugetlb bits are the rest of the 0x3F known set and were rejected above,
+    // so they can never reach the segment from here.
+    const uint32_t flags =
+        (create_flags & (kFlagHugePages | kFlagStats | kFlagAlignedSpans)) |
+        kFlagFileBacked;
+    const uint64_t page = static_cast<uint64_t>(page_size());
+    const uint64_t align = (flags & kFlagAlignedSpans) != 0 ? page : 0;
+    // FR-4, unchanged and for the same reason as in create(): a write that can
+    // never be satisfied must be impossible by construction. A file-backed
+    // channel is not exempt — capacity beyond RAM is still a finite capacity.
+    if (!frame_fits(max_payload_bytes, capacity_bytes, align)) {
+        set_err(err, kErrCapacityTooSmall);
+        return nullptr;
+    }
+    const uint32_t version =
+        (flags & kFlagStats) != 0 ? kVersionStats : kVersion;
+    const uint64_t data_offset = data_offset_for(version, flags, page);
+    // No rounding: a file has no granularity of its own (seg_map_len is the
+    // identity for kFile). The one-shot ftruncate below therefore sizes the
+    // object to exactly what the geometry needs.
+    const size_t map_len = seg_map_len(
+        static_cast<size_t>(data_offset) + capacity_bytes, SegBacking::kFile);
 
-    set_err(err, kOk);
-    return new Channel{base, map_len, h, seg_keep};
+    int seg_err = 0;
+    const SegHandle seg = seg_create_file(path, map_len, seg_err);
+    if (seg == kSegInvalid) {
+        // EEXIST is the documented recovery point for a STALE file left by a
+        // previous boot: create refuses to reuse it, and the operator unlinks
+        // and recreates (docs/API.md). It is never silently truncated — that
+        // would hand a live peer's segment to a second creator.
+        set_err(err, file_err(seg_err));
+        return nullptr;
+    }
+    const SegPlan plan{path,
+                       true,
+                       version,
+                       flags,
+                       data_offset,
+                       capacity_bytes,
+                       max_payload_bytes,
+                       (flags & kFlagHugePages) != 0,
+                       kErrSys};
+    return publish_segment(seg, map_len, plan, err);
 }
 
 // The pure post-map validation, lifted verbatim out of open() (see the
@@ -247,70 +460,27 @@ Channel* open(const char* name, int* err) {
         set_err(err, seg_err == ENOENT ? kErrNotFound : kErrSys);
         return nullptr;
     }
-    // An unreadable size (-1) and a too-small object are the same verdict:
-    // whatever is behind this name, it is not a channel. The bar is the
-    // SMALLEST header any known version has (v1) — the version is not readable
-    // until the object is mapped, and a legitimately small v1 segment must not
-    // be rejected just because the v2 header is bigger. The per-version
-    // geometry check below is what enforces the actual size requirement.
-    const int64_t seg_len = seg_size(seg);
-    if (seg_len < static_cast<int64_t>(kDataOffsetV1)) {
-        seg_close(seg);
-        set_err(err, kErrCorrupt);
+    return attach_segment(seg, err);
+}
+
+Channel* open_file(const char* path, int* err) {
+    if (!seg_path_ok(path)) {
+        set_err(err, kErrInvalidArgs);
         return nullptr;
     }
-    const size_t map_len = static_cast<size_t>(seg_len);
-    void* base = seg_map(seg, map_len);
-    if (base == nullptr) {
-        seg_close(seg);
-        set_err(err, kErrSys);
+    int seg_err = 0;
+    const SegHandle seg = seg_open_file(path, seg_err);
+    if (seg == kSegInvalid) {
+        set_err(err, file_err(seg_err));
         return nullptr;
     }
-    // POSIX drops the handle now (kSegInvalid); Windows RETAINS it (seam).
-    const SegHandle seg_keep = seg_keep_after_map(seg);
-
-    auto* h = static_cast<ChannelHeader*>(base);
-    // Wait for the creator's release-publish; deadlined so a creator that
-    // died mid-init cannot hang us (timeout = distinct error).
-    const uint64_t deadline = monotonic_ns() + kInitWaitNs;
-    while (h->init_state.load(std::memory_order_acquire) != kInitReady) {
-        if (monotonic_ns() > deadline) {
-            seg_unmap(base, map_len);
-            seg_close(
-                seg_keep);  // release retained handle (Windows); no-op POSIX
-            set_err(err, kErrInitTimeout);
-            return nullptr;
-        }
-        sleep_us(1000);
-    }
-
-    // FR-3 / NFR-S2: magic, version, geometry. Pure and self-contained, so it
-    // lives in validate_header() where a fuzzer can reach it directly; the
-    // codes and their precedence are exactly what this block reported inline.
-    const int verdict = validate_header(base, map_len);
-    if (verdict != kOk) {
-        seg_unmap(base, map_len);
-        seg_close(seg_keep);  // release retained handle (Windows); no-op POSIX
-        set_err(err, verdict);
-        return nullptr;
-    }
-
-    // The opener's mapping is independent of the creator's; if the creator
-    // opted into THP, advise this mapping too (advisory, ignores unknown bits
-    // per the flags contract). Only after the header is trusted.
-    //
-    // An explicitly hugetlb-backed segment needs NOTHING here: seg_open found
-    // the file on the hugetlbfs mount, and a MAP_SHARED mapping of such a file
-    // is huge-page backed by virtue of the file's filesystem — MAP_HUGETLB is
-    // an ANONYMOUS-mapping flag and has no role on this path. So the hugetlb
-    // bits are read only to suppress the meaningless THP advice.
-    const bool seg_is_hugetlb =
-        (h->flags & (kFlagHugeTLB2M | kFlagHugeTLB1G)) != 0;
-    if ((h->flags & kFlagHugePages) && !seg_is_hugetlb)
-        advise_huge_pages(base, map_len);
-
-    set_err(err, kOk);
-    return new Channel{base, map_len, h, seg_keep};
+    // From here on a file-backed segment is validated by EXACTLY the checks an
+    // shm one gets — same size floor, same init spin, same validate_header.
+    // That is the whole answer to "what if the file is not a channel": a file
+    // holding anything else fails one of them, and a file holding a stale
+    // channel from a previous boot is refused or opened on its merits like any
+    // other segment whose creator is gone (docs/API.md, "Stale files").
+    return attach_segment(seg, err);
 }
 
 void close(Channel* ch) {
@@ -346,6 +516,12 @@ int unlink(const char* name) {
         return seg_err == ENOENT ? kErrNotFound : kErrSys;
     }
     return kOk;
+}
+
+int unlink_file(const char* path) {
+    if (!seg_path_ok(path)) return kErrInvalidArgs;
+    const int seg_err = seg_unlink_file(path);
+    return seg_err == 0 ? kOk : file_err(seg_err);
 }
 
 }  // namespace shuttle

@@ -38,6 +38,17 @@
  * a segment created with it cannot be opened by a binary built before v1.4.
  * That opener reports SHUTTLE_ERR_CORRUPT (not BAD_VERSION — see the flag's
  * note below). Opting in is therefore a decision about which peers can attach.
+ *
+ * v1.4 also adds FILE-BACKED channels: shuttle_create_file / shuttle_open_file
+ * / shuttle_unlink_file, three new symbols that take an absolute PATH where the
+ * v1 lifecycle functions take an shm name. Additive in the strictest sense —
+ * the name-typed functions are untouched in signature, semantics, and behavior,
+ * and a caller that never mentions a path sees no change at all — so
+ * SHUTTLE_ABI_VERSION stays 1. The segment they produce is byte-for-byte an
+ * ordinary Shuttle segment that happens to live in a file, which is what lets a
+ * channel's capacity exceed physical RAM. See docs/API.md, "File-backed
+ * channels", for the crash story, the stale-file recipe, and the explicit
+ * non-goal of durability.
  */
 #ifndef SHUTTLE_C_H
 #define SHUTTLE_C_H
@@ -182,6 +193,22 @@ extern "C" {
  * and leave the alignment unit at the system page. */
 #define SHUTTLE_CREATE_ALIGNED_SPANS 0x10
 
+/* The segment lives in a FILE rather than in a POSIX shm object (v1.4).
+ *
+ * ASYMMETRIC ON PURPOSE, and the one create-flag you do not pass to
+ * shuttle_create_ex: choosing this backing means supplying a PATH, and
+ * shuttle_create_ex has nowhere to put one — its `name` is an shm name, with
+ * shm name rules. So the backing is selected by CALLING shuttle_create_file,
+ * which sets this bit itself; shuttle_create_ex masks 0x20 off exactly like any
+ * other bit it does not implement, and passing it there is silently ignored
+ * (not an error), per the unknown-bit rule.
+ *
+ * Persisted but INFORMATIONAL: an opener takes no action on it — it had to name
+ * the file to attach at all, and the framing and geometry are identical to an
+ * shm segment's. The bit is here so tools and peers can see what the creator
+ * asked for, and so `shuttle_get_stats`-style introspection can report it. */
+#define SHUTTLE_CREATE_FILE_BACKED 0x20
+
 typedef struct shuttle_channel shuttle_channel;
 
 /* Counter snapshot (v1.2). Byte counts are PAYLOAD bytes — the 8-byte frame
@@ -209,6 +236,41 @@ shuttle_channel* shuttle_create_ex(const char* name, size_t capacity_bytes,
 shuttle_channel* shuttle_open(const char* name, int* err);
 void shuttle_close(shuttle_channel* ch);
 int shuttle_unlink(const char* name);
+
+/* --- file-backed lifecycle (v1.4 additive) ---
+ * The same three operations against a segment that lives in a FILE at an
+ * absolute `path` instead of in the POSIX shm namespace. Capacity is then
+ * bounded by the filesystem rather than by RAM, and the OS page cache decides
+ * which pages are resident — the point of the backing.
+ *
+ * The path IS the identifier. It must be absolute (`path[0] == '/'`); NULL, an
+ * empty string, and a relative path are all SHUTTLE_ERR_INVALID_ARGS, because a
+ * channel's identity must not depend on which directory each peer was started
+ * in. There is no shm-style length limit: the filesystem's own limit applies
+ * and surfaces as SHUTTLE_ERR_NAME_TOO_LONG.
+ *
+ * shuttle_create_file takes the same create_flags as shuttle_create_ex with one
+ * exception: SHUTTLE_CREATE_HUGETLB_2MB/_1GB are REJECTED with
+ * SHUTTLE_ERR_INVALID_ARGS (a hugetlbfs backing and a caller-chosen path name
+ * two different segments; neither can be silently dropped).
+ * SHUTTLE_CREATE_FILE_BACKED is set automatically. Errors otherwise mirror
+ * shuttle_create_ex's, plus SHUTTLE_ERR_NOT_FOUND when the parent directory
+ * does not exist, and SHUTTLE_ERR_EXISTS when the file is already there — that
+ * refusal is the documented recovery point for a stale file (unlink it, then
+ * recreate); nothing here ever truncates a file it did not create.
+ *
+ * shuttle_close is shared: a handle is a handle whatever backs it.
+ *
+ * PLATFORM: POSIX only this pass. On Windows the argument checks above still
+ * apply (a malformed path is still SHUTTLE_ERR_INVALID_ARGS), and any call that
+ * gets past them returns SHUTTLE_ERR_SYS — the platform seam reports ENOTSUP —
+ * having created nothing. A documented parity gap, like the absent
+ * robust-mutex recovery there. */
+shuttle_channel* shuttle_create_file(const char* path, size_t capacity_bytes,
+                                     size_t max_payload_bytes,
+                                     uint32_t create_flags, int* err);
+shuttle_channel* shuttle_open_file(const char* path, int* err);
+int shuttle_unlink_file(const char* path);
 
 /* --- copy convenience path (IF-2) --- */
 /* Returns SHUTTLE_OK, a negative error code, or — only when the caller passed

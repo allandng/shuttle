@@ -16,7 +16,8 @@ from . import _ffi
 from .errors import (DROPPED, ERR_WOULD_BLOCK, InvalidArgs, ShuttleError,
                      TooBig, WouldBlock, check, error_for_code)
 
-__all__ = ["Channel", "BorrowedMessage", "Reservation", "Stats", "unlink"]
+__all__ = ["Channel", "BorrowedMessage", "Reservation", "Stats", "unlink",
+           "unlink_file"]
 
 #: Snapshot of a segment's counters (``shuttle_get_stats``, v1.2). Byte counts
 #: are PAYLOAD bytes: the 8-byte frame header — and, on a channel created with
@@ -272,6 +273,67 @@ class Channel:
         if handle == ffi.NULL:
             raise error_for_code(errp[0], "create {!r}".format(name))
         return cls(lib_, handle, name, max_payload)
+
+    @classmethod
+    def create_file(cls, path, capacity, max_payload, flags=0, library=None):
+        """Create a channel whose segment is a FILE at ``path`` (v1.4).
+
+        The bytes live in an ordinary file instead of a POSIX shm object, so
+        ``capacity`` is bounded by the filesystem rather than by RAM (or by
+        ``/dev/shm``) and the OS page cache decides which pages are resident.
+        Everything else about the channel is identical — same framing, same
+        header, same crash story (see docs/API.md, "File-backed channels").
+
+        ``path`` must be **absolute**; a relative or empty path raises
+        ``InvalidArgs``, because a channel's identity must not depend on which
+        directory each peer was started in. There is no shm-style name-length
+        limit here, only the filesystem's own (which arrives as ``NameTooLong``).
+
+        ``flags`` takes the same bits as ``create`` with one exception: the
+        hugetlb bits raise ``InvalidArgs``, since a hugetlbfs backing and a
+        caller-chosen path name two different segments. ``CREATE_FILE_BACKED``
+        is set for you.
+
+        An existing file raises ``Exists`` and is left untouched — that refusal
+        is the recovery point for a stale file left by a previous boot: unlink
+        it deliberately, then create again.
+
+        Durability is an explicit **non-goal**: the library never calls
+        ``msync``, and the file is a transport medium, not a database.
+        """
+        lib_ = _resolve_library(library)
+        ffi = lib_.ffi
+        errp = ffi.new("int*")
+        handle = lib_.lib.shuttle_create_file(_encode(path), capacity,
+                                              max_payload, flags, errp)
+        if handle == ffi.NULL:
+            raise error_for_code(errp[0], "create_file {!r}".format(path))
+        return cls(lib_, handle, path, max_payload)
+
+    @classmethod
+    def open_file(cls, path, library=None):
+        """Attach to the file-backed channel in the file at ``path`` (v1.4).
+
+        The same bounded init wait and the same header validation ``open``
+        performs. That matters more here than for shm: a file survives a reboot,
+        so it can be a stale segment (or not a segment at all), and those checks
+        are what turn that into ``Corrupt`` / ``InitTimeout`` instead of
+        garbage.
+        """
+        lib_ = _resolve_library(library)
+        ffi = lib_.ffi
+        errp = ffi.new("int*")
+        handle = lib_.lib.shuttle_open_file(_encode(path), errp)
+        if handle == ffi.NULL:
+            raise error_for_code(errp[0], "open_file {!r}".format(path))
+        return cls(lib_, handle, path)
+
+    @staticmethod
+    def unlink_file(path, library=None):
+        """Remove a file-backed segment's file. Live mappings stay valid."""
+        lib_ = _resolve_library(library)
+        check(lib_.lib.shuttle_unlink_file(_encode(path)),
+              "unlink_file {!r}".format(path))
 
     @classmethod
     def open(cls, name, library=None):
@@ -569,6 +631,11 @@ class Channel:
 def unlink(name, library=None):
     """Module-level alias for ``Channel.unlink``."""
     Channel.unlink(name, library=library)
+
+
+def unlink_file(path, library=None):
+    """Module-level alias for ``Channel.unlink_file`` (v1.4)."""
+    Channel.unlink_file(path, library=library)
 
 
 def _encode(name):

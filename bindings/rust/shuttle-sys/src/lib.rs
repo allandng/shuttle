@@ -2,10 +2,11 @@
 //!
 //! This crate is the complete surface as of ABI v1.4 and nothing else: the ten
 //! frozen v1 functions `shuttle_create`..`shuttle_keepalive`, plus the additive
-//! `shuttle_create_ex` (v1.1) and `shuttle_get_stats` (v1.2). Every declaration
-//! is transcribed by hand from `include/shuttle/shuttle_c.h`, which is the
-//! single source of truth. No symbol appears here that the header does not
-//! declare.
+//! `shuttle_create_ex` (v1.1), `shuttle_get_stats` (v1.2), and the file-backed
+//! trio `shuttle_create_file` / `shuttle_open_file` / `shuttle_unlink_file`
+//! (v1.4). Every declaration is transcribed by hand from
+//! `include/shuttle/shuttle_c.h`, which is the single source of truth. No symbol
+//! appears here that the header does not declare.
 //!
 //! `SHUTTLE_ABI_VERSION` is still 1: everything since v1.1 has been a new
 //! symbol or a new constant, never a changed signature.
@@ -93,6 +94,17 @@ pub const SHUTTLE_CREATE_STATS: u32 = 0x8;
 /// rejects with [`SHUTTLE_ERR_CORRUPT`]. That is deliberate: such a peer would
 /// otherwise misparse every frame.
 pub const SHUTTLE_CREATE_ALIGNED_SPANS: u32 = 0x10;
+/// Create-flag (v1.4): the segment lives in a FILE rather than a POSIX shm
+/// object, so capacity is bounded by the filesystem and the OS page cache
+/// decides residency.
+///
+/// The one create-flag that is **not** passed to [`shuttle_create_ex`]:
+/// selecting this backing means supplying a path, and `shuttle_create_ex` takes
+/// an shm name. It is set by [`shuttle_create_file`], which is how the backing
+/// is chosen; passed to `shuttle_create_ex` it is masked off and ignored, like
+/// any bit that entry point does not implement. Persisted and informational —
+/// an opener takes no action on it.
+pub const SHUTTLE_CREATE_FILE_BACKED: u32 = 0x20;
 
 /// Counter snapshot (v1.2). A plain five-`u64` record, in exactly this order —
 /// the C struct is the ABI shape, and the caller allocates it.
@@ -150,6 +162,34 @@ extern "C" {
 
     /// Remove the named shm object. Live mappings stay valid until closed.
     pub fn shuttle_unlink(name: *const c_char) -> c_int;
+
+    // --- file-backed lifecycle (v1.4) --------------------------------------
+
+    /// v1.4: create a channel whose segment is a FILE at an absolute `path`
+    /// instead of a POSIX shm object. `path` must start with `/`; NULL, empty
+    /// and relative paths are `SHUTTLE_ERR_INVALID_ARGS`. There is no
+    /// shm-style length limit — the filesystem's own limit surfaces as
+    /// `SHUTTLE_ERR_NAME_TOO_LONG`.
+    ///
+    /// `create_flags` takes the same bits as [`shuttle_create_ex`] except the
+    /// two hugetlb bits, which are rejected with `SHUTTLE_ERR_INVALID_ARGS`;
+    /// [`SHUTTLE_CREATE_FILE_BACKED`] is set automatically. An existing file is
+    /// `SHUTTLE_ERR_EXISTS` and is never truncated.
+    pub fn shuttle_create_file(
+        path: *const c_char,
+        capacity_bytes: usize,
+        max_payload_bytes: usize,
+        create_flags: u32,
+        err: *mut c_int,
+    ) -> *mut shuttle_channel;
+
+    /// v1.4: attach to the file-backed channel in the file at `path`. Same
+    /// bounded init wait and same header validation as [`shuttle_open`].
+    pub fn shuttle_open_file(path: *const c_char, err: *mut c_int) -> *mut shuttle_channel;
+
+    /// v1.4: remove a file-backed segment's file. Live mappings stay valid
+    /// until closed, exactly as for a name.
+    pub fn shuttle_unlink_file(path: *const c_char) -> c_int;
 
     // --- copy path ---------------------------------------------------------
 

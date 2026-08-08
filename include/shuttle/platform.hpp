@@ -146,15 +146,28 @@ inline bool shm_name_ok(const char* name) noexcept {
 // open and on unlink — the hugetlb file is then only reachable by unlinking
 // twice. Nothing in the library creates that situation; it needs two creators
 // racing on one name, which is already a contract breach (create is O_EXCL).
+//
+// A THIRD NAMESPACE (kFile, v1.4) is deliberately NOT part of that probe: its
+// identifier is an absolute PATH the caller chose, not a name this library
+// decorates, and it is reached only through the seg_*_file trio below. See the
+// block above those functions for why they are separate symbols rather than a
+// fourth case inside seg_open.
 // ---------------------------------------------------------------------
 
 // How a segment's pages are obtained. Additive by design: the hugetlb backings
-// slotted in beside kShm without changing a single signature below.
+// slotted in beside kShm without changing a single signature below, and kFile
+// slotted in beside them the same way.
 enum class SegBacking : uint32_t {
     // POSIX shm object; default page size (THP advice is a separate flag).
     kShm = 0,
     kHugeTLB2M = 1,  // file on a 2 MB-pagesize hugetlbfs mount (Linux only)
     kHugeTLB1G = 2,  // file on a 1 GB-pagesize hugetlbfs mount (Linux only)
+    // Ordinary file at a caller-supplied absolute path (v1.4). Normal pages, no
+    // fixed granularity — so it behaves exactly like kShm everywhere the
+    // BACKING is what matters (seg_map_len below returns `len` unchanged for
+    // both). What differs is only how the object is obtained and destroyed,
+    // which is the seg_*_file trio and nothing else.
+    kFile = 3,
 };
 
 // Handle to a live segment. POSIX: a file descriptor. Windows: the Win32
@@ -346,9 +359,10 @@ inline bool huge_seg_path(const char* mount, const char* name, char* out,
 
 // Length the mapping must actually cover for `backing`. hugetlbfs refuses a
 // size that is not a multiple of its page size, so a hugetlb segment is rounded
-// UP; kShm is exact. The header's data_capacity keeps the caller's value — the
-// rounding is slack past the end of the data region, and every coverage check
-// in the codebase is `>=`, never `==`, precisely so a larger object is legal.
+// UP; kShm and kFile are exact (neither has a granularity of its own). The
+// header's data_capacity keeps the caller's value — the rounding is slack past
+// the end of the data region, and every coverage check in the codebase is `>=`,
+// never `==`, precisely so a larger object is legal.
 inline size_t seg_map_len(size_t len, SegBacking backing) noexcept {
     const size_t ps = seg_huge_page_size(backing);
     if (ps == 0) return len;
@@ -542,6 +556,108 @@ inline SegHandle seg_open(const char* name, int& err_out) noexcept {
     err_out = shm_err;
     return kSegInvalid;
 #endif  // SHUTTLE_PLATFORM_WINDOWS
+}
+
+// ---------------------------------------------------------------------
+// FILE-BACKED SEGMENTS (SegBacking::kFile, v1.4).
+//
+// The segment object is an ordinary file at an absolute path the caller chose,
+// so a channel's capacity is bounded by the FILESYSTEM rather than by RAM (or
+// by /dev/shm's tmpfs limit) and residency is the page cache's problem. Only
+// the three functions here differ from the shm path; seg_map / seg_unmap /
+// seg_size / seg_close / seg_keep_after_map are backing-agnostic and are used
+// unchanged, because an fd is an fd.
+//
+// WHY SEPARATE SYMBOLS instead of a `SegBacking` parameter on seg_open, or a
+// fourth case in its probe: the identifier changes TYPE. seg_open's probe walks
+// namespaces looking for a NAME the library decorates ("/x" -> /dev/shm/x, ->
+// <mount>/shuttle_x); a path is already the object's location and needs no
+// search. Deciding "is this string a name or a path?" by inspecting it is not
+// possible — "/tmp/cache" is a syntactically legal shm name — so someone has to
+// say, and the caller is the only one who knows. Saying it by CALLING A
+// DIFFERENT FUNCTION makes that a compile-time fact instead of a runtime guess,
+// and it leaves the name-based paths above byte-for-byte untouched: no existing
+// signature moves, no existing branch is re-entered, and a name-typed caller
+// cannot reach the file namespace by accident (which is exactly the
+// dual-namespace ambiguity the hugetlb work had to document its way out of).
+//
+// WINDOWS: stubbed to ENOTSUP this pass — the code compiles, the capability is
+// absent, and a documented parity gap says so (docs/API.md, "File-backed
+// channels"). The Win32 form would be CreateFileW + CreateFileMappingW on that
+// handle rather than on INVALID_HANDLE_VALUE; it is not attempted here because
+// the experimental Windows backend has no crash-recovery story to test it
+// against.
+// ---------------------------------------------------------------------
+
+// A usable file-backed identifier: an ABSOLUTE path. Relative paths are refused
+// rather than resolved, because a channel's identity must not depend on which
+// directory each peer happened to be started in. There is no length rule of our
+// own — unlike shm names, the filesystem's own limit is the only one, and it
+// reports itself as ENAMETOOLONG.
+inline bool seg_path_ok(const char* path) noexcept {
+    return path != nullptr && path[0] == '/';
+}
+
+// Create the file at `path` exclusively, owner-only (NFR-S1), and fix its size
+// at `len`. Same contract as seg_create: kSegInvalid + err_out on failure,
+// EEXIST for a collision, sizing is ONE-SHOT. The ftruncate leaves a sparse
+// file — blocks are allocated as the pages are dirtied, which is what lets a
+// capacity larger than free RAM (or even larger than the free disk, until it is
+// actually used) be created at all.
+inline SegHandle seg_create_file(const char* path, size_t len,
+                                 int& err_out) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    (void)path;
+    (void)len;
+    err_out = ENOTSUP;
+    return kSegInvalid;
+#else
+    const int fd = ::open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) {
+        err_out = errno;
+        return kSegInvalid;
+    }
+    if (::ftruncate(fd, static_cast<off_t>(len)) != 0) {
+        err_out = errno;
+        seg_close(fd);
+        (void)::unlink(path);  // leave nothing behind, exactly as seg_create
+        return kSegInvalid;
+    }
+    err_out = 0;
+    return fd;
+#endif
+}
+
+// Attach to an existing file-backed segment read/write. ENOENT means no such
+// file — there is nothing to probe, so the verdict is immediate.
+inline SegHandle seg_open_file(const char* path, int& err_out) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    (void)path;
+    err_out = ENOTSUP;
+    return kSegInvalid;
+#else
+    const int fd = ::open(path, O_RDWR);
+    if (fd < 0) {
+        err_out = errno;
+        return kSegInvalid;
+    }
+    err_out = 0;
+    return fd;
+#endif
+}
+
+// Destroy the file (the mapping, if any, outlives it — FR-5, ordinary POSIX
+// unlink semantics). Returns 0 or the errno; ENOENT means there was no such
+// file. Never touches the shm or hugetlbfs namespaces: a path names exactly one
+// object, so unlike seg_unlink there is nothing to probe and no precedence rule
+// to state.
+inline int seg_unlink_file(const char* path) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    (void)path;
+    return ENOTSUP;
+#else
+    return ::unlink(path) == 0 ? 0 : errno;
+#endif
 }
 
 // Byte size of the object behind `h`, or -1 if it cannot be determined — the

@@ -3,9 +3,10 @@
 ABI mode, not API mode: nothing here is compiled at install time, so the wheel
 is pure Python and binds whatever ``libshuttle_c`` the host provides. The cdef
 below is the complete surface as of ABI v1.4 — the ten frozen v1 functions,
-``shuttle_create_ex`` (v1.1), and ``shuttle_get_stats`` + ``shuttle_stats``
-(v1.2) — transcribed from include/shuttle/shuttle_c.h. No symbol is declared
-that the header does not declare.
+``shuttle_create_ex`` (v1.1), ``shuttle_get_stats`` + ``shuttle_stats`` (v1.2),
+and the file-backed trio ``shuttle_create_file`` / ``shuttle_open_file`` /
+``shuttle_unlink_file`` (v1.4) — transcribed from include/shuttle/shuttle_c.h.
+No symbol is declared that the header does not declare.
 
 ``SHUTTLE_ABI_VERSION`` is still 1: every addition since has been a new symbol
 or a new constant, never a changed signature, so a library built at any of these
@@ -41,6 +42,12 @@ shuttle_channel* shuttle_create_ex(const char* name, size_t capacity_bytes,
 shuttle_channel* shuttle_open(const char* name, int* err);
 void shuttle_close(shuttle_channel* ch);
 int shuttle_unlink(const char* name);
+
+shuttle_channel* shuttle_create_file(const char* path, size_t capacity_bytes,
+                                     size_t max_payload_bytes,
+                                     uint32_t create_flags, int* err);
+shuttle_channel* shuttle_open_file(const char* path, int* err);
+int shuttle_unlink_file(const char* path);
 
 int shuttle_write(shuttle_channel* ch, const void* data, size_t len,
                   int flags);
@@ -95,6 +102,15 @@ CREATE_STATS = 0x8
 #: can attach: the segment's page-rounded ``data_offset`` makes a peer built
 #: before v1.4 report ``Corrupt``. See docs/API.md.
 CREATE_ALIGNED_SPANS = 0x10
+#: SHUTTLE_CREATE_FILE_BACKED (v1.4) — the segment lives in a FILE rather than a
+#: POSIX shm object, so capacity is bounded by the filesystem and the page cache
+#: decides residency. The one create-flag you never pass to ``Channel.create``:
+#: choosing this backing means supplying a PATH, so it is selected by calling
+#: ``Channel.create_file`` instead, which sets the bit itself. Passed to
+#: ``create`` it is simply masked off (not an error), like any bit that entry
+#: point cannot implement. Persisted and informational — read it back off a
+#: segment to see what the creator asked for.
+CREATE_FILE_BACKED = 0x20
 
 ABI_VERSION = 1
 

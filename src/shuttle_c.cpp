@@ -41,6 +41,7 @@ static_assert(SHUTTLE_CREATE_HUGETLB_2MB == shuttle::kFlagHugeTLB2M);
 static_assert(SHUTTLE_CREATE_HUGETLB_1GB == shuttle::kFlagHugeTLB1G);
 static_assert(SHUTTLE_CREATE_STATS == shuttle::kFlagStats);
 static_assert(SHUTTLE_CREATE_ALIGNED_SPANS == shuttle::kFlagAlignedSpans);
+static_assert(SHUTTLE_CREATE_FILE_BACKED == shuttle::kFlagFileBacked);
 // It is a CREATE-flag: it must never collide with a per-op bit, which is passed
 // through the same `int flags` slot on the read/write calls.
 static_assert(SHUTTLE_CREATE_ALIGNED_SPANS !=
@@ -139,6 +140,49 @@ shuttle_channel* shuttle_open(const char* name, int* err) {
     } catch (...) {
         set_err(err, SHUTTLE_ERR_SYS);
         return nullptr;
+    }
+}
+
+// --- file-backed lifecycle (v1.4) ------------------------------------------
+// Path-typed twins of create_ex/open/unlink. The handle they return is an
+// ordinary shuttle_channel — every other entry point in this file works on it
+// unchanged, shuttle_close included, because what differs is where the segment
+// object lives and nothing about the channel itself.
+
+shuttle_channel* shuttle_create_file(const char* path, size_t capacity_bytes,
+                                     size_t max_payload_bytes,
+                                     uint32_t create_flags, int* err) {
+    try {
+        int e = 0;
+        shuttle::Channel* ch = shuttle::create_file(
+            path, capacity_bytes, max_payload_bytes, &e, create_flags);
+        set_err(err, e);
+        if (ch == nullptr) return nullptr;
+        return new shuttle_channel{ch, nullptr, nullptr, nullptr, 0, false};
+    } catch (...) {
+        set_err(err, SHUTTLE_ERR_SYS);
+        return nullptr;
+    }
+}
+
+shuttle_channel* shuttle_open_file(const char* path, int* err) {
+    try {
+        int e = 0;
+        shuttle::Channel* ch = shuttle::open_file(path, &e);
+        set_err(err, e);
+        if (ch == nullptr) return nullptr;
+        return new shuttle_channel{ch, nullptr, nullptr, nullptr, 0, false};
+    } catch (...) {
+        set_err(err, SHUTTLE_ERR_SYS);
+        return nullptr;
+    }
+}
+
+int shuttle_unlink_file(const char* path) {
+    try {
+        return shuttle::unlink_file(path);
+    } catch (...) {
+        return SHUTTLE_ERR_SYS;
     }
 }
 

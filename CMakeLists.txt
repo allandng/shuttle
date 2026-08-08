@@ -220,6 +220,9 @@ target_link_libraries(shuttle_drop_policy_test PRIVATE shuttle_c shuttle_core Th
 add_executable(shuttle_aligned_spans_test tests/aligned_spans_test.cpp)
 target_link_libraries(shuttle_aligned_spans_test PRIVATE shuttle_c shuttle_core Threads::Threads)
 
+add_executable(shuttle_filebacked_test tests/filebacked_test.cpp)
+target_link_libraries(shuttle_filebacked_test PRIVATE shuttle_c shuttle_core Threads::Threads)
+
 add_executable(shuttle_inspect tools/inspect.cpp)
 target_link_libraries(shuttle_inspect PRIVATE shuttle_core)
 
@@ -259,6 +262,7 @@ add_test(NAME shuttle_hugetlb_test COMMAND shuttle_hugetlb_test)
 add_test(NAME shuttle_stats_test COMMAND shuttle_stats_test)
 add_test(NAME shuttle_drop_policy_test COMMAND shuttle_drop_policy_test)
 add_test(NAME shuttle_aligned_spans_test COMMAND shuttle_aligned_spans_test)
+add_test(NAME shuttle_filebacked_test COMMAND shuttle_filebacked_test)
 add_test(NAME shuttle_bench_g71 COMMAND shuttle_bench)
 add_test(NAME shuttle_nocopy_cpu_test COMMAND shuttle_nocopy_cpu_test)
 add_test(NAME shuttle_wake_under_load_test COMMAND shuttle_wake_under_load_test)
@@ -272,7 +276,7 @@ set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_cabi_rust_test shuttle_cabi_errors_test
                      shuttle_hugepage_test shuttle_hugetlb_test
                      shuttle_stats_test shuttle_drop_policy_test
-                     shuttle_aligned_spans_test
+                     shuttle_aligned_spans_test shuttle_filebacked_test
                      shuttle_bench_g71 shuttle_nocopy_cpu_test
                      shuttle_wake_under_load_test
                      PROPERTIES TIMEOUT 300)

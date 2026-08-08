@@ -551,6 +551,121 @@ def test_aligned_and_stats_compose():
         Channel.unlink(name)
 
 
+# --- v1.4 surface: file-backed channels ------------------------------------
+
+
+@pytest.fixture
+def seg_path(tmp_path):
+    """An absolute path for a file-backed segment, removed afterward."""
+    path = str(tmp_path / "chan.seg")
+    yield path
+    try:
+        Channel.unlink_file(path)
+    except shuttle_ipc.NotFound:
+        pass
+
+
+def test_file_backed_roundtrip(seg_path):
+    """The whole feature: a channel whose segment is a file on disk."""
+    producer = Channel.create_file(seg_path, CAPACITY, MAX_PAYLOAD)
+    consumer = Channel.open_file(seg_path)
+    try:
+        assert os.path.exists(seg_path)
+        # The file is sized to hold the geometry, which is where a capacity
+        # larger than RAM would come from.
+        assert os.path.getsize(seg_path) >= CAPACITY
+
+        payload = os.urandom(9999)
+        producer.write(payload)
+        with consumer.acquire_read() as view:  # zero-copy, out of a file
+            assert bytes(view) == payload
+
+        # ...and the borrow path on the producer side too.
+        blob = os.urandom(4096)
+        with producer.acquire_write(len(blob)) as buf:
+            buf[:] = blob
+        assert consumer.read() == blob
+    finally:
+        consumer.close()
+        producer.close()
+    Channel.unlink_file(seg_path)
+    assert not os.path.exists(seg_path)
+
+
+def test_file_backed_stats_compose(seg_path):
+    """0x28: file+stats. The backing changes nothing about the counters."""
+    producer = Channel.create_file(seg_path, CAPACITY, MAX_PAYLOAD,
+                                   flags=shuttle_ipc.CREATE_STATS)
+    consumer = Channel.open_file(seg_path)
+    try:
+        lengths = (1, 1000, 65536)
+        for n in lengths:
+            producer.write(b"f" * n)
+            with consumer.acquire_read() as view:
+                assert len(view) == n
+        stats = consumer.get_stats()
+        assert stats.msgs_written == stats.msgs_read == len(lengths)
+        assert stats.bytes_written == stats.bytes_read == sum(lengths)
+    finally:
+        consumer.close()
+        producer.close()
+
+
+def test_open_file_missing_raises_not_found(tmp_path):
+    with pytest.raises(shuttle_ipc.NotFound):
+        Channel.open_file(str(tmp_path / "nope.seg"))
+
+
+def test_unlink_file_missing_raises_not_found(tmp_path):
+    with pytest.raises(shuttle_ipc.NotFound):
+        Channel.unlink_file(str(tmp_path / "nope.seg"))
+
+
+def test_create_file_twice_raises_exists(seg_path):
+    """And the existing file is left alone — the stale-file recovery point."""
+    with Channel.create_file(seg_path, CAPACITY, MAX_PAYLOAD):
+        size = os.path.getsize(seg_path)
+        with pytest.raises(shuttle_ipc.Exists):
+            Channel.create_file(seg_path, CAPACITY, MAX_PAYLOAD)
+        assert os.path.getsize(seg_path) == size
+
+
+@pytest.mark.parametrize("bad", ["relative/chan.seg", "chan.seg", ""])
+def test_non_absolute_paths_raise_invalid_args(bad):
+    """A channel's identity must not depend on anyone's working directory."""
+    with pytest.raises(shuttle_ipc.InvalidArgs):
+        Channel.create_file(bad, CAPACITY, MAX_PAYLOAD)
+    with pytest.raises(shuttle_ipc.InvalidArgs):
+        Channel.open_file(bad)
+    with pytest.raises(shuttle_ipc.InvalidArgs):
+        Channel.unlink_file(bad)
+
+
+@pytest.mark.parametrize("bit", [shuttle_ipc.CREATE_HUGETLB_2MB,
+                                 shuttle_ipc.CREATE_HUGETLB_1GB])
+def test_file_backed_rejects_hugetlb_bits(seg_path, bit):
+    """A hugetlbfs backing and a path name two different segments."""
+    with pytest.raises(shuttle_ipc.InvalidArgs):
+        Channel.create_file(seg_path, CAPACITY, MAX_PAYLOAD, flags=bit)
+    assert not os.path.exists(seg_path)
+
+
+def test_create_masks_the_file_backed_bit():
+    """The documented asymmetry: 0x20 is not selectable through create().
+
+    ``create`` takes an shm NAME and has nowhere to put a path, so the bit is
+    masked off like any other it cannot implement — silently, per the
+    unknown-bit rule, not as an error.
+    """
+    name = unique_name()
+    with Channel.create(name, CAPACITY, MAX_PAYLOAD,
+                        flags=shuttle_ipc._ffi.CREATE_FILE_BACKED) as producer:
+        producer.write(b"an ordinary shm channel")
+        with Channel.open(name) as consumer:
+            assert consumer.read() == b"an ordinary shm channel"
+    Channel.unlink(name)
+
+
 def test_unknown_create_bits_are_masked_not_rejected():
     """An older library must tolerate a flag it does not implement."""
     name = unique_name()
