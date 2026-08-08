@@ -534,8 +534,16 @@ class Consumer {
             l |= static_cast<uint64_t>(blk[i]) << (8 * i);
         }
         // NFR-S2: a length the producer could never have written means the
-        // segment is corrupt; never hand out an out-of-bounds span.
-        if (l > h_->max_payload || kFrameHeader + l > avail) return kErrCorrupt;
+        // segment is corrupt; never hand out an out-of-bounds span. The
+        // available-space bound is subtraction against a checked floor, not
+        // the sum `kFrameHeader + l`: that addition wraps for an l near 2^64.
+        // The `l > max_payload` guard ahead of it already catches such an l on
+        // a validated segment, but keeping this form makes the backstop a real
+        // backstop rather than one that overflows in the same way (the class
+        // of bug fuzz/header_fuzz.cpp surfaced in validate_header).
+        if (l > h_->max_payload || avail < kFrameHeader ||
+            l > avail - kFrameHeader)
+            return kErrCorrupt;
         *payload = blk + kFrameHeader;
         *len = l;
         borrowed_ = kFrameHeader + l;

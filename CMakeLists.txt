@@ -313,3 +313,61 @@ if(SHUTTLE_INSTALL)
   install(FILES ${CMAKE_CURRENT_BINARY_DIR}/shuttle.pc
           DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 endif()
+
+# --- libFuzzer harnesses (opt-in, clang-only) --------------------------------
+# Deliberately the last block in the file and self-contained: the fuzz targets
+# share no target with the test/bench/install machinery above, and nothing
+# above changes when this is OFF (the default). They do inherit the file-scope
+# link_libraries(shuttle_san) — harmless, because the guard below forces
+# SHUTTLE_SAN=off, which makes shuttle_san an INTERFACE target carrying no
+# flags at all.
+option(SHUTTLE_FUZZ "Build libFuzzer harnesses (requires clang)" OFF)
+
+if(SHUTTLE_FUZZ)
+  # libFuzzer ships with clang's compiler-rt; gcc has no equivalent, so this is
+  # a hard requirement rather than a silent skip. Configure with
+  # `CC=clang CXX=clang++ cmake -B <dir> -DSHUTTLE_FUZZ=ON`.
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR
+      "SHUTTLE_FUZZ=ON requires clang (libFuzzer); this build uses "
+      "'${CMAKE_CXX_COMPILER_ID}'. Re-run in a fresh build dir with "
+      "CC=clang CXX=clang++.")
+  endif()
+
+  # The fuzz targets carry their OWN sanitizer flags (-fsanitize=fuzzer,
+  # address,undefined) and must not be crossed with the SHUTTLE_SAN machinery:
+  # SHUTTLE_SAN=tsan would try to link ThreadSanitizer and AddressSanitizer
+  # into one binary, which cannot work, and SHUTTLE_SAN=asan would leave two
+  # sources of truth for the same flags. An explicit error beats a documented
+  # constraint here because the failure mode of the tsan case is a linker
+  # error whose text points nowhere near this file. Fuzzing and the sanitizer
+  # test legs use separate build trees anyway.
+  if(NOT SHUTTLE_SAN STREQUAL "off")
+    message(FATAL_ERROR
+      "SHUTTLE_FUZZ=ON is incompatible with SHUTTLE_SAN=${SHUTTLE_SAN}: the "
+      "fuzz targets already build with -fsanitize=fuzzer,address,undefined. "
+      "Use a separate build directory for the sanitizer test legs.")
+  endif()
+
+  # -O1: libFuzzer needs a usable exec/s to get anywhere, and the project's
+  # default Debug build type otherwise leaves these unoptimized. -g and the
+  # frame pointer keep crash reports readable.
+  set(SHUTTLE_FUZZ_FLAGS -fsanitize=fuzzer,address,undefined
+                         -fno-omit-frame-pointer -O1 -g)
+
+  # bipbuffer.hpp is header-only, so this harness needs nothing else linked in.
+  add_executable(shuttle_bipbuffer_fuzz fuzz/bipbuffer_fuzz.cpp)
+  target_include_directories(shuttle_bipbuffer_fuzz PRIVATE include)
+  target_compile_options(shuttle_bipbuffer_fuzz PRIVATE ${SHUTTLE_FUZZ_FLAGS})
+  target_link_options(shuttle_bipbuffer_fuzz PRIVATE ${SHUTTLE_FUZZ_FLAGS})
+
+  # validate_header lives in src/shuttle.cpp, which is compiled INTO this
+  # target rather than linked from shuttle_core on purpose: shuttle_core is
+  # built without coverage instrumentation, so linking it would leave the
+  # fuzzer blind inside the very function under test.
+  add_executable(shuttle_header_fuzz fuzz/header_fuzz.cpp src/shuttle.cpp)
+  target_include_directories(shuttle_header_fuzz PRIVATE include)
+  target_compile_options(shuttle_header_fuzz PRIVATE ${SHUTTLE_FUZZ_FLAGS})
+  target_link_options(shuttle_header_fuzz PRIVATE ${SHUTTLE_FUZZ_FLAGS})
+  target_link_libraries(shuttle_header_fuzz PRIVATE Threads::Threads)
+endif()

@@ -33,7 +33,14 @@ Channel* create(const char* name, size_t capacity_bytes,
     }
     // FR-4: a write that can never be satisfied must be impossible by
     // construction, or blocking backpressure would park the producer forever.
-    if (capacity_bytes < max_payload_bytes + kFrameHeader) {
+    // Written as subtraction against a checked floor, never as the sum
+    // `max_payload_bytes + kFrameHeader`: that addition wraps for a
+    // max_payload near 2^64 and would let this guard pass on a geometry
+    // open()/validate_header now correctly reject (see validate_header's
+    // overflow note). Rejecting it here too keeps create() from minting a
+    // segment no opener will accept.
+    if (capacity_bytes < kFrameHeader ||
+        max_payload_bytes > capacity_bytes - kFrameHeader) {
         set_err(err, kErrCapacityTooSmall);
         return nullptr;
     }
@@ -139,6 +146,61 @@ Channel* create(const char* name, size_t capacity_bytes,
     return new Channel{base, map_len, h};
 }
 
+// The pure post-map validation, lifted verbatim out of open() (see the
+// declaration for what deliberately stayed behind). Reads only the cold
+// identity block — magic, version, flags-free geometry — and never touches a
+// byte outside [base, base + map_len).
+int validate_header(const void* base, size_t map_len) noexcept {
+    // Totality guard, not a new rule: open() has already rejected an object
+    // smaller than the smallest known header (kDataOffsetV1) BEFORE mapping
+    // it, so on that path this is unreachable and open()'s behavior is
+    // unchanged. It exists so the function is safe for a caller that hands
+    // over an arbitrary short range — the verdict is the same kErrCorrupt
+    // open() gives such an object.
+    if (base == nullptr || map_len < kDataOffsetV1) return kErrCorrupt;
+    const auto* h = static_cast<const ChannelHeader*>(base);
+
+    // FR-3: magic first, then version, distinct errors.
+    if (h->magic != kMagic) return kErrBadMagic;
+    // Two layouts are readable: the v1 default and the opt-in stats layout.
+    // Anything else is a header shape this binary does not know, and mapping
+    // it would mean guessing where the data region starts — refuse. (This is
+    // exactly what an OLD binary does when handed a v2 segment: its check is
+    // `!= kVersion`, so it reports kErrBadVersion. Designed behavior.)
+    if (h->version != kVersion && h->version != kVersionStats) {
+        return kErrBadVersion;
+    }
+    // NFR-S2: never trust header geometry — everything later indexes off it.
+    // The version chooses which data_offset is the ONLY legal one; a segment
+    // whose version and geometry disagree (e.g. a v1 header with its version
+    // word poked to 2) is corrupt, not merely unknown — hence the distinct
+    // error. Coverage check is >= not ==: macOS rounds shm st_size up to page
+    // size, so the mapping may legitimately be larger than the claimed
+    // geometry.
+    //
+    // Every comparison here is written as a SUBTRACTION against a checked
+    // floor, never as a sum. `data_offset + data_capacity` and
+    // `max_payload + kFrameHeader` are uint64 additions on attacker-supplied
+    // words, and a sum that wraps past 2^64 turns the guard into its own
+    // opposite. That is not hypothetical: the frame-length form was written
+    // as `h->max_payload + kFrameHeader > h->data_capacity`, and
+    // fuzz/header_fuzz.cpp found in ~2 seconds that max_payload =
+    // 0xFFFFFFFFFFFFFFFF wraps it to 7 > data_capacity == false — so open()
+    // ACCEPTED a segment claiming an 18-exabyte max_payload. Downstream that
+    // disarms Consumer::parse's `l > h_->max_payload` length guard, and a
+    // forged frame length of 2^64-8 is then handed to the caller as a valid
+    // span. Keep these in subtraction form.
+    const uint64_t want_offset =
+        h->version == kVersionStats ? kDataOffsetV2 : kDataOffsetV1;
+    if (h->data_offset != want_offset || map_len < want_offset ||
+        h->data_capacity > map_len - want_offset ||
+        h->data_capacity < kFrameHeader ||
+        h->max_payload > h->data_capacity - kFrameHeader) {
+        return kErrCorrupt;
+    }
+    return kOk;
+}
+
 Channel* open(const char* name, int* err) {
     if (name == nullptr || name[0] != '/') {
         set_err(err, kErrInvalidArgs);
@@ -183,36 +245,13 @@ Channel* open(const char* name, int* err) {
         usleep(1000);
     }
 
-    // FR-3: magic first, then version, distinct errors.
-    if (h->magic != kMagic) {
+    // FR-3 / NFR-S2: magic, version, geometry. Pure and self-contained, so it
+    // lives in validate_header() where a fuzzer can reach it directly; the
+    // codes and their precedence are exactly what this block reported inline.
+    const int verdict = validate_header(base, map_len);
+    if (verdict != kOk) {
         seg_unmap(base, map_len);
-        set_err(err, kErrBadMagic);
-        return nullptr;
-    }
-    // Two layouts are readable: the v1 default and the opt-in stats layout.
-    // Anything else is a header shape this binary does not know, and mapping
-    // it would mean guessing where the data region starts — refuse. (This is
-    // exactly what an OLD binary does when handed a v2 segment: its check is
-    // `!= kVersion`, so it reports kErrBadVersion. Designed behavior.)
-    if (h->version != kVersion && h->version != kVersionStats) {
-        seg_unmap(base, map_len);
-        set_err(err, kErrBadVersion);
-        return nullptr;
-    }
-    // NFR-S2: never trust header geometry — everything later indexes off it.
-    // The version chooses which data_offset is the ONLY legal one; a segment
-    // whose version and geometry disagree (e.g. a v1 header with its version
-    // word poked to 2) is corrupt, not merely unknown — hence the distinct
-    // error. Coverage check is >= not ==: macOS rounds shm st_size up to page
-    // size, so the mapping may legitimately be larger than the claimed
-    // geometry.
-    const uint64_t want_offset =
-        h->version == kVersionStats ? kDataOffsetV2 : kDataOffsetV1;
-    if (h->data_offset != want_offset || map_len < want_offset ||
-        h->data_capacity > map_len - want_offset ||
-        h->max_payload + kFrameHeader > h->data_capacity) {
-        seg_unmap(base, map_len);
-        set_err(err, kErrCorrupt);
+        set_err(err, verdict);
         return nullptr;
     }
 

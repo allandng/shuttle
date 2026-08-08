@@ -86,8 +86,27 @@ struct Channel {
 Channel* create(const char* name, size_t capacity_bytes,
                 size_t max_payload_bytes, int* err, uint32_t create_flags = 0);
 
+// FR-3 / NFR-S2: the pure, post-map half of open()'s validation — magic,
+// version, and the version-selected geometry — over an already-mapped byte
+// range [base, base + map_len). No syscalls, no I/O, no global state: it only
+// reads the cold identity block, which the creator writes once before it
+// release-stores init_state. open() calls this after its init-state spin, and
+// is the only reason the function exists as a separate symbol: it makes the
+// validation testable and fuzzable (fuzz/header_fuzz.cpp) against arbitrary
+// bytes without a real segment behind them.
+//
+// Returns kOk, kErrBadMagic, kErrBadVersion, or kErrCorrupt — the same codes,
+// in the same precedence, that open() reports. A null base or a range shorter
+// than the smallest known header (kDataOffsetV1) is kErrCorrupt, matching the
+// verdict open() already reaches before mapping such an object; the function
+// never reads outside the range it was given.
+//
+// NOT included, because neither is pure: the acquire-spin on init_state and
+// the peer-liveness/THP work. Both stay in open().
+int validate_header(const void* base, size_t map_len) noexcept;
+
 // FR-2/FR-3: attach without re-init; waits for init publication, then
-// validates magic, version, and header sanity (NFR-S2).
+// validates magic, version, and header sanity (NFR-S2) via validate_header.
 Channel* open(const char* name, int* err);
 
 // FR-5: unmap and free the local handle; the named object survives.

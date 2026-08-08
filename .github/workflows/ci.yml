@@ -112,3 +112,55 @@ jobs:
           cmake --build build/ci-tsan -j
       - name: Test
         run: ctest --test-dir build/ci-tsan --output-on-failure -E "$PERF_TESTS"
+
+  # Fuzz smoke: a MINUTE of libFuzzer per harness, not a campaign. The point is
+  # to keep the two harnesses building and running against every change — a
+  # harness that silently stops compiling is worse than no harness — and to
+  # catch the regressions that are cheap to find, which in practice means the
+  # ones a minute of coverage-guided mutation reaches from an empty corpus. No
+  # corpus is checked in and none is cached, so each run starts cold and
+  # explores a different path; treat a failure here as real, not as flake.
+  # Serious fuzzing runs out of band, for hours, with a persistent corpus.
+  #
+  # Linux-only and clang-only: libFuzzer ships with clang's compiler-rt and gcc
+  # has no equivalent, which is why -DSHUTTLE_FUZZ=ON hard-errors under g++.
+  # libclang-rt-18-dev is what actually provides libclang_rt.fuzzer-x86_64.a;
+  # it is pinned to 18 because that is what the `clang` metapackage resolves to
+  # on ubuntu-24.04. If a future image moves clang off 18, this job fails at
+  # LINK time with a missing libclang_rt.fuzzer — bump both together.
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-rt-18-dev cmake
+      - name: Configure + build (libFuzzer + ASan/UBSan)
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          mkdir -p fuzz-artifacts
+          cmake -B build/ci-fuzz -DSHUTTLE_FUZZ=ON -DSHUTTLE_BUILD_TESTS=OFF
+          cmake --build build/ci-fuzz -j \
+            --target shuttle_bipbuffer_fuzz shuttle_header_fuzz
+      - name: Fuzz BipBuffer (60s)
+        run: |
+          ./build/ci-fuzz/shuttle_bipbuffer_fuzz -max_total_time=60 \
+            -rss_limit_mb=2048 -print_final_stats=1 \
+            -artifact_prefix=./fuzz-artifacts/bipbuffer-
+      - name: Fuzz header validation (60s)
+        run: |
+          ./build/ci-fuzz/shuttle_header_fuzz -max_total_time=60 \
+            -rss_limit_mb=2048 -print_final_stats=1 \
+            -artifact_prefix=./fuzz-artifacts/header-
+      # A crash whose reproducer stays on the dead runner is a crash nobody can
+      # act on: libFuzzer writes the exact input that failed, so keep it.
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz-artifacts/
+          if-no-files-found: ignore
