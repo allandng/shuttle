@@ -47,8 +47,8 @@ consumer yet — the role is bound lazily on first use of the corresponding path
 
 ```c
 #define SHUTTLE_CREATE_HUGEPAGES   0x1
-#define SHUTTLE_CREATE_HUGETLB_2MB 0x2  /* RESERVED — not implemented yet */
-#define SHUTTLE_CREATE_HUGETLB_1GB 0x4  /* RESERVED — not implemented yet */
+#define SHUTTLE_CREATE_HUGETLB_2MB 0x2
+#define SHUTTLE_CREATE_HUGETLB_1GB 0x4
 #define SHUTTLE_CREATE_STATS       0x8
 shuttle_channel* shuttle_create_ex(const char* name, size_t capacity_bytes,
                                    size_t max_payload_bytes,
@@ -71,13 +71,85 @@ not be mixed. Unknown flag bits are masked off and ignored (never persisted).
   keep them updated. See **Statistics** below — this is the one create-flag
   that changes the segment's **layout version** (1 → 2), and therefore which
   peers can open it.
-- `SHUTTLE_CREATE_HUGETLB_2MB` / `SHUTTLE_CREATE_HUGETLB_1GB`: **reserved**.
-  The bit values are pinned so nothing else can claim them, but the behavior
-  (explicit hugetlbfs-backed segments) is not implemented. Until it is, these
-  bits are treated exactly like unknown bits: masked off, not persisted, no
-  error. Do not set them expecting an effect.
-- Errors: identical set to `shuttle_create`. Passing only unknown bits is not
-  an error; they are silently masked.
+- `SHUTTLE_CREATE_HUGETLB_2MB` / `SHUTTLE_CREATE_HUGETLB_1GB`: back the segment
+  with **explicit, reserved huge pages** of that size. See **Explicit huge
+  pages (hugetlbfs)** below — this is a guarantee-or-error flag, not advice,
+  and it never falls back to normal pages.
+- Errors: `shuttle_create`'s set, plus `INVALID_ARGS` if **both** hugetlb bits
+  are set (they name two different page sizes; neither can be silently
+  dropped), and `NO_HUGEPAGES` if a hugetlb request cannot be honored. Passing
+  only unknown bits is not an error; they are silently masked.
+
+#### Explicit huge pages (hugetlbfs)
+
+`SHUTTLE_CREATE_HUGEPAGES` (THP) and `SHUTTLE_CREATE_HUGETLB_*` sound alike and
+are opposites in the only way that matters:
+
+| | `HUGEPAGES` (THP) | `HUGETLB_2MB` / `HUGETLB_1GB` |
+|---|---|---|
+| Mechanism | `madvise(MADV_HUGEPAGE)` on a normal shm mapping | segment object is a **file on a hugetlbfs mount** |
+| If unavailable | silently proceeds on normal pages | **fails with `NO_HUGEPAGES`; creates nothing** |
+| Platforms | Linux (no-op on macOS) | Linux only (always `NO_HUGEPAGES` on macOS) |
+| Setup needed | none | operator must reserve pages and mount hugetlbfs |
+
+**No silent fallback.** If the pages cannot be delivered — no hugetlbfs mount
+with that page size, no free reserved pages, no permission on the mount, or a
+platform without hugetlbfs — `shuttle_create_ex` returns `NULL` with
+`SHUTTLE_ERR_NO_HUGEPAGES` and leaves nothing behind. A caller that would
+rather have normal pages than an error must ask for them explicitly (retry
+without the flag); the library will not decide that silently. This is the
+entire difference from the advisory THP flag.
+
+**Where the pages come from.** The implementation parses `/proc/mounts` for
+`hugetlbfs` mounts and matches the `pagesize=` option against the requested
+size; a mount with no `pagesize=` option uses the system default, resolved from
+`/proc/meminfo`'s `Hugepagesize:`. The first matching mount wins. Reservation
+happens at **`mmap` time**, not at create time, so an exhausted pool surfaces
+as `NO_HUGEPAGES` from the mapping step — and the partially-created file is
+removed before returning.
+
+**Two namespaces.** A normal segment lives in the POSIX shm namespace
+(`/name` → `/dev/shm/name` on Linux); a hugetlb segment is a file named
+`shuttle_<name>` on the hugetlbfs mount. `shuttle_open` and `shuttle_unlink`
+take no flag and need no knowledge of the backing: they probe shm first, then
+every hugetlbfs mount. If a name somehow exists in **both** namespaces (which
+requires two creators racing on one name — already a contract breach, since
+create is `O_EXCL`), **shm wins** on open and on unlink, and the hugetlbfs file
+is only reachable by unlinking a second time.
+
+**Openers need nothing special.** No flag, no `MAP_HUGETLB` — that flag is for
+*anonymous* mappings. A `MAP_SHARED` mapping of a hugetlbfs file is huge-page
+backed because the file's filesystem says so, which is why an opener built
+without any awareness of this feature still maps the segment correctly. The
+hugetlb bits are persisted in the header purely so tools and peers can see what
+the creator asked for.
+
+**Size rounding.** hugetlbfs objects must be a whole number of huge pages, so
+the segment is rounded **up** (a 1 MB channel on 2 MB pages occupies one full
+page). `data_capacity` in the header still records the capacity you asked for;
+the extra bytes are slack past the end of the data region, tolerated by the
+same `>=` coverage checks that already tolerate macOS's shm page rounding.
+
+**Combining flags.** `SHUTTLE_CREATE_STATS` is orthogonal — `0x8|0x2` is a
+version-2 segment that happens to live on hugetlbfs. `SHUTTLE_CREATE_HUGEPAGES`
+combined with a hugetlb bit is **not** an error: the explicit backing wins and
+the THP advice is skipped as meaningless (both bits are still persisted).
+Setting both hugetlb bits at once **is** an error (`INVALID_ARGS`).
+
+**Operator recipe (Linux, root)** — without this, expect `NO_HUGEPAGES`:
+
+```sh
+sysctl -w vm.nr_hugepages=64                        # reserve 64 x 2 MB
+mkdir -p /dev/hugepages
+mount -t hugetlbfs -o pagesize=2M none /dev/hugepages
+grep -i huge /proc/meminfo && grep hugetlbfs /proc/mounts
+```
+
+Make the reservation permanent via `vm.nr_hugepages` in `/etc/sysctl.conf` and
+an `/etc/fstab` entry. A non-root process also needs write permission on the
+mount point (`mount -o uid=,gid=,mode=`, or `chmod`). 1 GB pages generally
+require the `hugepagesz=1G hugepages=N` kernel command line, since they cannot
+usually be reserved at runtime.
 
 ### shuttle_open
 
@@ -87,8 +159,13 @@ shuttle_channel* shuttle_open(const char* name, int* err);
 
 Attach to an existing channel without re-initializing it. Waits (deadlined, 5 s)
 for the creator's readiness publication, then validates magic, version, and
-header geometry before trusting any field. If the creator opted into huge pages,
-the opener's mapping is advised too.
+header geometry before trusting any field. If the creator opted into THP, the
+opener's mapping is advised too.
+
+The opener takes no flags and needs no knowledge of how the segment is backed:
+it looks in the POSIX shm namespace first, then on hugetlbfs mounts (see
+**Explicit huge pages** above), and a hugetlbfs-backed segment maps onto huge
+pages with no `MAP_HUGETLB` and no special call.
 
 Two layout versions are accepted: `1` (the default) and `2` (created with
 `SHUTTLE_CREATE_STATS`). The version selects the only legal `data_offset`, so a
@@ -119,8 +196,10 @@ NULL-safe. Never fails.
 int shuttle_unlink(const char* name);
 ```
 
-Remove the named shm object. Existing mappings remain valid until closed
-(POSIX unlink semantics).
+Remove the named object. Existing mappings remain valid until closed
+(POSIX unlink semantics). Like `shuttle_open`, it probes both namespaces — the
+shm object first, then the hugetlbfs file — so a hugetlb-backed channel is
+removed by the same call, with the same name.
 
 - Returns: `SHUTTLE_OK`, `INVALID_ARGS` (`name` NULL or `name[0] != '/'`),
   `NOT_FOUND` (no such object), `SYS` (other failure).
@@ -271,7 +350,7 @@ it — because the counters live in the segment, not in the handle.
 | -11   | `SHUTTLE_ERR_MSG_TOO_LARGE`   | Write payload `> max_payload`; or copy-read buffer smaller than the queued message (message stays queued). |
 | -12   | `SHUTTLE_ERR_WOULD_BLOCK`     | Non-blocking op cannot proceed right now (full on write, empty on read). |
 | -13   | `SHUTTLE_ERR_PEER_DEAD`       | A blocking wait aborted because the peer's heartbeat went stale. |
-| -14   | `SHUTTLE_ERR_NO_HUGEPAGES`    | **Reserved** for the explicit-hugetlb create path; nothing returns it today. |
+| -14   | `SHUTTLE_ERR_NO_HUGEPAGES`    | `create_ex` with `SHUTTLE_CREATE_HUGETLB_2MB`/`_1GB`: reserved huge pages could not be delivered (no hugetlbfs mount of that page size, no free pages, no permission, or a platform without hugetlbfs). Never a silent fallback to normal pages. |
 | -15   | `SHUTTLE_ERR_NO_STATS`        | `shuttle_get_stats` on a segment created without `SHUTTLE_CREATE_STATS`. |
 
 The C `#define`s are `static_assert`ed equal to the C++ `shuttle::Err` enum in
@@ -351,9 +430,11 @@ additive extension point, so new bits carry no version bump (an old opener
 simply does not act on a bit it does not recognize). Correspondingly the creator
 masks `create_flags` down to the bits it actually implements, so an unknown (or
 merely reserved-and-unimplemented) bit is never persisted into a segment.
-Recorded bits: `SHUTTLE_CREATE_HUGEPAGES` = `0x1`, `SHUTTLE_CREATE_STATS` =
-`0x8`; `0x2` / `0x4` are reserved for the unimplemented hugetlb backings and are
-masked off today.
+Recorded bits: `SHUTTLE_CREATE_HUGEPAGES` = `0x1`,
+`SHUTTLE_CREATE_HUGETLB_2MB` = `0x2`, `SHUTTLE_CREATE_HUGETLB_1GB` = `0x4`,
+`SHUTTLE_CREATE_STATS` = `0x8`. The hugetlb bits are persisted but
+informational — an opener takes no action on them, because the segment's
+location already determines its page size.
 
 **Version gate**: `flags` is ignorable, `version` is not. A version selects the
 physical size of the header, so an opener that does not recognize one cannot

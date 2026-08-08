@@ -38,38 +38,79 @@ Channel* create(const char* name, size_t capacity_bytes,
         return nullptr;
     }
 
-    // Known-bits mask. kFlagHugeTLB2M/1G are pinned but unimplemented, so they
-    // stay OUT of this mask: passing one today is masked off like any unknown
-    // bit, preserving "an unknown bit is never persisted". They join the mask
-    // in the package that implements them.
-    const uint32_t flags = create_flags & (kFlagHugePages | kFlagStats);
+    // Known-bits mask: every bit whose behavior has shipped. An unknown bit is
+    // masked off and therefore never persisted, so no segment in the wild
+    // carries a promise this binary did not keep.
+    const uint32_t flags = create_flags & (kFlagHugePages | kFlagStats |
+                                           kFlagHugeTLB2M | kFlagHugeTLB1G);
+    // The two hugetlb bits select a page size, so asking for both is asking
+    // for two different segments. Not maskable, not resolvable — reject.
+    if ((flags & kFlagHugeTLB2M) && (flags & kFlagHugeTLB1G)) {
+        set_err(err, kErrInvalidArgs);
+        return nullptr;
+    }
+    // Backing choice is a seam concern; here it is only a bit-to-enum mapping.
+    const SegBacking backing = (flags & kFlagHugeTLB2M) ? SegBacking::kHugeTLB2M
+                               : (flags & kFlagHugeTLB1G)
+                                   ? SegBacking::kHugeTLB1G
+                                   : SegBacking::kShm;
+    const bool explicit_huge = backing != SegBacking::kShm;
     // kFlagStats is the one flag that selects a LAYOUT, so it also selects the
     // version and the header size. Without it this writes exactly the v1
-    // segment it always did — the default on-disk format is unchanged.
+    // segment it always did — the default on-disk format is unchanged. It is
+    // orthogonal to the backing: a stats + hugetlb segment (flags 0x8|0x2) is
+    // an ordinary v2 header that happens to live on hugetlbfs.
     const bool with_stats = (flags & kFlagStats) != 0;
     const uint64_t data_offset = with_stats ? kDataOffsetV2 : kDataOffsetV1;
 
-    const size_t map_len = static_cast<size_t>(data_offset) + capacity_bytes;
-    // Backing choice is a seam concern (kShm today; hugetlbfs backings land
-    // there later); creation is exclusive and sizes the object once, for good.
+    // hugetlbfs sizes objects in whole huge pages, so the mapping may cover
+    // more than data_offset + capacity_bytes. data_capacity below still
+    // records the caller's exact value; the extra bytes are slack the coverage
+    // checks (all >=) tolerate, exactly as they already tolerate macOS's shm
+    // page rounding.
+    const size_t map_len =
+        seg_map_len(static_cast<size_t>(data_offset) + capacity_bytes, backing);
+    // Creation is exclusive and sizes the object once, for good.
     int seg_err = 0;
-    const SegHandle seg = seg_create(name, map_len, SegBacking::kShm, seg_err);
+    const SegHandle seg = seg_create(name, map_len, backing, seg_err);
     if (seg == kSegInvalid) {
-        set_err(err, seg_err == EEXIST ? kErrExists : kErrSys);
+        // A name collision is a name collision whatever the backing. Every
+        // OTHER hugetlb failure — no mount of that page size, no permission,
+        // no hugetlbfs at all (macOS) — means the guarantee cannot be
+        // delivered, and the contract is to say so rather than quietly hand
+        // back normal pages. EINVAL is the seam's "this name has no filename
+        // form" verdict, which is an argument problem, not a capacity one.
+        int code = kErrSys;
+        if (seg_err == EEXIST) {
+            code = kErrExists;
+        } else if (explicit_huge) {
+            code = seg_err == EINVAL ? kErrInvalidArgs : kErrNoHugePages;
+        }
+        set_err(err, code);
         return nullptr;
     }
     void* base = seg_map(seg, map_len);
     seg_close(seg);
     if (base == nullptr) {
         (void)seg_unlink(name);
-        set_err(err, kErrSys);
+        // hugetlbfs reserves its pages at MMAP time, not at create/ftruncate
+        // time: this is where a box with no free huge pages actually fails
+        // (ENOMEM). It is the same "cannot deliver" verdict as above.
+        set_err(err, explicit_huge ? kErrNoHugePages : kErrSys);
         return nullptr;
     }
 
     // Opt-in THP: advise the fresh mapping before it is touched. Advisory and
     // masked to known bits — an unknown flag must never be persisted (openers
-    // trust that flags carries only bits they may act on).
-    if (flags & kFlagHugePages) advise_huge_pages(base, map_len);
+    // trust that flags carries only bits they may act on). Skipped when the
+    // segment is already on explicit huge pages: advice about promoting normal
+    // pages is meaningless for a mapping whose pages are huge by construction
+    // (the kernel would just return EINVAL). Both bits are still persisted:
+    // the hugetlb bit is informational — an opener needs no action from it,
+    // because seg_open finds the hugetlbfs file and the file's inode already
+    // dictates the page size.
+    if ((flags & kFlagHugePages) && !explicit_huge)
+        advise_huge_pages(base, map_len);
 
     // Creation zero-fills, so init_state is already 0 (uninitialized) and
     // cursors/heartbeats are already 0 — and so are the v2 stats lines, which
@@ -176,9 +217,18 @@ Channel* open(const char* name, int* err) {
     }
 
     // The opener's mapping is independent of the creator's; if the creator
-    // opted into huge pages, advise this mapping too (advisory, ignores
-    // unknown bits per the flags contract). Only after the header is trusted.
-    if (h->flags & kFlagHugePages) advise_huge_pages(base, map_len);
+    // opted into THP, advise this mapping too (advisory, ignores unknown bits
+    // per the flags contract). Only after the header is trusted.
+    //
+    // An explicitly hugetlb-backed segment needs NOTHING here: seg_open found
+    // the file on the hugetlbfs mount, and a MAP_SHARED mapping of such a file
+    // is huge-page backed by virtue of the file's filesystem — MAP_HUGETLB is
+    // an ANONYMOUS-mapping flag and has no role on this path. So the hugetlb
+    // bits are read only to suppress the meaningless THP advice.
+    const bool seg_is_hugetlb =
+        (h->flags & (kFlagHugeTLB2M | kFlagHugeTLB1G)) != 0;
+    if ((h->flags & kFlagHugePages) && !seg_is_hugetlb)
+        advise_huge_pages(base, map_len);
 
     set_err(err, kOk);
     return new Channel{base, map_len, h};

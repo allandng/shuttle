@@ -29,15 +29,33 @@ Shipped and tested; listed here because they are frequently proposed as
   disallows it, never a correctness dependency. The flag is recorded in the
   segment header so the opener advises its own mapping too. Unknown create-flag
   bits are masked.
+- **Explicit hugetlbfs pages.** `shuttle_create_ex` with
+  `SHUTTLE_CREATE_HUGETLB_2MB` / `_1GB` puts the segment in *reserved* huge
+  pages: the object becomes a file on a hugetlbfs mount of that page size,
+  discovered by parsing `/proc/mounts` (a mount without `pagesize=` is resolved
+  against `/proc/meminfo`'s `Hugepagesize`). Unlike THP this is a guarantee or
+  an error — no mount, no free pages, or macOS all yield
+  `SHUTTLE_ERR_NO_HUGEPAGES` (-14) and create nothing. **Never a silent
+  fallback to normal pages**; that distinction is the entire point of the flag.
+  Openers need no flag and no `MAP_HUGETLB`: `shuttle_open` probes both
+  namespaces, and a `MAP_SHARED` mapping of a hugetlbfs file is huge-page
+  backed because the file says so.
+
+  Honest caveat about testing: the **positive** path runs only on a host where
+  an operator has reserved pages and mounted hugetlbfs, so CI (and any shared
+  runner) exercises the **error** path instead — `tests/hugetlb_test.cpp`
+  asserts the exact `-14`, the both-bits-set rejection, and that a failed
+  create leaves nothing in either namespace, then prints `SKIP` and exits 0.
+  The positive path was verified on a host with `vm.nr_hugepages=64` and a
+  2 MB hugetlbfs mount (cross-process open, byte-exact transfer,
+  `KernelPageSize: 2048 kB` observed in `/proc/self/smaps` on both sides);
+  it is not verified by every run. `MADV_COLLAPSE` was deliberately **not**
+  implemented: it collapses normal pages into THP, which is redundant once the
+  mapping is on explicitly reserved huge pages.
 
 ## v1.x candidates
 
 Plausible next steps; each carries a caveat that keeps it out of v1.
-
-- **Explicit hugetlbfs pages.** Reserved 2 MB / 1 GB pages (optionally
-  `MADV_COLLAPSE`) for guaranteed large-page backing rather than THP's advisory
-  best-effort. Needs dedicated hardware with reserved huge pages to test — CI
-  shared runners cannot provide it.
 - **Stats counters in the shared header.** Message/byte counters surfaced
   through the inspect tool. Touches the frozen segment layout, so it needs
   versioning care (the layout freeze is an ABI contract).

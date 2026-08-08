@@ -25,9 +25,11 @@ enum Err : int {
     kErrMsgTooLarge = -11,      // payload > max_payload: fail fast (§2.2)
     kErrWouldBlock = -12,       // non-blocking op cannot proceed (IF-3)
     kErrPeerDead = -13,         // blocked wait aborted: peer heartbeat stale
-    // RESERVED: returned by the explicit-hugetlb create path when the request
-    // cannot be honored. Assigned now and left unused so the numbering stays
-    // coordinated across packages — never reuse -14 for anything else.
+    // create with kFlagHugeTLB2M/1G: the explicit huge pages could not be
+    // delivered — no hugetlbfs mount of that page size, no free reserved pages
+    // (hugetlbfs accounts them at mmap time), or a platform without hugetlbfs
+    // at all. Never a silent downgrade to normal pages: that is the whole
+    // difference from the advisory kFlagHugePages.
     kErrNoHugePages = -14,
     kErrNoStats = -15,  // get_stats: segment has no stats block (v1 layout)
 };
@@ -52,10 +54,13 @@ struct Channel {
 
 // FR-1: shm_open(O_CREAT|O_EXCL) + one-shot ftruncate + mmap + header init,
 // publishing init last with a release store. Owner-only permissions (NFR-S1).
-// create_flags carries opt-in create-time bits (kFlagHugePages, kFlagStats);
-// unknown bits are masked off. Defaulted for source-compatibility with
-// pre-flags callers. kFlagStats additionally selects the kVersionStats layout;
-// without it the segment written is byte-for-byte the v1 format as before.
+// create_flags carries opt-in create-time bits (kFlagHugePages, kFlagStats,
+// kFlagHugeTLB2M, kFlagHugeTLB1G); unknown bits are masked off. Defaulted for
+// source-compatibility with pre-flags callers. kFlagStats additionally selects
+// the kVersionStats layout; without it the segment written is byte-for-byte the
+// v1 format as before. A hugetlb bit instead selects the segment's BACKING (a
+// hugetlbfs file) and can fail with kErrNoHugePages; setting both is
+// kErrInvalidArgs.
 Channel* create(const char* name, size_t capacity_bytes,
                 size_t max_payload_bytes, int* err, uint32_t create_flags = 0);
 

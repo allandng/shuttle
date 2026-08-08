@@ -39,12 +39,18 @@ constexpr uint32_t kInitReady = 0x52454459;  // "REDY"
 // kVersion bump (an old opener simply doesn't act on a bit it doesn't know).
 constexpr uint32_t kFlagHugePages = 0x1;  // creator advised MADV_HUGEPAGE
 
-// RESERVED — bit values pinned now, implementation lands with the explicit
-// hugetlbfs segment backings (SegBacking::kHugeTLB* in platform.hpp). They are
-// deliberately NOT in create()'s known-bits mask while unimplemented, so a
-// caller passing one today has it masked off exactly like any unknown bit: the
-// "an unknown bit is never persisted" rule keeps holding, and no segment in
-// the wild can carry a bit whose meaning has not shipped yet.
+// IMPLEMENTED: the segment is backed by EXPLICIT, reserved huge pages — a file
+// on a hugetlbfs mount of the matching page size (SegBacking::kHugeTLB* in
+// platform.hpp), not the advisory promotion kFlagHugePages asks for. The two
+// are mutually exclusive at create() (both set = kErrInvalidArgs), and a
+// request that cannot be honored fails with kErrNoHugePages rather than
+// falling back to normal pages.
+//
+// Persisted but INFORMATIONAL: an opener takes no action on these bits. It
+// does not need to — seg_open discovers the hugetlbfs file by name, and a
+// MAP_SHARED mapping of a hugetlbfs file is huge-page backed because the file
+// says so (MAP_HUGETLB is for anonymous mappings). The bits exist so tools,
+// tests, and peers can SEE what the creator asked for.
 constexpr uint32_t kFlagHugeTLB2M = 0x2;
 constexpr uint32_t kFlagHugeTLB1G = 0x4;
 

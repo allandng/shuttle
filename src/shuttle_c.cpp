@@ -28,8 +28,7 @@ static_assert(SHUTTLE_ERR_PEER_DEAD == shuttle::kErrPeerDead);
 static_assert(SHUTTLE_ERR_NO_HUGEPAGES == shuttle::kErrNoHugePages);
 static_assert(SHUTTLE_ERR_NO_STATS == shuttle::kErrNoStats);
 // Create-flag bits are a separate namespace from the per-op flags, but the C
-// value must still track the C++ header bit exactly — including the reserved
-// bits, whose whole purpose is to be pinned before they are implemented.
+// value must still track the C++ header bit exactly.
 static_assert(SHUTTLE_CREATE_HUGEPAGES == shuttle::kFlagHugePages);
 static_assert(SHUTTLE_CREATE_HUGETLB_2MB == shuttle::kFlagHugeTLB2M);
 static_assert(SHUTTLE_CREATE_HUGETLB_1GB == shuttle::kFlagHugeTLB1G);

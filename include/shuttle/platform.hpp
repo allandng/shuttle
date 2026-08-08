@@ -26,6 +26,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 
@@ -59,19 +60,33 @@ inline bool shm_name_ok(const char* name) noexcept {
 // goes through the six functions below, so a new way of obtaining the pages
 // — explicit hugetlbfs on Linux, a Windows file mapping — arrives as a new
 // SegBacking value plus a branch *here*, never as a syscall (or an #ifdef)
-// in src/. Today there is exactly one backing.
+// in src/.
 //
 // Error convention: functions that return a resource report failure with a
 // sentinel (kSegInvalid / nullptr) and write a POSIX errno-style code into
 // `err_out`; the two that return nothing useful return 0-or-errno directly.
 // A future non-POSIX backend translates its native error into that space,
 // so callers keep one platform-independent errno -> shuttle::Err mapping.
+//
+// TWO NAMESPACES (hugetlbfs). A kShm segment lives in the POSIX shm namespace
+// ("/name" -> /dev/shm/name on Linux); a hugetlb segment is an ordinary FILE
+// named "shuttle_<name>" on a hugetlbfs mount, because that is the only way to
+// get guaranteed reserved huge pages for a *named, cross-process* mapping.
+// Openers do not know which one a channel used, so seg_open/seg_unlink probe:
+// shm first, then every hugetlbfs mount. If the same channel name somehow
+// exists in BOTH namespaces (two creators, different backings), shm wins on
+// open and on unlink — the hugetlb file is then only reachable by unlinking
+// twice. Nothing in the library creates that situation; it needs two creators
+// racing on one name, which is already a contract breach (create is O_EXCL).
 // ---------------------------------------------------------------------
 
-// How a segment's pages are obtained. Additive by design: kHugeTLB2M /
-// kHugeTLB1G slot in beside kShm without changing a single signature below.
+// How a segment's pages are obtained. Additive by design: the hugetlb backings
+// slotted in beside kShm without changing a single signature below.
 enum class SegBacking : uint32_t {
-    kShm = 0,  // POSIX shm object; default page size (THP advice is separate)
+    // POSIX shm object; default page size (THP advice is a separate flag).
+    kShm = 0,
+    kHugeTLB2M = 1,  // file on a 2 MB-pagesize hugetlbfs mount (Linux only)
+    kHugeTLB1G = 2,  // file on a 1 GB-pagesize hugetlbfs mount (Linux only)
 };
 
 // Handle to a live segment. POSIX: a file descriptor. A Windows backend maps
@@ -80,12 +95,164 @@ enum class SegBacking : uint32_t {
 using SegHandle = int;
 inline constexpr SegHandle kSegInvalid = -1;
 
+// Buffer sizes for the hugetlbfs path discovery below. A hugetlbfs mount point
+// is a plain path; eight distinct mounts is already far past anything real
+// (one per page size, plus a few per-cgroup pools).
+inline constexpr size_t kSegPathMax = 512;
+inline constexpr size_t kMaxHugeMounts = 8;
+
 inline void seg_close(SegHandle h) noexcept { (void)::close(h); }
 
+// Bytes per page for a hugetlb backing; 0 for kShm (no fixed granularity).
+inline size_t seg_huge_page_size(SegBacking backing) noexcept {
+    switch (backing) {
+        case SegBacking::kHugeTLB2M:
+            return 2ull * 1024 * 1024;
+        case SegBacking::kHugeTLB1G:
+            return 1024ull * 1024 * 1024;
+        default:
+            return 0;
+    }
+}
+
+#if defined(SHUTTLE_PLATFORM_LINUX)
+namespace detail {
+
+// The system's DEFAULT huge page size, from /proc/meminfo's "Hugepagesize:"
+// line (kB). Needed because a hugetlbfs mount with no pagesize= option uses
+// the default size, and we must know which one that is before deciding
+// whether the mount can serve a 2 MB or a 1 GB request. 0 = unknown.
+inline size_t huge_default_page_size() noexcept {
+    std::FILE* f = std::fopen("/proc/meminfo", "re");
+    if (f == nullptr) return 0;
+    char line[256];
+    size_t out = 0;
+    while (std::fgets(line, sizeof line, f) != nullptr) {
+        unsigned long kb = 0;
+        if (std::sscanf(line, "Hugepagesize: %lu kB", &kb) == 1) {
+            out = static_cast<size_t>(kb) * 1024;
+            break;
+        }
+    }
+    std::fclose(f);
+    return out;
+}
+
+// Page size named by a mount's "pagesize=" option, e.g. pagesize=2M,
+// pagesize=1024M, pagesize=2097152. 0 = option absent (mount uses the default).
+inline size_t huge_opt_page_size(const char* opts) noexcept {
+    const char* p = std::strstr(opts, "pagesize=");
+    // Must be at the start of the option list or right after a comma, so
+    // "nopagesize=..." (hypothetical) cannot match.
+    while (p != nullptr && p != opts && p[-1] != ',')
+        p = std::strstr(p + 1, "pagesize=");
+    if (p == nullptr) return 0;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(p + 9, &end, 10);
+    if (end == p + 9) return 0;
+    size_t mult = 1;
+    switch (*end) {
+        case 'k':
+        case 'K':
+            mult = 1024;
+            break;
+        case 'm':
+        case 'M':
+            mult = 1024 * 1024;
+            break;
+        case 'g':
+        case 'G':
+            mult = 1024 * 1024 * 1024;
+            break;
+        default:
+            break;
+    }
+    return static_cast<size_t>(v) * mult;
+}
+
+// Collect hugetlbfs mount points from /proc/mounts whose page size equals
+// `want` (0 = any page size). Returns how many were written to `out`.
+//
+// Mount points containing whitespace appear in /proc/mounts octal-escaped
+// (\040); rather than decode, such a mount is skipped — a shared-memory pool
+// under a path with a space in it is not worth the parser.
+inline size_t huge_mounts(size_t want, char out[][kSegPathMax],
+                          size_t max_out) noexcept {
+    std::FILE* f = std::fopen("/proc/mounts", "re");
+    if (f == nullptr) return 0;
+    size_t n = 0;
+    size_t dflt = 0;
+    bool dflt_read = false;
+    char line[1024];
+    while (n < max_out && std::fgets(line, sizeof line, f) != nullptr) {
+        char dev[256], dir[kSegPathMax], type[64], opts[kSegPathMax];
+        static_assert(kSegPathMax == 512, "scanf widths below assume 512");
+        if (std::sscanf(line, "%255s %511s %63s %511s", dev, dir, type, opts) !=
+            4)
+            continue;
+        if (std::strcmp(type, "hugetlbfs") != 0) continue;
+        if (std::strchr(dir, '\\') != nullptr) continue;  // escaped path
+        size_t ps = huge_opt_page_size(opts);
+        if (ps == 0) {
+            if (!dflt_read) {
+                dflt = huge_default_page_size();
+                dflt_read = true;
+            }
+            ps = dflt;
+        }
+        if (want != 0 && ps != want) continue;
+        std::snprintf(out[n], kSegPathMax, "%s", dir);
+        ++n;
+    }
+    std::fclose(f);
+    return n;
+}
+
+// "/my-chan" on mount "/dev/hugepages" -> "/dev/hugepages/shuttle_my-chan".
+// A channel name with an embedded '/' has no filename form and is rejected
+// (EINVAL at the call site) rather than silently flattened.
+inline bool huge_seg_path(const char* mount, const char* name, char* out,
+                          size_t out_len) noexcept {
+    if (name == nullptr || name[0] != '/' ||
+        std::strchr(name + 1, '/') != nullptr)
+        return false;
+    const int n = std::snprintf(out, out_len, "%s/shuttle_%s", mount, name + 1);
+    return n > 0 && static_cast<size_t>(n) < out_len;
+}
+
+}  // namespace detail
+#endif  // SHUTTLE_PLATFORM_LINUX
+
+// Length the mapping must actually cover for `backing`. hugetlbfs refuses a
+// size that is not a multiple of its page size, so a hugetlb segment is rounded
+// UP; kShm is exact. The header's data_capacity keeps the caller's value — the
+// rounding is slack past the end of the data region, and every coverage check
+// in the codebase is `>=`, never `==`, precisely so a larger object is legal.
+inline size_t seg_map_len(size_t len, SegBacking backing) noexcept {
+    const size_t ps = seg_huge_page_size(backing);
+    if (ps == 0) return len;
+    return (len + ps - 1) / ps * ps;
+}
+
 // Destroy the name (the mapping, if any, outlives it — FR-5). Returns 0, or
-// the errno; ENOENT means there was no such segment.
+// the errno; ENOENT means there was no such segment. Probes both namespaces
+// (see the note above): shm first, then hugetlbfs mounts.
 inline int seg_unlink(const char* name) noexcept {
-    return shm_unlink(name) == 0 ? 0 : errno;
+    if (shm_unlink(name) == 0) return 0;
+    const int shm_err = errno;
+#if defined(SHUTTLE_PLATFORM_LINUX)
+    if (shm_err == ENOENT) {
+        char mounts[kMaxHugeMounts][kSegPathMax];
+        const size_t nm = detail::huge_mounts(0, mounts, kMaxHugeMounts);
+        char path[kSegPathMax];
+        for (size_t i = 0; i < nm; ++i) {
+            if (!detail::huge_seg_path(mounts[i], name, path, sizeof path))
+                continue;
+            if (::unlink(path) == 0) return 0;
+        }
+    }
+#endif
+    return shm_err;
 }
 
 // Create `name` exclusively, owner-only (NFR-S1), and fix its size at `len`.
@@ -94,9 +261,53 @@ inline int seg_unlink(const char* name) noexcept {
 // this ftruncate is the only one the object will ever see, and any backing
 // added later must likewise settle its size right here. A failure after the
 // object exists leaves nothing behind — it is closed and unlinked.
+//
+// hugetlb backings: the object is a file on a hugetlbfs mount of the matching
+// page size. NOTE that creating and sizing it reserves NOTHING — hugetlbfs
+// accounts pages at mmap() time, so a box with no free huge pages fails later,
+// in seg_map, with ENOMEM. That is why the caller must treat a hugetlb mmap
+// failure as "no huge pages", not as a generic syscall error.
 inline SegHandle seg_create(const char* name, size_t len, SegBacking backing,
                             int& err_out) noexcept {
-    (void)backing;  // kShm is the only backing today
+    if (backing != SegBacking::kShm) {
+#if defined(SHUTTLE_PLATFORM_LINUX)
+        const size_t ps = seg_huge_page_size(backing);
+        char mounts[kMaxHugeMounts][kSegPathMax];
+        // No mount of the right page size = the request cannot be honored.
+        // Deliberately no fallback to a different page size or to kShm.
+        if (detail::huge_mounts(ps, mounts, kMaxHugeMounts) == 0) {
+            err_out = ENODEV;
+            return kSegInvalid;
+        }
+        char path[kSegPathMax];
+        if (!detail::huge_seg_path(mounts[0], name, path, sizeof path)) {
+            err_out = EINVAL;
+            return kSegInvalid;
+        }
+        const int fd = ::open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd < 0) {
+            err_out = errno;
+            return kSegInvalid;
+        }
+        if (::ftruncate(fd, static_cast<off_t>(seg_map_len(len, backing))) !=
+            0) {
+            err_out = errno;
+            seg_close(fd);
+            (void)::unlink(path);
+            return kSegInvalid;
+        }
+        err_out = 0;
+        return fd;
+#else
+        // macOS has no hugetlbfs. Failing here is the whole point: the caller
+        // maps this to kErrNoHugePages, and there is deliberately no silent
+        // fallback to normal pages (that is what the advisory THP flag is for).
+        (void)name;
+        (void)len;
+        err_out = ENOTSUP;
+        return kSegInvalid;
+#endif
+    }
     const int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0) {
         err_out = errno;
@@ -114,20 +325,45 @@ inline SegHandle seg_create(const char* name, size_t len, SegBacking backing,
 
 // Attach to an existing segment read/write. Returns kSegInvalid on failure
 // with err_out set; ENOENT means no such segment.
+//
+// The opener is NOT told which backing the creator used, and does not need to
+// be: it probes the shm namespace, then the hugetlbfs mounts, and whichever
+// fd it gets back carries its page size in the inode. Mapping needs no
+// MAP_HUGETLB — that flag exists for ANONYMOUS mappings; for a file on
+// hugetlbfs the filesystem dictates the page size, so a plain MAP_SHARED mmap
+// of this fd is already huge-page backed.
 inline SegHandle seg_open(const char* name, int& err_out) noexcept {
     const int fd = shm_open(name, O_RDWR, 0);
-    if (fd < 0) {
-        err_out = errno;
-        return kSegInvalid;
+    if (fd >= 0) {
+        err_out = 0;
+        return fd;
     }
-    err_out = 0;
-    return fd;
+    const int shm_err = errno;
+#if defined(SHUTTLE_PLATFORM_LINUX)
+    if (shm_err == ENOENT) {
+        char mounts[kMaxHugeMounts][kSegPathMax];
+        const size_t nm = detail::huge_mounts(0, mounts, kMaxHugeMounts);
+        char path[kSegPathMax];
+        for (size_t i = 0; i < nm; ++i) {
+            if (!detail::huge_seg_path(mounts[i], name, path, sizeof path))
+                continue;
+            const int hfd = ::open(path, O_RDWR);
+            if (hfd >= 0) {
+                err_out = 0;
+                return hfd;
+            }
+        }
+    }
+#endif
+    err_out = shm_err;
+    return kSegInvalid;
 }
 
 // Byte size of the object behind `h`, or -1 if it cannot be determined — the
 // opener sizes its mapping from this (the creator already knows `len`). Note
-// macOS rounds an shm object up to a page, so this can exceed the geometry
-// the header claims; callers validate with >=, never ==.
+// macOS rounds an shm object up to a page, and a hugetlbfs file is rounded up
+// to its huge page size, so this can exceed the geometry the header claims;
+// callers validate with >=, never ==.
 inline int64_t seg_size(SegHandle h) noexcept {
     struct stat st;
     if (fstat(h, &st) != 0) return -1;
@@ -359,6 +595,29 @@ inline int shm_object_exists_fs(const char* name) noexcept {
     std::snprintf(path, sizeof path, "/dev/shm/%s", name + 1);
     struct stat st;
     return stat(path, &st) == 0 ? 1 : 0;
+#else
+    (void)name;
+    return -1;
+#endif
+}
+
+// Filesystem view of a hugetlb-backed segment, the counterpart of the check
+// above for the other namespace (NFR-R2 leak checks). Returns 1 if a file for
+// `name` exists on some hugetlbfs mount, 0 if not, -1 where hugetlbfs cannot
+// exist at all (macOS). 0 and -1 are different verdicts: 0 means "looked, not
+// there", -1 means "nothing to look at".
+inline int hugetlb_object_exists_fs(const char* name) noexcept {
+#if defined(SHUTTLE_PLATFORM_LINUX)
+    char mounts[kMaxHugeMounts][kSegPathMax];
+    const size_t nm = detail::huge_mounts(0, mounts, kMaxHugeMounts);
+    char path[kSegPathMax];
+    for (size_t i = 0; i < nm; ++i) {
+        if (!detail::huge_seg_path(mounts[i], name, path, sizeof path))
+            continue;
+        struct stat st;
+        if (stat(path, &st) == 0) return 1;
+    }
+    return 0;
 #else
     (void)name;
     return -1;

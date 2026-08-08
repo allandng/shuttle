@@ -51,9 +51,10 @@ extern "C" {
 #define SHUTTLE_ERR_MSG_TOO_LARGE (-11)
 #define SHUTTLE_ERR_WOULD_BLOCK (-12)
 #define SHUTTLE_ERR_PEER_DEAD (-13)
-/* RESERVED (v1.2): the explicit-hugetlb create path returns this when the
- * request cannot be honored. The value is assigned now and unused today so the
- * numbering stays coordinated; nothing returns it yet. */
+/* shuttle_create_ex with SHUTTLE_CREATE_HUGETLB_2MB/1GB: the explicit huge
+ * pages could not be delivered (no hugetlbfs mount with that page size, no free
+ * reserved pages, or a platform without hugetlbfs). The request NEVER falls
+ * back to normal pages — this code is returned instead. */
 #define SHUTTLE_ERR_NO_HUGEPAGES (-14)
 /* shuttle_get_stats on a channel whose segment has no stats block (i.e. it was
  * not created with SHUTTLE_CREATE_STATS). */
@@ -70,11 +71,15 @@ extern "C" {
  * implementation. SHUTTLE_CREATE_HUGEPAGES advises transparent huge pages on
  * the segment (advisory; effective only where the kernel THP policy permits). */
 #define SHUTTLE_CREATE_HUGEPAGES 0x1
-/* RESERVED (v1.2), not implemented yet: explicit hugetlbfs-backed segments.
- * The bit values are pinned here so they cannot be claimed by anything else,
- * but until the implementation lands they are NOT in the known-bits mask —
- * passing one today is masked off like any unknown bit and is not persisted
- * into the segment. */
+/* Explicit hugetlbfs-backed segment: the channel's bytes live in RESERVED huge
+ * pages of the named size, not in normal pages the kernel may or may not
+ * promote. Unlike SHUTTLE_CREATE_HUGEPAGES (advisory), this is a guarantee or
+ * an error: if the pages cannot be obtained, shuttle_create_ex fails with
+ * SHUTTLE_ERR_NO_HUGEPAGES and creates nothing. Requires an operator to have
+ * reserved pages and mounted hugetlbfs (Linux only; always
+ * SHUTTLE_ERR_NO_HUGEPAGES on macOS). Setting BOTH bits is
+ * SHUTTLE_ERR_INVALID_ARGS — they name two different page sizes. Openers need
+ * no flag and no special call: shuttle_open finds the segment either way. */
 #define SHUTTLE_CREATE_HUGETLB_2MB 0x2
 #define SHUTTLE_CREATE_HUGETLB_1GB 0x4
 /* Create the segment with the statistics counters (layout version 2). See the
