@@ -25,9 +25,29 @@ static_assert(SHUTTLE_ERR_CORRUPT == shuttle::kErrCorrupt);
 static_assert(SHUTTLE_ERR_MSG_TOO_LARGE == shuttle::kErrMsgTooLarge);
 static_assert(SHUTTLE_ERR_WOULD_BLOCK == shuttle::kErrWouldBlock);
 static_assert(SHUTTLE_ERR_PEER_DEAD == shuttle::kErrPeerDead);
+static_assert(SHUTTLE_ERR_NO_HUGEPAGES == shuttle::kErrNoHugePages);
+static_assert(SHUTTLE_ERR_NO_STATS == shuttle::kErrNoStats);
 // Create-flag bits are a separate namespace from the per-op flags, but the C
-// value must still track the C++ header bit exactly.
+// value must still track the C++ header bit exactly — including the reserved
+// bits, whose whole purpose is to be pinned before they are implemented.
 static_assert(SHUTTLE_CREATE_HUGEPAGES == shuttle::kFlagHugePages);
+static_assert(SHUTTLE_CREATE_HUGETLB_2MB == shuttle::kFlagHugeTLB2M);
+static_assert(SHUTTLE_CREATE_HUGETLB_1GB == shuttle::kFlagHugeTLB1G);
+static_assert(SHUTTLE_CREATE_STATS == shuttle::kFlagStats);
+// The C struct is the ABI shape callers allocate; it must stay a plain
+// five-u64 record in the order the C++ Stats declares.
+static_assert(sizeof(shuttle_stats) == 5 * sizeof(uint64_t));
+static_assert(sizeof(shuttle_stats) == sizeof(shuttle::Stats));
+static_assert(offsetof(shuttle_stats, msgs_written) ==
+              offsetof(shuttle::Stats, msgs_written));
+static_assert(offsetof(shuttle_stats, bytes_written) ==
+              offsetof(shuttle::Stats, bytes_written));
+static_assert(offsetof(shuttle_stats, msgs_dropped) ==
+              offsetof(shuttle::Stats, msgs_dropped));
+static_assert(offsetof(shuttle_stats, msgs_read) ==
+              offsetof(shuttle::Stats, msgs_read));
+static_assert(offsetof(shuttle_stats, bytes_read) ==
+              offsetof(shuttle::Stats, bytes_read));
 
 struct shuttle_channel {
     shuttle::Channel* ch = nullptr;
@@ -205,6 +225,23 @@ int shuttle_release_read(shuttle_channel* ch) {
         ch->borrow_active = false;
         ch->borrow_ptr = nullptr;
         ch->borrow_len = 0;
+        return SHUTTLE_OK;
+    } catch (...) {
+        return SHUTTLE_ERR_SYS;
+    }
+}
+
+int shuttle_get_stats(shuttle_channel* ch, shuttle_stats* out) {
+    if (ch == nullptr || out == nullptr) return SHUTTLE_ERR_INVALID_ARGS;
+    try {
+        shuttle::Stats s{};
+        const int rc = shuttle::get_stats(ch->ch, s);
+        if (rc != shuttle::kOk) return rc;
+        out->msgs_written = s.msgs_written;
+        out->bytes_written = s.bytes_written;
+        out->msgs_dropped = s.msgs_dropped;
+        out->msgs_read = s.msgs_read;
+        out->bytes_read = s.bytes_read;
         return SHUTTLE_OK;
     } catch (...) {
         return SHUTTLE_ERR_SYS;

@@ -38,7 +38,18 @@ Channel* create(const char* name, size_t capacity_bytes,
         return nullptr;
     }
 
-    const size_t map_len = kDataOffset + capacity_bytes;
+    // Known-bits mask. kFlagHugeTLB2M/1G are pinned but unimplemented, so they
+    // stay OUT of this mask: passing one today is masked off like any unknown
+    // bit, preserving "an unknown bit is never persisted". They join the mask
+    // in the package that implements them.
+    const uint32_t flags = create_flags & (kFlagHugePages | kFlagStats);
+    // kFlagStats is the one flag that selects a LAYOUT, so it also selects the
+    // version and the header size. Without it this writes exactly the v1
+    // segment it always did — the default on-disk format is unchanged.
+    const bool with_stats = (flags & kFlagStats) != 0;
+    const uint64_t data_offset = with_stats ? kDataOffsetV2 : kDataOffsetV1;
+
+    const size_t map_len = static_cast<size_t>(data_offset) + capacity_bytes;
     // Backing choice is a seam concern (kShm today; hugetlbfs backings land
     // there later); creation is exclusive and sizes the object once, for good.
     int seg_err = 0;
@@ -58,18 +69,18 @@ Channel* create(const char* name, size_t capacity_bytes,
     // Opt-in THP: advise the fresh mapping before it is touched. Advisory and
     // masked to known bits — an unknown flag must never be persisted (openers
     // trust that flags carries only bits they may act on).
-    const uint32_t flags = create_flags & kFlagHugePages;
     if (flags & kFlagHugePages) advise_huge_pages(base, map_len);
 
     // Creation zero-fills, so init_state is already 0 (uninitialized) and
-    // cursors/heartbeats are already 0; set the rest explicitly. flags is part
-    // of the cold identity block: written once here, before the init_state
-    // release-store publish, and immutable after (single-init contract).
+    // cursors/heartbeats are already 0 — and so are the v2 stats lines, which
+    // therefore need no explicit initialization. Set the rest explicitly.
+    // flags is part of the cold identity block: written once here, before the
+    // init_state release-store publish, and immutable after (single-init).
     auto* h = static_cast<ChannelHeader*>(base);
     h->magic = kMagic;
-    h->version = kVersion;
+    h->version = with_stats ? kVersionStats : kVersion;
     h->flags = flags;
-    h->data_offset = kDataOffset;
+    h->data_offset = data_offset;
     h->data_capacity = capacity_bytes;
     h->max_payload = max_payload_bytes;
     if (mutex_init_pshared(&h->lock) != 0 ||
@@ -99,9 +110,13 @@ Channel* open(const char* name, int* err) {
         return nullptr;
     }
     // An unreadable size (-1) and a too-small object are the same verdict:
-    // whatever is behind this name, it is not a channel.
+    // whatever is behind this name, it is not a channel. The bar is the
+    // SMALLEST header any known version has (v1) — the version is not readable
+    // until the object is mapped, and a legitimately small v1 segment must not
+    // be rejected just because the v2 header is bigger. The per-version
+    // geometry check below is what enforces the actual size requirement.
     const int64_t seg_len = seg_size(seg);
-    if (seg_len < static_cast<int64_t>(sizeof(ChannelHeader))) {
+    if (seg_len < static_cast<int64_t>(kDataOffsetV1)) {
         seg_close(seg);
         set_err(err, kErrCorrupt);
         return nullptr;
@@ -133,16 +148,27 @@ Channel* open(const char* name, int* err) {
         set_err(err, kErrBadMagic);
         return nullptr;
     }
-    if (h->version != kVersion) {
+    // Two layouts are readable: the v1 default and the opt-in stats layout.
+    // Anything else is a header shape this binary does not know, and mapping
+    // it would mean guessing where the data region starts — refuse. (This is
+    // exactly what an OLD binary does when handed a v2 segment: its check is
+    // `!= kVersion`, so it reports kErrBadVersion. Designed behavior.)
+    if (h->version != kVersion && h->version != kVersionStats) {
         seg_unmap(base, map_len);
         set_err(err, kErrBadVersion);
         return nullptr;
     }
     // NFR-S2: never trust header geometry — everything later indexes off it.
-    // Coverage check is >= not ==: macOS rounds shm st_size up to page size,
-    // so the mapping may legitimately be larger than the claimed geometry.
-    if (h->data_offset != kDataOffset ||
-        h->data_capacity > map_len - kDataOffset ||
+    // The version chooses which data_offset is the ONLY legal one; a segment
+    // whose version and geometry disagree (e.g. a v1 header with its version
+    // word poked to 2) is corrupt, not merely unknown — hence the distinct
+    // error. Coverage check is >= not ==: macOS rounds shm st_size up to page
+    // size, so the mapping may legitimately be larger than the claimed
+    // geometry.
+    const uint64_t want_offset =
+        h->version == kVersionStats ? kDataOffsetV2 : kDataOffsetV1;
+    if (h->data_offset != want_offset || map_len < want_offset ||
+        h->data_capacity > map_len - want_offset ||
         h->max_payload + kFrameHeader > h->data_capacity) {
         seg_unmap(base, map_len);
         set_err(err, kErrCorrupt);
@@ -162,6 +188,21 @@ void close(Channel* ch) {
     if (ch == nullptr) return;
     seg_unmap(ch->base, ch->map_len);
     delete ch;
+}
+
+int get_stats(Channel* ch, Stats& out) {
+    if (ch == nullptr || ch->hdr == nullptr) return kErrInvalidArgs;
+    const ChannelHeader* h = ch->hdr;
+    if (!has_stats(h)) return kErrNoStats;
+    // Relaxed throughout: each counter has exactly one writer and is monotonic,
+    // and the snapshot is explicitly not an atomic tuple (see the declaration).
+    // Reading them must cost the data path nothing.
+    out.msgs_written = h->stat_msgs_written.load(std::memory_order_relaxed);
+    out.bytes_written = h->stat_bytes_written.load(std::memory_order_relaxed);
+    out.msgs_dropped = h->stat_msgs_dropped.load(std::memory_order_relaxed);
+    out.msgs_read = h->stat_msgs_read.load(std::memory_order_relaxed);
+    out.bytes_read = h->stat_bytes_read.load(std::memory_order_relaxed);
+    return kOk;
 }
 
 int unlink(const char* name) {

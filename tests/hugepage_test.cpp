@@ -11,8 +11,9 @@
 //   b. a byte-exact payload survives producer->spawned-consumer on that
 //      huge-page-flagged channel.
 //   c. plain shuttle_create leaves the flag bit clear.
-//   d. unknown create-flag bits are masked off (flags shows only known bits)
-//      and the channel still carries data.
+//   d. unknown create-flag bits — and the reserved-but-unimplemented hugetlb
+//      bits — are masked off (flags shows only known, implemented bits) and
+//      the channel still carries data.
 #include <unistd.h>
 
 #include <cstdint>
@@ -147,13 +148,32 @@ int run_driver(const char* self) {
     }
 
     // (d) unknown create-flag bits are masked to the known set; channel works.
-    shuttle_channel* masked = shuttle_create_ex(
-        mask_name, kCapacity, kMaxPayload, 0xFFFFFFFFu, &err);
+    //
+    // The probe word was 0xFFFFFFFF back when kFlagHugePages was the only
+    // known bit. It cannot stay that: SHUTTLE_CREATE_STATS (0x8) is now known,
+    // so 0xFFFFFFFF would create a version-2 stats segment and this case would
+    // stop being about masking at all. The probe is therefore every bit EXCEPT
+    // stats — which still covers the two things worth asserting here:
+    //   * genuinely unknown bits (the whole 0xFFFFFF00 range) are dropped;
+    //   * SHUTTLE_CREATE_HUGETLB_2MB|1GB, which are *reserved but not yet
+    //     implemented*, are dropped too. That is the contract while they are
+    //     unimplemented: a bit whose behavior has not shipped must never be
+    //     persisted into a segment, or an opener could act on a promise the
+    //     creator never kept. When that package lands, they join the mask and
+    //     this expectation changes with it.
+    constexpr uint32_t kMaskProbe = SHUTTLE_CREATE_HUGEPAGES |
+                                    SHUTTLE_CREATE_HUGETLB_2MB |
+                                    SHUTTLE_CREATE_HUGETLB_1GB | 0xFFFFFF00u;
+    static_assert((kMaskProbe & SHUTTLE_CREATE_STATS) == 0,
+                  "probe must not opt into the v2 stats layout");
+    shuttle_channel* masked =
+        shuttle_create_ex(mask_name, kCapacity, kMaxPayload, kMaskProbe, &err);
     if (masked == nullptr) {
         ++fails;
         fail("create_ex(unknown bits)", err);
     } else {
-        // 0xFFFFFFFF masks down to exactly kFlagHugePages (the one known bit).
+        // The probe masks down to exactly kFlagHugePages: unknown bits and the
+        // reserved-unimplemented hugetlb bits alike are gone.
         if (shuttle_test::run_child_sync(self, "opener", mask_name, "1",
                                          kChildTimeoutNs) != 0) {
             std::fprintf(stderr, "FAIL: unknown bits not masked to known set\n");

@@ -43,6 +43,17 @@
 //   or 0 (high region freed) — no torn intermediate state exists. The
 //   producer's space arithmetic is conservative under both values.
 //
+// STATISTICS COUNTERS (opt-in, kVersionStats segments only) fit this same
+//   single-writer scheme and add NO ordering obligations. stat_msgs_written /
+//   stat_bytes_written are written only by the producer, stat_msgs_read /
+//   stat_bytes_read only by the consumer, each on its own cache line, each a
+//   relaxed load + relaxed store (never an RMW) — identical to the heartbeat.
+//   No agent ever reads a counter to make a decision, so no publish edge is
+//   needed and none is created: an observer may see a counter that lags the
+//   cursors, which is the documented cost of keeping the hot path free of
+//   extra ordering. On a v1 segment those addresses are DATA, so both sides
+//   resolve a null stats pointer at construction and never touch them.
+//
 // Staleness: each side re-loads the other side's cursor on every attempt.
 //   An out-of-date value can only UNDER-estimate available space (producer)
 //   or available data (consumer) — failure is spurious "would block",
@@ -134,7 +145,11 @@ class Producer {
           data_(static_cast<unsigned char*>(
               resolve(ch->base, ch->hdr->data_offset))),
           cap_(ch->hdr->data_capacity),
-          stale_ns_(stale_threshold_ns) {}
+          stale_ns_(stale_threshold_ns),
+          // STATS GATE, resolved once: null on a v1 segment, where the stats
+          // fields alias the data region and must never be touched. The hot
+          // path then pays one perfectly-predictable branch per commit.
+          stats_(has_stats(ch->hdr) ? ch->hdr : nullptr) {}
 
     // A3: announce liveness without transferring data. Sparse-traffic
     // producers must call this periodically or the peer may declare us dead.
@@ -311,6 +326,22 @@ class Producer {
         return false;
     }
 
+    // Producer-owned counters: single-writer plain load+store, exactly the
+    // heartbeat idiom (never an RMW — nothing else writes this line). Counted
+    // at the commit that publishes the message, so a message is "written" iff
+    // the consumer can see it. Payload bytes only: n includes the frame
+    // header, which is transport overhead and not part of the caller's data.
+    void bump_write_stats(uint64_t payload_len) {
+        if (stats_ == nullptr) return;  // v1 segment: those bytes are data
+        stats_->stat_msgs_written.store(
+            stats_->stat_msgs_written.load(std::memory_order_relaxed) + 1,
+            std::memory_order_relaxed);
+        stats_->stat_bytes_written.store(
+            stats_->stat_bytes_written.load(std::memory_order_relaxed) +
+                payload_len,
+            std::memory_order_relaxed);
+    }
+
     void commit(uint64_t n, uint64_t off, bool wrap) {
         if (wrap) {
             // P2: watermark first (relaxed), sequenced before the write
@@ -321,6 +352,7 @@ class Producer {
         } else {
             h_->write.store(off + n, std::memory_order_release);  // P1
         }
+        bump_write_stats(n - kFrameHeader);
         wake_consumer_if_waiting();  // A4 signaler side
         bump_heartbeat();
     }
@@ -329,6 +361,7 @@ class Producer {
     unsigned char* data_;
     uint64_t cap_;
     uint64_t stale_ns_;
+    ChannelHeader* stats_;  // == h_ on a v2 segment, nullptr on v1
     detail::StaleTracker peer_stale_;
     // Outstanding zero-copy reservation (process-local per A1).
     uint64_t res_off_ = 0;
@@ -344,7 +377,10 @@ class Consumer {
         : h_(ch->hdr),
           data_(static_cast<unsigned char*>(
               resolve(ch->base, ch->hdr->data_offset))),
-          stale_ns_(stale_threshold_ns) {}
+          stale_ns_(stale_threshold_ns),
+          // Same gate as the producer's: null on v1, where those bytes are the
+          // data region (see header.hpp).
+          stats_(has_stats(ch->hdr) ? ch->hdr : nullptr) {}
 
     // A3: announce liveness without consuming data.
     void keepalive() { bump_heartbeat(); }
@@ -392,6 +428,7 @@ class Consumer {
     void release() {
         const uint64_t r = h_->read.load(std::memory_order_relaxed);
         h_->read.store(r + borrowed_, std::memory_order_release);
+        bump_read_stats(borrowed_);
         borrowed_ = 0;
         wake_producer_if_waiting();  // A4 signaler side
         bump_heartbeat();
@@ -439,6 +476,22 @@ class Consumer {
             std::memory_order_relaxed);
     }
 
+    // Consumer-owned counters, mirroring the producer's: single-writer plain
+    // load+store, counted at the release that frees the message's bytes, and
+    // payload-only (`span` is kFrameHeader + payload). A release with no
+    // active borrow (span 0) counts nothing — the A->B handoff store of
+    // read = 0 is not a message and must not be counted either.
+    void bump_read_stats(uint64_t span) {
+        if (stats_ == nullptr || span < kFrameHeader) return;
+        stats_->stat_msgs_read.store(
+            stats_->stat_msgs_read.load(std::memory_order_relaxed) + 1,
+            std::memory_order_relaxed);
+        stats_->stat_bytes_read.store(
+            stats_->stat_bytes_read.load(std::memory_order_relaxed) + span -
+                kFrameHeader,
+            std::memory_order_relaxed);
+    }
+
     void wake_producer_if_waiting() {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (h_->producer_waiting.load(std::memory_order_relaxed) != 0) {
@@ -475,6 +528,7 @@ class Consumer {
     unsigned char* data_;
     uint64_t borrowed_ = 0;  // consumer-private span of the active borrow
     uint64_t stale_ns_;
+    ChannelHeader* stats_;  // == h_ on a v2 segment, nullptr on v1
     detail::StaleTracker peer_stale_;
 };
 

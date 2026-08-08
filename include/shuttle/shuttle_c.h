@@ -13,6 +13,16 @@
  * v1.1 additions (shuttle_create_ex + SHUTTLE_CREATE_* below) are strictly
  * additive — new symbols only, no existing signature or semantic touched —
  * so SHUTTLE_ABI_VERSION stays 1 (old binaries keep linking and running).
+ *
+ * v1.2 adds shuttle_get_stats + shuttle_stats + SHUTTLE_CREATE_STATS and the
+ * error codes below, on the same additive terms: new symbols and new
+ * constants only. SHUTTLE_ABI_VERSION stays 1. One thing to know about
+ * SHUTTLE_CREATE_STATS specifically: unlike every other create-flag, it
+ * changes the segment's LAYOUT VERSION (1 -> 2). Layout versions are checked
+ * exactly, not ignored like unknown flag bits, so a segment created with it
+ * cannot be opened by a binary built before v1.2 — that opener reports
+ * SHUTTLE_ERR_BAD_VERSION. Opting in is therefore a decision about which
+ * peers can attach; leaving it off keeps the unchanged v1 format.
  */
 #ifndef SHUTTLE_C_H
 #define SHUTTLE_C_H
@@ -41,6 +51,13 @@ extern "C" {
 #define SHUTTLE_ERR_MSG_TOO_LARGE (-11)
 #define SHUTTLE_ERR_WOULD_BLOCK (-12)
 #define SHUTTLE_ERR_PEER_DEAD (-13)
+/* RESERVED (v1.2): the explicit-hugetlb create path returns this when the
+ * request cannot be honored. The value is assigned now and unused today so the
+ * numbering stays coordinated; nothing returns it yet. */
+#define SHUTTLE_ERR_NO_HUGEPAGES (-14)
+/* shuttle_get_stats on a channel whose segment has no stats block (i.e. it was
+ * not created with SHUTTLE_CREATE_STATS). */
+#define SHUTTLE_ERR_NO_STATS (-15)
 
 /* Per-op flags (IF-3): blocking is the default; OR in SHUTTLE_NONBLOCK for
  * try-semantics ("would block" instead of parking). Passed to the read/write
@@ -53,8 +70,33 @@ extern "C" {
  * implementation. SHUTTLE_CREATE_HUGEPAGES advises transparent huge pages on
  * the segment (advisory; effective only where the kernel THP policy permits). */
 #define SHUTTLE_CREATE_HUGEPAGES 0x1
+/* RESERVED (v1.2), not implemented yet: explicit hugetlbfs-backed segments.
+ * The bit values are pinned here so they cannot be claimed by anything else,
+ * but until the implementation lands they are NOT in the known-bits mask —
+ * passing one today is masked off like any unknown bit and is not persisted
+ * into the segment. */
+#define SHUTTLE_CREATE_HUGETLB_2MB 0x2
+#define SHUTTLE_CREATE_HUGETLB_1GB 0x4
+/* Create the segment with the statistics counters (layout version 2). See the
+ * ABI note at the top of this file: this is the one create-flag that changes
+ * the layout version, so pre-v1.2 openers get SHUTTLE_ERR_BAD_VERSION. Without
+ * it the segment is the unchanged version-1 format and shuttle_get_stats
+ * returns SHUTTLE_ERR_NO_STATS. */
+#define SHUTTLE_CREATE_STATS 0x8
 
 typedef struct shuttle_channel shuttle_channel;
+
+/* Counter snapshot (v1.2). Byte counts are PAYLOAD bytes — the 8-byte frame
+ * header is transport overhead and excluded on both sides. msgs_dropped is
+ * RESERVED: nothing in this library drops a message today (a full ring blocks
+ * or reports SHUTTLE_ERR_WOULD_BLOCK), so it always reads 0. */
+typedef struct shuttle_stats {
+    uint64_t msgs_written;
+    uint64_t bytes_written;
+    uint64_t msgs_dropped;
+    uint64_t msgs_read;
+    uint64_t bytes_read;
+} shuttle_stats;
 
 /* --- lifecycle (FR-1..FR-5) --- */
 shuttle_channel* shuttle_create(const char* name, size_t capacity_bytes,
@@ -87,6 +129,17 @@ int shuttle_release_read(shuttle_channel* ch);
 
 /* --- liveness (A3) --- */
 void shuttle_keepalive(shuttle_channel* ch);
+
+/* --- statistics (v1.2 additive) ---
+ * Copy the segment's counters into *out. Either side of the channel may call
+ * it, and so may a third process that merely opened the segment: the counters
+ * live in the segment, not in the handle.
+ * Returns SHUTTLE_OK, SHUTTLE_ERR_INVALID_ARGS (NULL argument), or
+ * SHUTTLE_ERR_NO_STATS (segment created without SHUTTLE_CREATE_STATS).
+ * Each field is individually exact and monotonic; the five together are not
+ * sampled atomically, so a snapshot taken while traffic flows may show
+ * msgs_read one behind msgs_written. */
+int shuttle_get_stats(shuttle_channel* ch, shuttle_stats* out);
 
 #ifdef __cplusplus
 }

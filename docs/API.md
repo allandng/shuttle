@@ -14,8 +14,9 @@ Two conventions for reporting failure:
   or a negative error code.
 
 The ten functions `shuttle_create` .. `shuttle_keepalive` are frozen v1.
-`shuttle_create_ex` is an additive v1.1 symbol (new symbol only, no existing
-signature or semantic touched), so the ABI version stays `1`.
+`shuttle_create_ex` is an additive v1.1 symbol and `shuttle_get_stats` an
+additive v1.2 symbol (new symbols only, no existing signature or semantic
+touched), so the ABI version stays `1`.
 
 ---
 
@@ -34,7 +35,9 @@ Owner-only permissions (`0600`). The caller of `create` is neither producer nor
 consumer yet — the role is bound lazily on first use of the corresponding path.
 
 - Blocking: no. Returns immediately.
-- Segment size mapped: `sizeof(ChannelHeader) + capacity_bytes`.
+- Segment size mapped: `data_offset + capacity_bytes`, where `data_offset` is
+  the header size of the layout version written — the v1 layout here, always
+  (only `shuttle_create_ex` with `SHUTTLE_CREATE_STATS` writes anything else).
 - Errors (via `*err`): `INVALID_ARGS` (`name` NULL, `name[0] != '/'`,
   `capacity_bytes == 0`, or `max_payload_bytes == 0`), `NAME_TOO_LONG`,
   `CAPACITY_TOO_SMALL` (`capacity_bytes < max_payload_bytes + 8`), `EXISTS`
@@ -43,7 +46,10 @@ consumer yet — the role is bound lazily on first use of the corresponding path
 ### shuttle_create_ex
 
 ```c
-#define SHUTTLE_CREATE_HUGEPAGES 0x1
+#define SHUTTLE_CREATE_HUGEPAGES   0x1
+#define SHUTTLE_CREATE_HUGETLB_2MB 0x2  /* RESERVED — not implemented yet */
+#define SHUTTLE_CREATE_HUGETLB_1GB 0x4  /* RESERVED — not implemented yet */
+#define SHUTTLE_CREATE_STATS       0x8
 shuttle_channel* shuttle_create_ex(const char* name, size_t capacity_bytes,
                                    size_t max_payload_bytes,
                                    uint32_t create_flags, int* err);
@@ -61,6 +67,15 @@ not be mixed. Unknown flag bits are masked off and ignored (never persisted).
   unsupported kernels; never a correctness dependency. The chosen flag is
   recorded in the segment header, so that `shuttle_open` re-advises the opener's
   independent mapping automatically.
+- `SHUTTLE_CREATE_STATS`: allocate the statistics counters in the segment and
+  keep them updated. See **Statistics** below — this is the one create-flag
+  that changes the segment's **layout version** (1 → 2), and therefore which
+  peers can open it.
+- `SHUTTLE_CREATE_HUGETLB_2MB` / `SHUTTLE_CREATE_HUGETLB_1GB`: **reserved**.
+  The bit values are pinned so nothing else can claim them, but the behavior
+  (explicit hugetlbfs-backed segments) is not implemented. Until it is, these
+  bits are treated exactly like unknown bits: masked off, not persisted, no
+  error. Do not set them expecting an effect.
 - Errors: identical set to `shuttle_create`. Passing only unknown bits is not
   an error; they are silently masked.
 
@@ -75,12 +90,18 @@ for the creator's readiness publication, then validates magic, version, and
 header geometry before trusting any field. If the creator opted into huge pages,
 the opener's mapping is advised too.
 
+Two layout versions are accepted: `1` (the default) and `2` (created with
+`SHUTTLE_CREATE_STATS`). The version selects the only legal `data_offset`, so a
+segment whose version and geometry disagree is `CORRUPT`, while a version this
+binary does not know at all is `BAD_VERSION` — the two verdicts stay distinct.
+
 - Blocking: bounded. Spins up to a 5 s deadline waiting for creator init.
 - Errors (via `*err`): `INVALID_ARGS` (`name` NULL or `name[0] != '/'`),
   `NOT_FOUND` (no such segment), `CORRUPT` (`fstat` failure, segment smaller
-  than a header, or header geometry fails validation), `SYS` (`mmap` failure),
-  `INIT_TIMEOUT` (creator never published readiness within 5 s), `BAD_MAGIC`,
-  `BAD_VERSION`.
+  than a v1 header, or header geometry fails validation — including a
+  `data_offset` that does not match the claimed version), `SYS` (`mmap`
+  failure), `INIT_TIMEOUT` (creator never published readiness within 5 s),
+  `BAD_MAGIC`, `BAD_VERSION` (layout version not 1 or 2).
 
 ### shuttle_close
 
@@ -207,6 +228,29 @@ call this (or raise the staleness threshold) so the other side does not declare
 them dead. NULL-safe. Bumps whichever roles (producer/consumer) the handle has
 already taken. Never fails.
 
+### shuttle_get_stats
+
+```c
+typedef struct shuttle_stats {
+    uint64_t msgs_written;
+    uint64_t bytes_written;
+    uint64_t msgs_dropped;
+    uint64_t msgs_read;
+    uint64_t bytes_read;
+} shuttle_stats;
+
+int shuttle_get_stats(shuttle_channel* ch, shuttle_stats* out);
+```
+
+Copy the segment's counters into `*out` (v1.2, additive). Any handle on the
+segment may call it — producer, consumer, or a third process that merely opened
+it — because the counters live in the segment, not in the handle.
+
+- Returns `SHUTTLE_OK`, `INVALID_ARGS` (`ch` or `out` NULL), or `NO_STATS` (the
+  segment was not created with `SHUTTLE_CREATE_STATS`).
+- Never blocks and never touches the park mutex.
+- See **Statistics** for what each field counts and for the exactness rules.
+
 ---
 
 ## Error codes
@@ -227,6 +271,8 @@ already taken. Never fails.
 | -11   | `SHUTTLE_ERR_MSG_TOO_LARGE`   | Write payload `> max_payload`; or copy-read buffer smaller than the queued message (message stays queued). |
 | -12   | `SHUTTLE_ERR_WOULD_BLOCK`     | Non-blocking op cannot proceed right now (full on write, empty on read). |
 | -13   | `SHUTTLE_ERR_PEER_DEAD`       | A blocking wait aborted because the peer's heartbeat went stale. |
+| -14   | `SHUTTLE_ERR_NO_HUGEPAGES`    | **Reserved** for the explicit-hugetlb create path; nothing returns it today. |
+| -15   | `SHUTTLE_ERR_NO_STATS`        | `shuttle_get_stats` on a segment created without `SHUTTLE_CREATE_STATS`. |
 
 The C `#define`s are `static_assert`ed equal to the C++ `shuttle::Err` enum in
 the implementation, so the two can never drift.
@@ -273,10 +319,10 @@ the implementation, so the two can never drift.
 
 ## Segment layout
 
-`sizeof(ChannelHeader)` (a cache-line multiple) of control header, followed by
-the data region at byte offset `data_offset`. Everything in the segment is
-fixed-width and referenced by **byte offset from the segment base**, never by
-pointer — each process maps at a different address.
+A control header (a cache-line multiple), followed by the data region at byte
+offset `data_offset`. Everything in the segment is fixed-width and referenced by
+**byte offset from the segment base**, never by pointer — each process maps at a
+different address.
 
 Header, in order:
 
@@ -289,14 +335,64 @@ Header, in order:
    then `[0, write)`.
 3. **Park flags**: `producer_waiting`, `consumer_waiting`.
 4. **Heartbeats**: `producer_heartbeat`, `consumer_heartbeat`.
-5. **Park/wake primitives** (off the hot path): a pshared mutex and two condvars.
+5. **Park/wake primitives** (off the hot path): a pshared mutex and two
+   condvars. **End of layout version 1** — `data_offset` for a v1 segment is
+   exactly the size of everything above.
+6. **Statistics counters** — *layout version 2 only*: a producer-owned line
+   (`msgs_written`, `bytes_written`, `msgs_dropped`) and a consumer-owned line
+   (`msgs_read`, `bytes_read`). In a v1 segment these bytes are not header at
+   all; they are the first bytes of the data region, and nothing ever touches
+   them there.
 
 **Flags-bits contract**: the creator writes the entire `flags` word **once**, in
 the cold identity block, before the release-store that publishes `init_state`;
 it is immutable thereafter. Openers must **ignore unknown bits** — `flags` is an
 additive extension point, so new bits carry no version bump (an old opener
-simply does not act on a bit it does not recognize). `SHUTTLE_CREATE_HUGEPAGES`
-is recorded here as bit `0x1`.
+simply does not act on a bit it does not recognize). Correspondingly the creator
+masks `create_flags` down to the bits it actually implements, so an unknown (or
+merely reserved-and-unimplemented) bit is never persisted into a segment.
+Recorded bits: `SHUTTLE_CREATE_HUGEPAGES` = `0x1`, `SHUTTLE_CREATE_STATS` =
+`0x8`; `0x2` / `0x4` are reserved for the unimplemented hugetlb backings and are
+masked off today.
+
+**Version gate**: `flags` is ignorable, `version` is not. A version selects the
+physical size of the header, so an opener that does not recognize one cannot
+know where the data region starts and must refuse the segment. That is why
+`SHUTTLE_CREATE_STATS` is the one flag that also bumps the layout version — and
+why a binary built before v1.2 reports `BAD_VERSION` when handed a v2 segment,
+rather than silently ignoring the stats bit. Plain `shuttle_create` writes the
+v1 layout, byte for byte as before.
+
+---
+
+## Statistics
+
+Opt in at creation with `shuttle_create_ex(..., SHUTTLE_CREATE_STATS, ...)`;
+read with `shuttle_get_stats`. Five counters live in the segment, so either peer
+— or any other process that opens the segment — observes the same values.
+
+| Field | Written by | Counts |
+|-------|-----------|--------|
+| `msgs_written`  | producer | messages published (counted at the commit that makes a message visible). |
+| `bytes_written` | producer | **payload** bytes published. |
+| `msgs_dropped`  | — | **Reserved**: always `0`. Nothing in this library drops a message — a full ring blocks or returns `WOULD_BLOCK`. The field exists so its offset is frozen with the rest of the v2 layout. |
+| `msgs_read`     | consumer | messages released (counted at the release that frees the message's bytes). |
+| `bytes_read`    | consumer | **payload** bytes released. |
+
+- **Payload bytes, not frame bytes**: the 8-byte length prefix is transport
+  overhead and is excluded on both sides, so `bytes_written` / `bytes_read` are
+  directly comparable to the lengths the caller passed and to each other.
+- **Cost**: each counter has exactly one writer and is updated with a relaxed
+  load + relaxed store (never a read-modify-write) on a cache line that side
+  already owns — the same discipline as the heartbeats. The producer's and
+  consumer's counters sit on separate lines, so they never contend.
+- **Exactness**: every field is individually exact and monotonic. The five are
+  *not* sampled atomically, and the counters are deliberately not ordered
+  against the data path, so a snapshot taken while traffic flows may show
+  `msgs_read` trailing `msgs_written`, or a counter lagging a cursor. Once both
+  sides are quiescent the totals are exact.
+- **Without the flag**: `shuttle_get_stats` returns `NO_STATS`, and the data
+  path never reads or writes those addresses (they are payload).
 
 ---
 
