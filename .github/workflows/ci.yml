@@ -1,5 +1,7 @@
-# Linux CI: builds and runs the correctness suite natively on glibc x86_64
-# runners, under ASan/UBSan and TSan.
+# CI: builds and runs the correctness suite on both supported platforms —
+# natively on glibc x86_64 runners (g++) and on macOS runners (Apple clang) —
+# under ASan/UBSan and TSan. Same four legs the local `make` harness runs
+# (test-mac / tsan-mac / test-linux / tsan-linux), minus the container.
 #
 # Performance-MEASUREMENT tests are excluded here (-E filter below): they
 # assert latency percentiles / CPU ratios that are only meaningful on
@@ -46,6 +48,64 @@ jobs:
         # default): "unexpected memory mapping" at startup. Documented
         # workaround, same one the local harness applies via setarch -R.
         run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Configure + build (TSan)
+        run: |
+          cmake -B build/ci-tsan -DSHUTTLE_SAN=tsan
+          cmake --build build/ci-tsan -j
+      - name: Test
+        run: ctest --test-dir build/ci-tsan --output-on-failure -E "$PERF_TESTS"
+
+  # macOS legs: the second platform of the two-platform harness, run natively
+  # (Apple clang; no container involved — Docker is not available on GitHub's
+  # macOS runners, and these jobs do not need it).
+  #
+  # Runner-image requirement: the macOS park path uses os_sync_wait_on_address,
+  # which is macOS 14.4+ only. `macos-latest` is currently a macOS 14/15 image,
+  # so it satisfies that. If these jobs ever fail to COMPILE with a missing
+  # <os/os_sync_wait_on_address.h> or an unavailable-API error, suspect a
+  # runner-image downgrade below 14.4 and pin an explicit `macos-15`-style
+  # label rather than working around it in the source.
+  #
+  # Flake triage: shared macOS runners are noisier than the Linux ones, and the
+  # timing-sensitive correctness tests are the first suspects — of the ones the
+  # PERF_TESTS filter still leaves running, the park/wake pair
+  # (shuttle_park_idle_test, shuttle_park_hotpath_test) asserts on idle CPU and
+  # on the peer actually parking, so it is the most sensitive to a noisy
+  # neighbour. Deliberately NOT excluded: these legs filter out exactly the
+  # perf-MEASUREMENT set above, on mac the same as on Linux.
+  macos-asan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        # The image already ships Apple clang, cmake, python3 and rustc; only
+        # cffi (needed by the C ABI Python FFI tests) is missing.
+        #
+        # `python3 -m pip` rather than `pip3`: the tests spawn plain `python3`
+        # from PATH, and -m pip guarantees the package lands in *that*
+        # interpreter. `--break-system-packages` because the image's python3 is
+        # Homebrew's, which is PEP 668 externally-managed and refuses a bare
+        # install; its pip is new enough (>= 23.0) for the flag. Kept as one
+        # unconditional command with no `|| pip3 install --user cffi` fallback
+        # so a future image change fails loudly here instead of silently
+        # installing into an interpreter the tests never see.
+        run: python3 -m pip install --break-system-packages cffi
+      - name: Configure + build (ASan/UBSan)
+        run: |
+          cmake -B build/ci-asan -DSHUTTLE_SAN=asan
+          cmake --build build/ci-asan -j
+      - name: Test
+        run: ctest --test-dir build/ci-asan --output-on-failure -E "$PERF_TESTS"
+
+  macos-tsan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        # See the macos-asan job for why this exact pip invocation.
+        run: python3 -m pip install --break-system-packages cffi
+      # No ASLR-entropy workaround here: that one is specific to gcc TSan on
+      # Ubuntu 24.04. Apple clang's TSan runs as-is, same as `make tsan-mac`.
       - name: Configure + build (TSan)
         run: |
           cmake -B build/ci-tsan -DSHUTTLE_SAN=tsan
