@@ -52,6 +52,14 @@
 //! The same shape covers the producer: [`Reservation<'_>`] borrows the
 //! [`Producer`] mutably for as long as the reservation is outstanding.
 //!
+//! One consequence is worth naming, because it shapes the v1.4 lookahead: while
+//! a `Borrowed` is alive the `Consumer` is exclusively borrowed and *no* method
+//! on it can be called — not even a `&self` one. So the read-only peek appears
+//! on both types: [`Consumer::peek_next`] when nothing is borrowed, and
+//! [`Borrowed::peek_next`] when something is, which is the case that matters
+//! (holding message N, a second acquire returns N, so peeking is the only way
+//! to see N+1). Neither weakens the two compile-time guarantees above.
+//!
 //! # Blocking
 //!
 //! Blocking is the default: the C layer spins briefly, then parks (it does not
@@ -215,6 +223,25 @@ pub enum Written {
     /// The ring could not take it, so it was discarded. Nothing was written and
     /// nothing already queued was disturbed.
     Dropped,
+}
+
+/// The lookahead, shared by [`Consumer::peek_next`] and [`Borrowed::peek_next`]
+/// so the two cannot drift.
+///
+/// `WOULD_BLOCK` becomes `Ok(None)` rather than an error: "the next message has
+/// not arrived yet" is an ordinary answer to an ordinary question, and making it
+/// an `Err` would push every caller into matching on an error variant to handle
+/// the common case.
+fn peek_of(ch: *mut sys::shuttle_channel) -> Result<Option<u64>> {
+    let mut len: usize = 0;
+    // SAFETY: the handle is live for as long as its owner exists, and `len` is
+    // a valid out-param. The call reads shared cursors and writes nothing.
+    let rc = unsafe { sys::shuttle_peek_next(ch, &mut len) };
+    match rc {
+        sys::SHUTTLE_OK => Ok(Some(len as u64)),
+        sys::SHUTTLE_ERR_WOULD_BLOCK => Ok(None),
+        _ => Err(Error::from_code(rc)),
+    }
 }
 
 /// Read the counters out of a live handle. Shared by every role wrapper.
@@ -634,6 +661,62 @@ impl Consumer {
         self.acquire_read_flags(sys::SHUTTLE_NONBLOCK)
     }
 
+    /// Read-only lookahead (v1.4): the payload length of the next
+    /// **un-borrowed** message, or `None` if nothing is committed yet.
+    ///
+    /// Never blocks, never copies, moves no cursor, and creates no borrow.
+    ///
+    /// # Why `&self`
+    ///
+    /// Peeking observes; it does not consume, and it leaves no state behind for
+    /// a later call to trip over. `&mut self` would claim otherwise and would
+    /// forbid a peek from anywhere that merely holds a shared reference,
+    /// buying nothing. It also would not have helped with the case peeking is
+    /// FOR — see below.
+    ///
+    /// # Peeking while a message is borrowed
+    ///
+    /// [`Consumer::acquire_read`] takes `&mut self`, so a live [`Borrowed`]
+    /// keeps this `Consumer` exclusively borrowed: **no** method on it,
+    /// `&self` or `&mut self`, can be called while a borrow is outstanding.
+    /// That is deliberate and stays — it is what makes a second acquire and a
+    /// use-after-release compile errors rather than runtime faults, and
+    /// loosening it to let a peek through would give both of those up.
+    ///
+    /// So the peek is offered on the value that legitimately holds the
+    /// consumer for that window: [`Borrowed::peek_next`], the identical call
+    /// through the same handle. Reaching for this one instead does not compile,
+    /// which is the guarantee working, not a gap in it:
+    ///
+    /// ```compile_fail,E0502
+    /// use shuttle::Channel;
+    ///
+    /// let mut consumer = Channel::open("/demo").unwrap().into_consumer();
+    /// let msg = consumer.acquire_read().unwrap();  // holds `consumer`
+    /// let next = consumer.peek_next().unwrap();    // E0502: already borrowed
+    /// println!("{} {:?}", msg.len(), next);
+    /// ```
+    ///
+    /// ```no_run
+    /// # use shuttle::Channel;
+    /// # let mut consumer = Channel::open("/demo")?.into_consumer();
+    /// let msg = consumer.acquire_read()?;        // holds `consumer`
+    /// if let Some(next_len) = msg.peek_next()? { // ...so peek through it
+    ///     let _buf = vec![0u8; next_len as usize];
+    /// }
+    /// drop(msg);                                 // release
+    /// let _also = consumer.peek_next()?;         // and directly again after
+    /// # Ok::<(), shuttle::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] if the frame header holds a length the producer could
+    /// never have written — the same verdict the acquire path reaches.
+    pub fn peek_next(&self) -> Result<Option<u64>> {
+        peek_of(self.ch)
+    }
+
     /// Bump this side's heartbeat without transferring data. See
     /// [`Producer::keepalive`].
     pub fn keepalive(&self) {
@@ -881,6 +964,26 @@ impl<'a> Borrowed<'a> {
     /// An owned copy of the payload. Defeats zero-copy — be deliberate.
     pub fn to_vec(&self) -> Vec<u8> {
         self.as_slice().to_vec()
+    }
+
+    /// Read-only lookahead past THIS borrow (v1.4): the payload length of the
+    /// next message, or `None` if nothing further is committed yet.
+    ///
+    /// The same call as [`Consumer::peek_next`], reachable from here because a
+    /// live `Borrowed` holds the consumer exclusively — and this is the window
+    /// where the answer is most useful, since borrows are strictly
+    /// release-before-acquire: while this message is held, a second
+    /// `acquire_read` would hand back THIS message again, so the lookahead is
+    /// the only way to see the next one before letting go.
+    ///
+    /// It takes `&self` and reads nothing but shared cursors: it cannot
+    /// invalidate this borrow, and the payload slice stays valid across it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`], as for [`Consumer::peek_next`].
+    pub fn peek_next(&self) -> Result<Option<u64>> {
+        peek_of(self.ch)
     }
 
     /// Release explicitly and surface the result.

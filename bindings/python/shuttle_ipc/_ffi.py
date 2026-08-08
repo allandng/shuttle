@@ -4,9 +4,10 @@ ABI mode, not API mode: nothing here is compiled at install time, so the wheel
 is pure Python and binds whatever ``libshuttle_c`` the host provides. The cdef
 below is the complete surface as of ABI v1.4 — the ten frozen v1 functions,
 ``shuttle_create_ex`` (v1.1), ``shuttle_get_stats`` + ``shuttle_stats`` (v1.2),
-and the file-backed trio ``shuttle_create_file`` / ``shuttle_open_file`` /
-``shuttle_unlink_file`` (v1.4) — transcribed from include/shuttle/shuttle_c.h.
-No symbol is declared that the header does not declare.
+the file-backed trio ``shuttle_create_file`` / ``shuttle_open_file`` /
+``shuttle_unlink_file`` and the lookahead ``shuttle_peek_next`` (v1.4) —
+transcribed from include/shuttle/shuttle_c.h. No symbol is declared that the
+header does not declare.
 
 ``SHUTTLE_ABI_VERSION`` is still 1: every addition since has been a new symbol
 or a new constant, never a changed signature, so a library built at any of these
@@ -59,6 +60,7 @@ int shuttle_commit_write(shuttle_channel* ch, size_t actual_len);
 int shuttle_acquire_read(shuttle_channel* ch, const void** ptr, size_t* len,
                          int flags);
 int shuttle_release_read(shuttle_channel* ch);
+int shuttle_peek_next(shuttle_channel* ch, size_t* len_out);
 
 void shuttle_keepalive(shuttle_channel* ch);
 

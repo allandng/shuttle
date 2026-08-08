@@ -60,6 +60,40 @@
 //   or available data (consumer) — failure is spurious "would block",
 //   never corruption.
 //
+// PEEK (v1.4, Consumer::peek_next) adds NO new writer and NO new edge. It is
+//   the read-only half of try_read: it loads read (its own cursor, relaxed),
+//   write (acquire — the SAME P1 edge try_read takes), and, only after
+//   observing write < read, watermark (relaxed — valid by the SAME P2
+//   argument, since that state can only have been produced by the wrap commit
+//   whose write value was just acquired). It then decodes an 8-byte length
+//   header out of the run those cursors delimit, under parse()'s own
+//   overflow-safe guards. It STORES NOTHING: not read, not borrowed_, not a
+//   waiting flag, not a heartbeat. In particular it does NOT perform the C2
+//   A->B handoff when its position reaches the watermark — it reports the
+//   wrapped message by reading at offset 0 directly, leaving the handoff to
+//   the next try_read, so `read` keeps its single writer AND its single
+//   writing SITE.
+//   Sufficiency of reusing the existing edges: peek dereferences payload
+//   header bytes at a position it has proven lies inside a committed run
+//   [read+borrowed_, write) (or [read+borrowed_, watermark) plus [0, write)
+//   when wrapped) — the identical proof obligation try_read discharges with
+//   the identical loads, so P1 makes those bytes visible before they are read
+//   and P2 makes the watermark visible before it is used.
+//   It can UNDER-report: an acquire load that misses a just-published write
+//   yields kErrWouldBlock for a message that is, by then, committed. That is
+//   the same spurious-would-block staleness documented above, and it is
+//   harmless for the same reason — a caller re-peeks or simply reads. It can
+//   never OVER-report, because write is the ONLY publisher of committed data
+//   and a consumer cannot observe a write value the producer never stored.
+//
+// PREFETCH (v1.4, the advise_willneed hooks) is outside this contract
+//   entirely: madvise/posix_madvise on an already-mapped range is advice about
+//   PAGE RESIDENCY, touches no shared state, and its result is discarded. The
+//   hooks compute their range from the same relaxed/acquire cursor loads peek
+//   uses and store nothing. They are gated on a bool resolved once at Consumer
+//   construction (kFlagFileBacked), so a default channel pays one predictable
+//   branch and never enters the code at all.
+//
 // PARKING PROTOCOL (Phase 4, amendments A3/A4) — the park decision is a
 // Dekker-style store->load pattern with a seq_cst fence on BOTH sides:
 //
@@ -426,7 +460,18 @@ class Consumer {
           // caller: the SEGMENT says it, which is why an opener that knows the
           // bit parses an aligned channel correctly with no extra API.
           align_(has_aligned_spans(ch->hdr) ? static_cast<uint64_t>(page_size())
-                                            : 0) {}
+                                            : 0),
+          // PREFETCH GATE, resolved once from that same immutable flags word,
+          // by the same argument as the two gates above. True ONLY on a
+          // file-backed segment (kFlagFileBacked), where an unread page can be
+          // a disk read; on an shm segment there is nothing to bring in, so the
+          // default path pays exactly one perfectly-predictable branch per
+          // acquire and never reaches the advisory code. The existing perf
+          // tests (bench, nocopy_cpu, park_latency) are the guard on that.
+          prefetch_((ch->hdr->flags & kFlagFileBacked) != 0),
+          // page_size() is a host constant but not free to query; resolve it
+          // once, and only when the gate is on (0 = "never needed").
+          page_(prefetch_ ? static_cast<uint64_t>(page_size()) : 0) {}
 
     // A3: announce liveness without consuming data.
     void keepalive() { bump_heartbeat(); }
@@ -448,11 +493,60 @@ class Consumer {
                 r = 0;
                 // fall through to linear view below
             } else {
-                return parse(r, m - r, payload, len);
+                return acquired(parse(r, m - r, payload, len));
             }
         }
         if (w == r) return kErrWouldBlock;  // empty
-        return parse(r, w - r, payload, len);
+        return acquired(parse(r, w - r, payload, len));
+    }
+
+    // READ-ONLY LOOKAHEAD (v1.4): is the next UN-BORROWED message committed,
+    // and how long is its payload? kOk (with *len_out set) | kErrWouldBlock |
+    // kErrCorrupt | kErrInvalidArgs (null out-param).
+    //
+    // "Un-borrowed" is what makes this a new capability rather than a
+    // restatement of try_read: borrows here are strictly release-before-
+    // acquire — a consumer holding message N cannot acquire N+1 — so with a
+    // borrow outstanding there is no other way to learn that N+1 has arrived,
+    // or how big it is, before committing to releasing N. The position it
+    // reports on is therefore `read + borrowed_`, which is the next frame
+    // start with 0 borrows outstanding AND with 1.
+    //
+    // It writes NOTHING (see the PEEK paragraph in the contract above): no
+    // cursor, no borrowed_, no heartbeat. Calling it does not create, extend,
+    // or invalidate a borrow, and it can be called with one outstanding.
+    int peek_next(uint64_t* len_out) const {
+        if (len_out == nullptr) return kErrInvalidArgs;
+        const uint64_t r = h_->read.load(std::memory_order_relaxed);  // ours
+        // The next frame start past whatever we are holding. borrowed_ is 0
+        // when nothing is borrowed, so this one expression covers both cases.
+        const uint64_t pos = r + borrowed_;
+        const uint64_t w = h_->write.load(std::memory_order_acquire);  // P1
+        if (w < r) {
+            // Wrapped: committed data is [r, m) then [0, w). watermark
+            // visibility is guaranteed by P2 exactly as in try_read (relaxed).
+            const uint64_t m = h_->watermark.load(std::memory_order_relaxed);
+            if (pos < m) return peek_at(pos, m - pos, len_out);
+            // THE WRAP SUBTLETY. pos == m: the high region holds nothing we
+            // have not already borrowed, so the next message is the one at
+            // offset 0. try_read reaches this state and performs the C2 A->B
+            // handoff (read = 0) before parsing there. Peek MUST NOT: it is
+            // read-only, and the handoff is a store to `read`. It simply reads
+            // the header at 0 instead and leaves the cursor exactly where it
+            // was — the handoff still happens, later, in the try_read that
+            // actually consumes the message. Nothing is lost by deferring it,
+            // because the handoff publishes only that the high region is free,
+            // and peek frees nothing.
+            // (A wrapped state always has w > 0: the wrap commit publishes a
+            // whole frame at offset 0. So [0, w) is a non-empty committed run
+            // and this is never the empty case.)
+            return peek_at(0, w, len_out);
+        }
+        // Linear: committed data is [r, w), and pos <= w always (a borrowed
+        // frame lies inside the committed run). Equality means we have already
+        // borrowed/consumed everything published.
+        if (pos >= w) return kErrWouldBlock;
+        return peek_at(pos, w - pos, len_out);
     }
 
     // Blocking borrow: brief spin, then park on not_empty.
@@ -513,6 +607,13 @@ class Consumer {
             return kErrPeerDead;
         }
         ++lock_count_;
+        // PREFETCH HOOK (a): the last thing before we sleep. Normally there is
+        // nothing to advise — we only get here because the predicate said the
+        // ring is empty — but the window between that check and the sleep is
+        // exactly where a commit can land, and a page we ask for now is one we
+        // are not faulting in after the wake. Costs one predictable branch when
+        // the gate is off, and no syscall when the region is empty.
+        if (prefetch_) prefetch_unread();
         // Sleep until the producer publishes ANY progress on write.
         park_wait_cursor(&h_->write, w_seen, &h_->park.lock,
                          &h_->park.not_empty, detail::kParkTimeoutNs);
@@ -558,8 +659,79 @@ class Consumer {
     // Process-local count of park-mutex acquisitions by this handle (G4.3).
     uint64_t locks_taken() const { return lock_count_; }
 
+    // Is the WILLNEED prefetch enabled on this handle? The gate itself, exposed
+    // read-only for the same reason locks_taken() is: a test that claims the
+    // default path is branch-off has to be able to SEE that it is off, and
+    // "verified indirectly by timing" is not a check. Fixed at construction.
+    bool prefetching() const { return prefetch_; }
+
  private:
     uint64_t lock_count_ = 0;
+
+    // Prefetch hook (b), on the successful-acquire path: advise the committed
+    // region BEYOND the borrow we just handed out, so the pages the caller will
+    // want next are on their way in while it works on this one. Written as a
+    // pass-through on parse()'s result so try_read keeps its shape, and gated
+    // first so the default path is one predictable branch and nothing else.
+    int acquired(int rc) {
+        if (prefetch_ && rc == kOk) prefetch_unread();
+        return rc;
+    }
+
+    // Advise the committed-but-unread region past the active borrow. Two runs
+    // in the wrapped state, one otherwise; ONLY committed data is ever named
+    // (advising the free part of the ring would ask the kernel to fetch pages
+    // whose contents are about to be overwritten). Loads exactly what peek
+    // loads, with the same orders, and stores nothing.
+    void prefetch_unread() const {
+        const uint64_t r = h_->read.load(std::memory_order_relaxed);
+        const uint64_t pos = r + borrowed_;
+        const uint64_t w = h_->write.load(std::memory_order_acquire);  // P1
+        if (w >= r) {  // linear: committed [r, w)
+            if (pos < w) advise_run(pos, w - pos);
+            return;
+        }
+        // Wrapped: committed [r, m) then [0, w) — both worth having, and the
+        // second one is where the consumer is headed next.
+        const uint64_t m = h_->watermark.load(std::memory_order_relaxed);  // P2
+        if (pos < m) advise_run(pos, m - pos);
+        advise_run(0, w);
+    }
+
+    // One contiguous run [off, off + n) of the data region, page-clamped.
+    // madvise operates on whole PAGES and rejects an unaligned address, and the
+    // data region does NOT start on a page in the default framing (data_offset
+    // is 1280/1536) — so the start ADDRESS is floored to its enclosing page and
+    // the bytes that adds are folded into the length. Flooring can only walk
+    // back into the header, never out of the mapping: the mapping's own base is
+    // page-aligned and lies at or below this address, so its page floor is a
+    // lower bound on ours. The end is inside the data region by construction.
+    void advise_run(uint64_t off, uint64_t n) const {
+        if (n == 0) return;
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(data_ + off);
+        const uintptr_t start = addr & ~(static_cast<uintptr_t>(page_) - 1);
+        advise_willneed(reinterpret_cast<void*>(start),
+                        static_cast<size_t>(addr - start + n));
+    }
+
+    // The read-only half of parse(): the identical little-endian header decode
+    // and the identical guards — `l > max_payload` first, then frame_fits()'s
+    // subtraction-against-a-checked-floor form, never the sum `header + l` that
+    // wraps for an l near 2^64 (fuzz/header_fuzz.cpp's lesson). What it does
+    // NOT do is everything that mutates: no *payload, no borrowed_, no
+    // borrowed_len_. A corrupt length is kErrCorrupt here exactly as there.
+    int peek_at(uint64_t at, uint64_t avail, uint64_t* len_out) const {
+        const unsigned char* blk = data_ + at;
+        uint64_t l = 0;
+        for (unsigned i = 0; i < 8; ++i) {
+            l |= static_cast<uint64_t>(blk[i]) << (8 * i);
+        }
+        if (l > h_->max_payload || !frame_fits(l, avail, align_))
+            return kErrCorrupt;
+        *len_out = l;
+        return kOk;
+    }
+
     int parse(uint64_t at, uint64_t avail, const unsigned char** payload,
               uint64_t* len) {
         // Whole-unit reservation: a readable run always starts at a message
@@ -599,6 +771,8 @@ class Consumer {
     uint64_t stale_ns_;
     ChannelHeader* stats_;  // == h_ on a v2 segment, nullptr on v1
     uint64_t align_;        // 0 = classic framing, page = kFlagAlignedSpans
+    bool prefetch_;         // kFlagFileBacked: WILLNEED the unread region
+    uint64_t page_;         // page_size() when prefetch_, else 0 (unused)
     detail::StaleTracker peer_stale_;
 };
 

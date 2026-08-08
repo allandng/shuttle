@@ -713,3 +713,69 @@ fn unknown_create_bits_are_masked_not_rejected() {
     assert_eq!(msg.as_slice(), b"still works");
     let _ = Channel::unlink(&name);
 }
+
+// --- v1.4 surface: the read-only lookahead ---------------------------------
+
+#[test]
+fn peek_next_reports_the_next_message_length() {
+    let mut p = Pair::new();
+
+    // Nothing committed: the ordinary "not yet", as Ok(None) rather than an
+    // error — that is the whole reason the return is an Option.
+    assert_eq!(p.consumer.peek_next().expect("peek"), None);
+
+    p.producer.write(&vec![b'x'; 1234]).expect("write");
+    assert_eq!(p.consumer.peek_next().expect("peek"), Some(1234));
+    // Read-only: asking twice consumes nothing.
+    assert_eq!(p.consumer.peek_next().expect("peek"), Some(1234));
+
+    let msg = p.consumer.acquire_read().expect("acquire_read");
+    assert_eq!(msg.len(), 1234);
+    drop(msg);
+    assert_eq!(p.consumer.peek_next().expect("peek"), None);
+}
+
+#[test]
+fn peek_next_sees_past_a_live_borrow() {
+    // The case with no other API, and the one that decides the signatures: a
+    // live `Borrowed` holds the `Consumer` exclusively, so the peek has to be
+    // reachable THROUGH it. Both spellings are exercised here.
+    let mut p = Pair::new();
+    p.producer.write(b"first").expect("write");
+
+    let msg = p.consumer.acquire_read().expect("acquire_read");
+    assert_eq!(msg.as_slice(), b"first");
+    assert_eq!(msg.peek_next().expect("peek"), None);
+
+    // A second message arrives while the first is still borrowed.
+    p.producer.write(b"second message").expect("write");
+    assert_eq!(msg.peek_next().expect("peek"), Some(14));
+    // Peeking did not disturb the borrow: the slice is still the first message.
+    assert_eq!(msg.as_slice(), b"first");
+    // ...and it did not consume it either — this borrow still owns message 1.
+    drop(msg);
+
+    // With nothing borrowed, the same answer through the Consumer.
+    assert_eq!(p.consumer.peek_next().expect("peek"), Some(14));
+    let msg = p.consumer.acquire_read().expect("acquire_read");
+    assert_eq!(msg.as_slice(), b"second message");
+    drop(msg);
+    assert_eq!(p.consumer.peek_next().expect("peek"), None);
+}
+
+#[test]
+fn peek_next_keeps_up_across_wraps() {
+    // Long enough to lap the ring many times: peek must track the wrapped
+    // state (where the next message can sit at offset 0 while the borrow is
+    // still in the high region) exactly as the acquire path does.
+    let mut p = Pair::new();
+    for i in 0..500usize {
+        let n = (i * 7919) % 30_000 + 1;
+        p.producer.write(&vec![b'w'; n]).expect("write");
+        assert_eq!(p.consumer.peek_next().expect("peek"), Some(n as u64));
+        let msg = p.consumer.acquire_read().expect("acquire_read");
+        assert_eq!(msg.len(), n);
+        assert_eq!(msg.peek_next().expect("peek"), None);
+    }
+    assert_eq!(p.consumer.peek_next().expect("peek"), None);
+}

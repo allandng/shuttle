@@ -530,6 +530,38 @@ class Channel:
         self._borrow = msg
         return msg
 
+    def peek_next(self):
+        """Length of the next **un-borrowed** message, or ``None`` (v1.4).
+
+        Answers "has the next message arrived, and how big is it?" without
+        acquiring it. Returns the payload length as an ``int``, or ``None`` when
+        nothing beyond the current borrow is committed yet — ``None`` is the
+        ordinary "not here yet", not an error, which is why this returns it
+        instead of raising ``WouldBlock``.
+
+        Never blocks, never copies, never moves a cursor, and never creates or
+        disturbs a borrow. Its whole reason for existing is that borrows are
+        strictly release-before-acquire: while you hold message N,
+        ``acquire_read`` hands you N again, so this is the only way to see N+1
+        before letting go of N::
+
+            with channel.acquire_read() as payload:
+                nxt = channel.peek_next()      # None, or N+1's length
+                if nxt is not None:
+                    buf = bytearray(nxt)       # size the next step now
+
+        A length answer stays true (the producer never un-publishes); a ``None``
+        may be stale the instant you get it — it can only under-report. Raises
+        ``Corrupt`` if the frame header holds a length the producer could never
+        have written, the same verdict the acquire path reaches.
+        """
+        lenp = self._ffi.new("size_t*")
+        rc = self._lib.shuttle_peek_next(self._require_handle(), lenp)
+        if rc == ERR_WOULD_BLOCK:
+            return None
+        check(rc, "peek_next")
+        return lenp[0]
+
     def release_read(self):
         """Release the outstanding borrow (the ABI-mirroring form)."""
         msg = self._borrow

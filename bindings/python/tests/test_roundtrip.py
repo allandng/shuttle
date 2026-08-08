@@ -676,6 +676,71 @@ def test_unknown_create_bits_are_masked_not_rejected():
     Channel.unlink(name)
 
 
+# --- v1.4 surface: the read-only lookahead ---------------------------------
+
+
+def test_peek_next_reports_the_next_message_length(pair):
+    """Empty -> None; one committed message -> its exact payload length."""
+    producer, consumer = pair
+
+    assert consumer.peek_next() is None      # nothing committed yet
+
+    producer.write(b"x" * 1234)
+    assert consumer.peek_next() == 1234
+    # Read-only: asking twice does not consume, and the message is still there.
+    assert consumer.peek_next() == 1234
+    assert consumer.read() == b"x" * 1234
+    assert consumer.peek_next() is None
+
+
+def test_peek_next_sees_past_an_outstanding_borrow(pair):
+    """The case with no other API.
+
+    Borrows are strictly release-before-acquire — while message 1 is held,
+    ``acquire_read`` hands back message 1 — so this is the only way to learn
+    that message 2 has arrived, and how big it is, before releasing.
+    """
+    producer, consumer = pair
+    producer.write(b"first")
+
+    with consumer.acquire_read() as view:
+        assert bytes(view) == b"first"
+        assert consumer.peek_next() is None      # nothing behind it yet
+        producer.write(b"second message")
+        assert consumer.peek_next() == len(b"second message")
+        # The borrow is untouched by the peek.
+        assert bytes(view) == b"first"
+
+    assert consumer.peek_next() == len(b"second message")
+    assert consumer.read() == b"second message"
+    assert consumer.peek_next() is None
+
+
+def test_peek_next_survives_a_wrap(pair):
+    """Draining a channel repeatedly wraps the ring; peek keeps up.
+
+    The interesting internal state (the next message sitting at offset 0 while
+    the borrow is still in the high region) is engineered precisely in the C++
+    test; here the point is that the binding stays correct across whatever the
+    ring does under a long run.
+    """
+    producer, consumer = pair
+    lengths = [(i * 7919) % 30000 + 1 for i in range(200)]
+    for n in lengths:
+        producer.write(b"w" * n)
+        assert consumer.peek_next() == n
+        with consumer.acquire_read() as view:
+            assert len(view) == n
+    assert consumer.peek_next() is None
+
+
+def test_peek_next_on_a_closed_channel_raises(pair):
+    producer, consumer = pair
+    consumer.close()
+    with pytest.raises(shuttle_ipc.ShuttleError):
+        consumer.peek_next()
+
+
 # --- library discovery -----------------------------------------------------
 
 

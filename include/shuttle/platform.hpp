@@ -723,6 +723,41 @@ inline void advise_huge_pages(void* base, size_t len) noexcept {
 #endif
 }
 
+// Advise the kernel that a mapped range will be read SOON, so it can start the
+// I/O now instead of at the first touching fault (v1.4, the consumer-side
+// prefetch hook in spsc.hpp). The point of it is the file-backed backing, where
+// an unread page can be a disk read the consumer would otherwise pay for
+// synchronously, in the middle of a borrow; on an shm segment there is nothing
+// to bring in and the call is never made (Consumer gates on kFlagFileBacked).
+//
+// PURELY ADVISORY, exactly like advise_huge_pages above, and the return value
+// is deliberately ignored for the same reason: WILLNEED is a hint the kernel
+// is free to refuse (EINVAL on a range it dislikes, ENOMEM under pressure),
+// and no caller may make a correctness decision from it. The kernel may also
+// complete the readahead asynchronously or not at all — the consumer reads the
+// bytes either way.
+//
+// Linux uses posix_madvise(POSIX_MADV_WILLNEED), the POSIX spelling, whose
+// glibc implementation is madvise(MADV_WILLNEED) for this hint; macOS has no
+// posix_madvise for WILLNEED semantics and takes madvise(MADV_WILLNEED)
+// directly. Windows has no equivalent advice for a mapped view (PrefetchVirtual
+// Memory exists but is a different contract and the file backing is stubbed out
+// there anyway), so it is a no-op — as it is on any future platform.
+//
+// `addr` MUST be page-aligned: madvise operates on whole pages and rejects an
+// unaligned address. The caller floors it (spsc.hpp's advise_run), because the
+// data region is NOT page-aligned in the default framing.
+inline void advise_willneed(void* addr, size_t len) noexcept {
+#if defined(SHUTTLE_PLATFORM_LINUX)
+    (void)posix_madvise(addr, len, POSIX_MADV_WILLNEED);  // ignored by design
+#elif defined(SHUTTLE_PLATFORM_MACOS)
+    (void)madvise(addr, len, MADV_WILLNEED);  // ignored by design
+#else
+    (void)addr;
+    (void)len;
+#endif
+}
+
 // The system's ordinary page size, and the alignment unit for
 // kFlagAlignedSpans (SHUTTLE_CREATE_ALIGNED_SPANS). Same-host IPC makes this a
 // HOST CONSTANT: every process that maps a given segment runs on the same

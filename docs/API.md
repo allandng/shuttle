@@ -25,9 +25,10 @@ The ten functions `shuttle_create` .. `shuttle_keepalive` are frozen v1.
 additive v1.2 symbol (new symbols only, no existing signature or semantic
 touched); v1.3 adds only the `SHUTTLE_DROP_NEWEST` flag bit and the
 `SHUTTLE_DROPPED` return, both opt-in. v1.4 adds the
-`SHUTTLE_CREATE_ALIGNED_SPANS` flag and the three path-typed lifecycle symbols
-`shuttle_create_file` / `shuttle_open_file` / `shuttle_unlink_file`, all
-additive. The ABI version stays `1`.
+`SHUTTLE_CREATE_ALIGNED_SPANS` flag, the three path-typed lifecycle symbols
+`shuttle_create_file` / `shuttle_open_file` / `shuttle_unlink_file`, and the
+read-only lookahead `shuttle_peek_next`, all additive. The ABI version stays
+`1`.
 
 ---
 
@@ -434,6 +435,54 @@ is the release edge; the borrowed pointer is invalid afterward.
 - Errors: `INVALID_ARGS` (`ch` NULL, no consumer role, or no active borrow),
   `SYS`.
 
+### shuttle_peek_next
+
+```c
+int shuttle_peek_next(shuttle_channel* ch, size_t* len_out);
+```
+
+**Peeking at the next message** (v1.4, additive). Report whether the next
+**un-borrowed** message is committed, and its payload length in `*len_out`.
+Read-only: it never blocks, never copies, moves no cursor, and neither creates
+nor disturbs a borrow. There is no `flags` word — peeking is a question, and the
+answer is always available immediately.
+
+Valid with **0 or 1 borrows outstanding**, and the second case is why it exists.
+Borrows here are strictly release-before-acquire: while you hold message N,
+`shuttle_acquire_read` hands you N again, not N+1 (it is idempotent). So without
+this call there is no way to learn that N+1 has arrived — or how big it is —
+until you have already committed to releasing N:
+
+```c
+const void* p; size_t n;
+shuttle_acquire_read(ch, &p, &n, 0);
+size_t next = 0;
+if (shuttle_peek_next(ch, &next) == SHUTTLE_OK) {
+    /* N+1 is committed and is `next` bytes: size the destination now, decide
+       whether to batch, keep a pipeline full, or start a DMA for it. */
+}
+consume(p, n);
+shuttle_release_read(ch);
+```
+
+- `SHUTTLE_OK` — `*len_out` is the next message's payload length.
+- `SHUTTLE_ERR_WOULD_BLOCK` — nothing beyond the current borrow is committed.
+  **Not an error**: it is the ordinary "not here yet". The bindings map it to
+  `None` (Python) and `Ok(None)` (Rust) for exactly that reason.
+- Errors: `INVALID_ARGS` (`ch` or `len_out` NULL), `CORRUPT` (the frame header
+  holds a length the producer could never have written — the same verdict the
+  acquire path reaches on the same bytes, reached through the same guards).
+
+**Freshness.** A length answer stays true: the producer never un-publishes. A
+`WOULD_BLOCK` answer may be stale the instant it is given, because the consumer
+may have missed a just-landed publication. That is one-sided by construction —
+peek can only under-report, never over-report, since `write` is the only
+publisher of committed data — and it is the same staleness every non-blocking
+call in this ABI already has.
+
+Calling it binds this handle's **consumer** role, exactly as `shuttle_read` and
+`shuttle_acquire_read` do.
+
 ### shuttle_keepalive
 
 ```c
@@ -648,6 +697,43 @@ the kernel *can* reclaim it, not that it will have done so at any given moment.
 Size the channel for the working set you want, not for the largest file you can
 create.
 
+### Prefetch on file-backed channels (`MADV_WILLNEED`, automatic)
+
+There is nothing to switch on and nothing to call. On a **file-backed** channel
+— and only there — the consumer advises the kernel about the pages it is about
+to read: `posix_madvise(POSIX_MADV_WILLNEED)` on Linux, `madvise(MADV_WILLNEED)`
+on macOS, over the **committed-but-unread** region beyond the borrow it is
+currently holding. Two points, both consumer-side: on a successful acquire (so
+the next message's pages are on their way in while the current one is being
+worked on) and immediately before parking.
+
+The reason it is scoped to this backing: on an shm segment there is nothing to
+bring in — the pages are already memory. On a file, an unread page can be a disk
+read, and paying for it synchronously in the middle of a borrow is exactly the
+stall this hint exists to avoid. That shape is the point of the backing: a large
+store on disk, consumed through a small resident window.
+
+Properties worth being precise about:
+
+- **Advisory, and the return value is deliberately ignored.** WILLNEED is a hint
+  the kernel may refuse, defer, or complete asynchronously. Nothing in the
+  library makes a decision from it, and a channel behaves identically if every
+  call is a no-op. Same contract as `SHUTTLE_CREATE_HUGEPAGES`.
+- **Zero-cost on the default path.** The gate is a `bool` resolved once at
+  consumer construction from the persisted `0x20` flag, so an shm channel pays
+  one perfectly-predictable branch per acquire and never reaches the advisory
+  code (`Consumer::prefetching()` exposes the gate, and the test suite asserts
+  it is `false` for shm and `true` for a file).
+- **Only committed data is ever named.** The free part of the ring is never
+  advised — asking the kernel to fetch pages the producer is about to overwrite
+  would be work for nothing. In the wrapped state that means two runs:
+  `[read+borrow, watermark)` and `[0, write)`.
+- **No new ordering.** The hooks read the same cursors with the same memory
+  orders the read path already uses and store nothing; the
+  memory-ordering contract in `include/shuttle/spsc.hpp` says why that adds no
+  edge.
+- **Windows:** no-op, like the file backing itself.
+
 ### Combining flags
 
 | Combination | Result |
@@ -778,6 +864,11 @@ producer side.
 - **Mandatory release**: every acquire must be paired with exactly one release.
   At most one borrow/reservation may be outstanding per handle; a second acquire
   before releasing the first returns `INVALID_ARGS`.
+- **Release before acquire, and the window through it**: a consumer holding
+  message N cannot acquire N+1 — the read cursor does not move until the
+  release. Use `shuttle_peek_next` to learn that N+1 exists, and how large it
+  is, while still holding N; it is read-only and cannot invalidate the borrow
+  you are holding.
 - **Contiguity guarantee**: the ring is a **BipBuffer** — reservations are
   whole-unit, so a payload is never split across the physical wrap. A borrowed or
   reserved span is always one contiguous run of bytes, safe to expose directly as
@@ -961,3 +1052,20 @@ and `Borrowed`'s `Drop` performs `shuttle_release_read`. Consequences enforced
   (`E0597`), not a runtime fault.
 - No second acquire while a borrow is outstanding — the `Consumer` stays mutably
   borrowed until the `Borrowed` drops.
+
+The distributable `shuttle` crate keeps that shape, which decides where the
+v1.4 lookahead lives. A live `Borrowed` holds the `Consumer` exclusively, so
+*no* method on the consumer — `&self` or `&mut self` — is callable while a
+message is borrowed; weakening that to let a peek through would give up both
+guarantees above. So the peek is offered on **both** types:
+`Consumer::peek_next(&self)` when nothing is borrowed, and
+`Borrowed::peek_next(&self)` when something is (the case that matters). Both
+return `Result<Option<u64>>`, with `Ok(None)` for `WOULD_BLOCK`. `&self` rather
+than `&mut self` because peeking observes and leaves nothing behind. A
+`compile_fail` doctest in the crate pins the reasoning: calling
+`consumer.peek_next()` with a borrow alive is `E0502`, by design, and
+`msg.peek_next()` is the spelling that works.
+
+In Python the same call is `Channel.peek_next()`, returning the length or
+`None`; it is safe to call with a `BorrowedMessage` outstanding and does not
+invalidate its view.

@@ -46,6 +46,16 @@ static_assert(SHUTTLE_CREATE_FILE_BACKED == shuttle::kFlagFileBacked);
 // through the same `int flags` slot on the read/write calls.
 static_assert(SHUTTLE_CREATE_ALIGNED_SPANS !=
               (SHUTTLE_NONBLOCK | SHUTTLE_DROP_NEWEST));
+// shuttle_peek_next (v1.4) adds NO error code and NO flag bit — the house rule
+// asks for a mirroring assert whenever one of those arrives, and the honest
+// mirror here is that its ENTIRE return set is already asserted above. Restated
+// as one assertion so the claim is checked by the compiler rather than by prose
+// in the header: OK, WOULD_BLOCK (nothing new is committed), INVALID_ARGS (null
+// argument), CORRUPT (a length the producer could never have written).
+static_assert(SHUTTLE_OK == shuttle::kOk &&
+              SHUTTLE_ERR_WOULD_BLOCK == shuttle::kErrWouldBlock &&
+              SHUTTLE_ERR_INVALID_ARGS == shuttle::kErrInvalidArgs &&
+              SHUTTLE_ERR_CORRUPT == shuttle::kErrCorrupt);
 // The C struct is the ABI shape callers allocate; it must stay a plain
 // five-u64 record in the order the C++ Stats declares.
 static_assert(sizeof(shuttle_stats) == 5 * sizeof(uint64_t));
@@ -295,6 +305,33 @@ int shuttle_acquire_read(shuttle_channel* ch, const void** ptr, size_t* len,
         if (rc != SHUTTLE_OK) return rc;
         *ptr = ch->borrow_ptr;
         *len = static_cast<size_t>(ch->borrow_len);
+        return SHUTTLE_OK;
+    } catch (...) {
+        return SHUTTLE_ERR_SYS;
+    }
+}
+
+// v1.4 additive: read-only lookahead at the next UN-BORROWED message.
+//
+// It deliberately does NOT consult ch->borrow_active or ch->borrow_len. Those
+// cache what THIS layer handed out; the position peek must report on is the one
+// the Consumer knows — `read + borrowed_`, where borrowed_ is the span of the
+// borrow the Consumer itself is holding (spsc.hpp). Those two agree by
+// construction: ensure_borrow only ever sets borrow_active after a Consumer
+// read that set borrowed_, and shuttle_release_read clears both. So a peek with
+// a borrow outstanding looks past that borrow, and a peek without one looks at
+// the head of the queue, with no accounting of our own to keep in step.
+//
+// Like every other consumer-side entry point, calling it binds this handle's
+// consumer role (lazily constructing the Consumer) — peeking is something only
+// a consumer can do.
+int shuttle_peek_next(shuttle_channel* ch, size_t* len_out) {
+    if (ch == nullptr || len_out == nullptr) return SHUTTLE_ERR_INVALID_ARGS;
+    try {
+        uint64_t len = 0;
+        const int rc = consumer(ch)->peek_next(&len);
+        if (rc != SHUTTLE_OK) return rc;
+        *len_out = static_cast<size_t>(len);
         return SHUTTLE_OK;
     } catch (...) {
         return SHUTTLE_ERR_SYS;

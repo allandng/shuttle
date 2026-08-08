@@ -2,11 +2,11 @@
 //!
 //! This crate is the complete surface as of ABI v1.4 and nothing else: the ten
 //! frozen v1 functions `shuttle_create`..`shuttle_keepalive`, plus the additive
-//! `shuttle_create_ex` (v1.1), `shuttle_get_stats` (v1.2), and the file-backed
-//! trio `shuttle_create_file` / `shuttle_open_file` / `shuttle_unlink_file`
-//! (v1.4). Every declaration is transcribed by hand from
-//! `include/shuttle/shuttle_c.h`, which is the single source of truth. No symbol
-//! appears here that the header does not declare.
+//! `shuttle_create_ex` (v1.1), `shuttle_get_stats` (v1.2), the file-backed trio
+//! `shuttle_create_file` / `shuttle_open_file` / `shuttle_unlink_file` and the
+//! lookahead `shuttle_peek_next` (v1.4). Every declaration is transcribed by
+//! hand from `include/shuttle/shuttle_c.h`, which is the single source of
+//! truth. No symbol appears here that the header does not declare.
 //!
 //! `SHUTTLE_ABI_VERSION` is still 1: everything since v1.1 has been a new
 //! symbol or a new constant, never a changed signature.
@@ -239,6 +239,18 @@ extern "C" {
     /// Release the outstanding borrow. The borrowed pointer is invalid
     /// afterward — the bytes may be reused by the producer immediately.
     pub fn shuttle_release_read(ch: *mut shuttle_channel) -> c_int;
+
+    /// v1.4: report whether the next UN-BORROWED message is committed, and its
+    /// payload length in `*len_out`. Valid with 0 or 1 borrows outstanding —
+    /// with one, it looks PAST it, which is the only way to see message N+1
+    /// while holding N (borrows are strictly release-before-acquire).
+    ///
+    /// Never blocks (there is no flags word), never copies, moves no cursor and
+    /// disturbs no borrow. Returns `SHUTTLE_OK`,
+    /// [`SHUTTLE_ERR_WOULD_BLOCK`] (nothing committed beyond the borrow — the
+    /// ordinary "not yet", not an error), `SHUTTLE_ERR_INVALID_ARGS` (NULL
+    /// argument) or `SHUTTLE_ERR_CORRUPT`.
+    pub fn shuttle_peek_next(ch: *mut shuttle_channel, len_out: *mut usize) -> c_int;
 
     // --- liveness ----------------------------------------------------------
 

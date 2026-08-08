@@ -49,6 +49,20 @@
  * channel's capacity exceed physical RAM. See docs/API.md, "File-backed
  * channels", for the crash story, the stale-file recipe, and the explicit
  * non-goal of durability.
+ *
+ * v1.4 also adds shuttle_peek_next: one new symbol, no new constant, no new
+ * error code, nothing existing touched, so SHUTTLE_ABI_VERSION stays 1. It
+ * answers "has the next message arrived, and how big is it?" WITHOUT acquiring
+ * it — which is a capability the ABI genuinely lacked, because borrows here are
+ * strictly release-before-acquire: a consumer holding message N cannot acquire
+ * N+1, and so had no way to size, schedule, or even detect N+1 before letting
+ * go of N. Its companion is invisible from the ABI: on a FILE-BACKED channel
+ * the consumer now advises the kernel (MADV_WILLNEED) about the committed-but-
+ * unread region, so the next pages are on their way in from disk while the
+ * current message is being worked on. That is advisory, automatic, costs a
+ * default (shm) channel one predictable branch, and changes no observable
+ * behavior — there is no flag to set and nothing to call. See docs/API.md,
+ * "Peeking at the next message" and "Prefetch on file-backed channels".
  */
 #ifndef SHUTTLE_C_H
 #define SHUTTLE_C_H
@@ -288,6 +302,42 @@ int shuttle_commit_write(shuttle_channel* ch, size_t actual_len);
 int shuttle_acquire_read(shuttle_channel* ch, const void** ptr, size_t* len,
                          int flags);
 int shuttle_release_read(shuttle_channel* ch);
+
+/* --- read-only lookahead (v1.4 additive) ---
+ * Report whether the next UN-BORROWED message is committed, and its payload
+ * length in *len_out. Never blocks (there is no flags word: peeking is a
+ * question, and the answer is always available immediately), never copies,
+ * never moves a cursor, and never creates or disturbs a borrow.
+ *
+ * Valid with 0 or 1 borrows outstanding, and that is the point. Borrows are
+ * strictly release-before-acquire — while you hold message N,
+ * shuttle_acquire_read hands you N again, not N+1 — so without this call there
+ * is no way to learn that N+1 exists, or how large it is, until you have
+ * already released N. With it:
+ *
+ *     const void* p; size_t n;
+ *     shuttle_acquire_read(ch, &p, &n, 0);
+ *     size_t next = 0;
+ *     if (shuttle_peek_next(ch, &next) == SHUTTLE_OK) {
+ *         // N+1 is already committed and is `next` bytes: size the
+ *         // destination, decide whether to batch, keep the pipeline full.
+ *     }
+ *     shuttle_release_read(ch);
+ *
+ * Returns:
+ *   SHUTTLE_OK               *len_out holds the next message's payload length.
+ *   SHUTTLE_ERR_WOULD_BLOCK  nothing beyond the current borrow is committed
+ *                            yet. Not an error — the ordinary "not here yet".
+ *   SHUTTLE_ERR_INVALID_ARGS ch or len_out is NULL.
+ *   SHUTTLE_ERR_CORRUPT      the frame header holds a length the producer could
+ *                            never have written (NFR-S2), the same verdict the
+ *                            acquire path reaches on the same bytes.
+ *
+ * A SHUTTLE_OK answer stays true (the producer never un-publishes), while a
+ * WOULD_BLOCK answer may be stale the instant it is given — it can only
+ * under-report, never over-report. Calling it binds this handle's consumer
+ * role, exactly as shuttle_read / shuttle_acquire_read do. */
+int shuttle_peek_next(shuttle_channel* ch, size_t* len_out);
 
 /* --- liveness (A3) --- */
 void shuttle_keepalive(shuttle_channel* ch);
