@@ -13,10 +13,18 @@ Two conventions for reporting failure:
 - `shuttle_read` returns a `long`: the non-negative payload length on success,
   or a negative error code.
 
+**Test errors as `< 0`, not as `!= SHUTTLE_OK`.** Since v1.3 there is exactly
+one positive return in the ABI — `SHUTTLE_DROPPED` (1) from `shuttle_write`,
+and only when the caller passed `SHUTTLE_DROP_NEWEST` on that very call. It is
+not an error and it is not `SHUTTLE_OK`; code that tests `!= SHUTTLE_OK` will
+report a successful drop as a failure. Code that tests `< 0` is correct for
+every entry point here, before and after this addition.
+
 The ten functions `shuttle_create` .. `shuttle_keepalive` are frozen v1.
 `shuttle_create_ex` is an additive v1.1 symbol and `shuttle_get_stats` an
 additive v1.2 symbol (new symbols only, no existing signature or semantic
-touched), so the ABI version stays `1`.
+touched); v1.3 adds only the `SHUTTLE_DROP_NEWEST` flag bit and the
+`SHUTTLE_DROPPED` return, both opt-in. The ABI version stays `1`.
 
 ---
 
@@ -217,6 +225,9 @@ as producer on first use.
   `SHUTTLE_OK` or `PEER_DEAD`.
 - Non-blocking (`flags & SHUTTLE_NONBLOCK`): try-semantics; returns
   `WOULD_BLOCK` instead of parking.
+- Lossy (`flags & SHUTTLE_DROP_NEWEST`): try-semantics *and* a drop policy;
+  returns the positive `SHUTTLE_DROPPED` instead of `WOULD_BLOCK`. See
+  **Drop-newest backpressure policy** below.
 - Errors: `INVALID_ARGS` (`ch` NULL, or `data` NULL with `len != 0`),
   `MSG_TOO_LARGE` (`len > max_payload`; checked fail-fast, never parks),
   `WOULD_BLOCK` (non-blocking, no contiguous space now), `PEER_DEAD` (blocked
@@ -232,7 +243,9 @@ Copy path: dequeue the next message into `out`, up to `cap` bytes. Binds the
 handle as consumer on first use.
 
 - Returns the payload length (`>= 0`) on success.
-- Blocking / non-blocking as for `shuttle_write`.
+- Blocking / non-blocking as for `shuttle_write`. `SHUTTLE_DROP_NEWEST` is
+  **not** valid here and returns `INVALID_ARGS` (there is nothing to drop on a
+  read; see the policy section).
 - If the waiting message is larger than `cap`, returns `MSG_TOO_LARGE` **and the
   message stays queued** (not consumed) — retry with a larger buffer.
 - Errors: `INVALID_ARGS` (`ch` NULL, or `out` NULL with `cap != 0`),
@@ -252,10 +265,13 @@ bytes and return a pointer to it in `*ptr`. Nothing is published until
 reservation is process-local: a producer that dies mid-reservation leaves no
 shared-state inconsistency.
 
-- Blocking / non-blocking as for `shuttle_write`.
-- Errors: `INVALID_ARGS` (`ch` or `ptr` NULL, or a reservation is already
-  outstanding), `MSG_TOO_LARGE` (`len > max_payload`), `WOULD_BLOCK`
-  (non-blocking, no contiguous span now), `PEER_DEAD`, `SYS`.
+- Blocking / non-blocking as for `shuttle_write`. `SHUTTLE_DROP_NEWEST` is
+  **not** valid here and returns `INVALID_ARGS`: a reservation has no payload
+  yet, so there is nothing a drop could discard.
+- Errors: `INVALID_ARGS` (`ch` or `ptr` NULL, a reservation is already
+  outstanding, or `flags` contains `SHUTTLE_DROP_NEWEST`), `MSG_TOO_LARGE`
+  (`len > max_payload`), `WOULD_BLOCK` (non-blocking, no contiguous span now),
+  `PEER_DEAD`, `SYS`.
 
 ### shuttle_commit_write
 
@@ -279,10 +295,12 @@ Zero-copy borrow, consumer side: borrow the next message in place. `*ptr` points
 into the shared segment; `*len` is the payload length. At most one outstanding
 borrow per handle; must be paired with `shuttle_release_read`.
 
-- Blocking / non-blocking as for `shuttle_read`.
+- Blocking / non-blocking as for `shuttle_read`. `SHUTTLE_DROP_NEWEST` is
+  **not** valid here and returns `INVALID_ARGS`.
 - The borrowed payload is guaranteed contiguous (see Zero-copy borrow rules).
-- Errors: `INVALID_ARGS` (`ch`, `ptr`, or `len` NULL), `WOULD_BLOCK`
-  (non-blocking, empty), `PEER_DEAD`, `CORRUPT`, `SYS`.
+- Errors: `INVALID_ARGS` (`ch`, `ptr`, or `len` NULL, or `flags` contains
+  `SHUTTLE_DROP_NEWEST`), `WOULD_BLOCK` (non-blocking, empty), `PEER_DEAD`,
+  `CORRUPT`, `SYS`.
 
 ### shuttle_release_read
 
@@ -336,6 +354,7 @@ it — because the counters live in the segment, not in the handle.
 
 | Value | Name                          | Meaning / when it occurs |
 |-------|-------------------------------|--------------------------|
+| **1** | **`SHUTTLE_DROPPED`**         | **Not an error.** `shuttle_write` with `SHUTTLE_DROP_NEWEST`: the ring could not take the message, so it was dropped. The only positive return in the ABI; unreachable without the flag. |
 | 0     | `SHUTTLE_OK`                  | Success. |
 | -1    | `SHUTTLE_ERR_INVALID_ARGS`    | NULL handle/pointer, malformed name, zero size, misuse (double reservation/borrow, wrong role). |
 | -2    | `SHUTTLE_ERR_NAME_TOO_LONG`   | Name exceeds the platform shm-name limit (macOS 30, Linux 254). |
@@ -353,8 +372,9 @@ it — because the counters live in the segment, not in the handle.
 | -14   | `SHUTTLE_ERR_NO_HUGEPAGES`    | `create_ex` with `SHUTTLE_CREATE_HUGETLB_2MB`/`_1GB`: reserved huge pages could not be delivered (no hugetlbfs mount of that page size, no free pages, no permission, or a platform without hugetlbfs). Never a silent fallback to normal pages. |
 | -15   | `SHUTTLE_ERR_NO_STATS`        | `shuttle_get_stats` on a segment created without `SHUTTLE_CREATE_STATS`. |
 
-The C `#define`s are `static_assert`ed equal to the C++ `shuttle::Err` enum in
-the implementation, so the two can never drift.
+The C `#define`s are `static_assert`ed equal to the C++ `shuttle::Err` enum (and
+`shuttle::kDropped` / the `shuttle::kOp*` flag bits) in the implementation, so
+the two can never drift.
 
 ---
 
@@ -377,6 +397,89 @@ the implementation, so the two can never drift.
   `CAPACITY_TOO_SMALL`.
 - **One-shot sizing**: the segment is `ftruncate`d exactly once, at creation, on
   both platforms (macOS forbids re-truncating an shm object). It never grows.
+
+---
+
+## Backpressure
+
+The default, and a v1 guarantee: **Shuttle applies backpressure and never drops
+a message.** A full ring parks the producer (`flags == 0`) or reports
+`WOULD_BLOCK` (`SHUTTLE_NONBLOCK`). Nothing queued is ever overwritten, and a
+message the library accepted is a message the consumer will see.
+
+### Drop-newest policy (`SHUTTLE_DROP_NEWEST`, v1.3)
+
+```c
+#define SHUTTLE_DROP_NEWEST 0x2   /* per-op flag, shuttle_write only */
+#define SHUTTLE_DROPPED     1     /* positive, not an error, not SHUTTLE_OK */
+```
+
+For callers who would rather lose a sample than stall — telemetry, live video
+frames, sensor feeds — `shuttle_write` accepts an opt-in lossy policy:
+
+| `flags` on a **full** ring | Result |
+|---|---|
+| `0` | parks until space (or `PEER_DEAD`) — the default, unchanged |
+| `SHUTTLE_NONBLOCK` | `SHUTTLE_ERR_WOULD_BLOCK`, message not written |
+| `SHUTTLE_DROP_NEWEST` | `SHUTTLE_DROPPED`, message **discarded**, counted |
+| `SHUTTLE_NONBLOCK \| SHUTTLE_DROP_NEWEST` | same as `SHUTTLE_DROP_NEWEST` (redundant, accepted) |
+
+The rules, exactly:
+
+- **Per call, never a mode.** The bit affects the one call it is passed on.
+  There is no channel-wide setting, no create-flag, and no path by which a
+  blocking or non-blocking write turns lossy on its own. Segments created by a
+  dropping producer are ordinary segments.
+- **It never parks.** `SHUTTLE_DROP_NEWEST` implies try-semantics, so it takes
+  the same non-blocking path as `SHUTTLE_NONBLOCK` — including when the
+  consumer is parked, wedged, or dead. It therefore never returns `PEER_DEAD`
+  either: a dead consumer simply means the ring stays full and writes drop.
+- **It drops the NEWEST — the message you just passed.** Nothing already queued
+  is touched: no cursor moves, no bytes are overwritten, the consumer is not
+  involved, and a drop is invisible to the peer. The consumer still sees a
+  gap-free, in-order prefix of the messages that were accepted.
+- **Oversize is still an error.** `len > max_payload` returns
+  `MSG_TOO_LARGE`, not `SHUTTLE_DROPPED`. A payload that could never fit in any
+  ring state is a caller bug, not backpressure, and is not swallowed silently.
+- **Write-only.** `shuttle_read`, `shuttle_acquire_read` and
+  `shuttle_acquire_write` return `INVALID_ARGS` if the bit is set — there is
+  nothing to drop on those paths, so the flag is refused rather than ignored.
+- **Counted where counters exist.** Each drop bumps `msgs_dropped` on a
+  `SHUTTLE_CREATE_STATS` segment. On a v1 segment the drop still happens; there
+  is simply nowhere to record it (`shuttle_get_stats` keeps returning
+  `NO_STATS`). `msgs_written` / `bytes_written` never count a dropped message.
+
+```c
+int rc = shuttle_write(ch, frame, len, SHUTTLE_DROP_NEWEST);
+if (rc < 0) return rc;                  /* real error */
+if (rc == SHUTTLE_DROPPED) ++dropped;   /* consumer is behind; frame is gone */
+```
+
+### Freshness without dropping: drain-to-latest
+
+`SHUTTLE_DROP_NEWEST` keeps the *oldest* queued messages and throws away the
+newest. A consumer that wants the *newest* wants the opposite, and it does not
+need a library feature — it needs a loop. Drain everything available and keep
+the last message:
+
+```c
+const void* p; size_t n;
+int have = 0;
+while (shuttle_acquire_read(ch, &p, &n, SHUTTLE_NONBLOCK) == SHUTTLE_OK) {
+    memcpy(latest, p, n);               /* copy: the borrow ends at release */
+    latest_len = n; have = 1;
+    shuttle_release_read(ch);           /* release each one, in order */
+}
+if (have) process(latest, latest_len);  /* only the freshest survives */
+```
+
+This is the **recommended freshness pattern**, and it is strictly better than
+an overwrite-oldest ring would be: the consumer decides what is stale (it knows
+what it is behind on; the producer does not), the ring keeps applying
+backpressure if the consumer stops draining, and every memory-ordering
+invariant is untouched — the consumer is only doing what a consumer always
+does. See `docs/ROADMAP.md` for why overwrite-oldest is rejected on the
+producer side.
 
 ---
 
@@ -456,7 +559,7 @@ read with `shuttle_get_stats`. Five counters live in the segment, so either peer
 |-------|-----------|--------|
 | `msgs_written`  | producer | messages published (counted at the commit that makes a message visible). |
 | `bytes_written` | producer | **payload** bytes published. |
-| `msgs_dropped`  | — | **Reserved**: always `0`. Nothing in this library drops a message — a full ring blocks or returns `WOULD_BLOCK`. The field exists so its offset is frozen with the rest of the v2 layout. |
+| `msgs_dropped`  | producer | messages discarded by a `SHUTTLE_DROP_NEWEST` write (v1.3), and nothing else. `0` unless the producer opts into that policy — a full ring otherwise blocks or returns `WOULD_BLOCK`. Dropped messages are **not** counted in `msgs_written` / `bytes_written`. |
 | `msgs_read`     | consumer | messages released (counted at the release that frees the message's bytes). |
 | `bytes_read`    | consumer | **payload** bytes released. |
 
@@ -473,7 +576,10 @@ read with `shuttle_get_stats`. Five counters live in the segment, so either peer
   `msgs_read` trailing `msgs_written`, or a counter lagging a cursor. Once both
   sides are quiescent the totals are exact.
 - **Without the flag**: `shuttle_get_stats` returns `NO_STATS`, and the data
-  path never reads or writes those addresses (they are payload).
+  path never reads or writes those addresses (they are payload). This includes
+  the drop counter: `SHUTTLE_DROP_NEWEST` works exactly the same on a v1
+  segment, the drops are simply not counted anywhere. A producer that needs the
+  drop rate must create the channel with `SHUTTLE_CREATE_STATS`.
 
 ---
 

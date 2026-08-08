@@ -127,10 +127,10 @@ struct alignas(kCacheLine) ChannelHeader {
     // producer-owned line
     alignas(kCacheLine) std::atomic<uint64_t> stat_msgs_written;
     std::atomic<uint64_t> stat_bytes_written;
-    // RESERVED: written only by a later drop-policy package; always zero today
-    // (nothing in this library drops a message — a full ring blocks or reports
-    // kErrWouldBlock). The field exists now so its offset is frozen with the
-    // rest of the v2 layout.
+    // Messages the caller chose to discard under the opt-in lossy write
+    // policy (the C ABI's SHUTTLE_DROP_NEWEST; see Producer::count_drop).
+    // Stays zero unless the caller opts in per call — the library never drops
+    // on its own: a full ring blocks or reports kErrWouldBlock by default.
     std::atomic<uint64_t> stat_msgs_dropped;
 
     // consumer-owned line

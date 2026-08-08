@@ -53,16 +53,51 @@ Shipped and tested; listed here because they are frequently proposed as
   implemented: it collapses normal pages into THP, which is redundant once the
   mapping is on explicitly reserved huge pages.
 
+- **Configurable backpressure: the drop-newest policy.** `shuttle_write` accepts
+  the per-op flag `SHUTTLE_DROP_NEWEST` (`0x2`): on a full ring the message is
+  discarded instead of blocking, and the call returns the new positive
+  `SHUTTLE_DROPPED` (`1`) — the first non-negative-non-zero return in the ABI,
+  which is why the documentation now says to test errors as `rc < 0`. Strictly
+  **per call**: no create-flag, no channel mode, no fallback path, so
+  "backpressure, never drops" remains the default and the guarantee. It implies
+  try-semantics (it can never park, even against a dead consumer), it never
+  touches anything already queued, oversize payloads still fail with
+  `MSG_TOO_LARGE` rather than being disguised as backpressure, and it is refused
+  with `INVALID_ARGS` on the read/acquire paths where there is nothing to drop.
+  Drops increment `msgs_dropped` on a `SHUTTLE_CREATE_STATS` segment; on a v1
+  segment the drop still happens, uncounted. See `tests/drop_policy_test.cpp`.
+
+  **Overwrite-oldest is rejected for v1.x**, and not on taste. Making the
+  producer discard the oldest queued message would require it to:
+
+  1. **advance `read`** — the consumer's cursor. Strict single-writer ownership
+     of `write`/`watermark` (producer) and `read` (consumer) is the premise
+     every memory-ordering proof in `spsc.hpp` rests on: it is what lets each
+     store be a plain store rather than an RMW, and what makes a stale read of
+     the peer's cursor merely conservative instead of unsound. A second writer
+     to `read` invalidates all of it, C2's handoff argument first.
+  2. **invalidate a borrow that is legally outstanding.** `[read, read +
+     borrowed)` is a live pointer the consumer is allowed to be dereferencing;
+     the zero-copy contract says those bytes stay valid until release. A
+     producer reclaiming them turns the headline feature into a use-after-free
+     that no API rule could make the consumer's fault.
+  3. **parse frame headers it does not own,** racing the consumer, to find where
+     the oldest message ends — reading data-region bytes whose framing is only
+     stable because exactly one side advances each cursor.
+
+  A sound freshness story needs none of that, and needs no library change:
+  **consumer drain-to-latest** — read and release in a loop while messages are
+  available, keep the last one. The consumer is the side that knows what it is
+  behind on, it is only doing what a consumer always does, and backpressure
+  still protects the ring if it stops draining. It is documented as the
+  recommended pattern in `docs/API.md`.
+
 ## v1.x candidates
 
 Plausible next steps; each carries a caveat that keeps it out of v1.
 - **Stats counters in the shared header.** Message/byte counters surfaced
   through the inspect tool. Touches the frozen segment layout, so it needs
   versioning care (the layout freeze is an ABI contract).
-- **Configurable backpressure policies.** Lossy drop/overwrite modes for callers
-  that prefer freshness over completeness. Must be **strictly opt-in**:
-  never-drops is a v1 guarantee, so any lossy mode is an explicit,
-  separately-selected policy — never a default or a silent fallback.
 - **Bare-metal Linux benchmark run.** Convert the provisional headline latency
   claim into a final one by measuring on controlled hardware (shared CI runners
   produce arbitrary numbers and cannot settle a percentile claim). A virtualized

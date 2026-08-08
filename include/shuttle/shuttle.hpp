@@ -34,13 +34,35 @@ enum Err : int {
     kErrNoStats = -15,  // get_stats: segment has no stats block (v1 layout)
 };
 
+// NOT an error, and the first POSITIVE code in the surface: an opt-in
+// drop-newest write found no room and threw the message away instead of
+// blocking (C ABI: SHUTTLE_DROPPED, from shuttle_write with kOpDropNewest).
+// Callers that test `rc != kOk` therefore see a successful drop as a failure;
+// testing `rc < 0` for errors is the form that stays correct. Nothing returns
+// this unless the caller asked for the policy on that very call.
+constexpr int kDropped = 1;
+
+// Per-op flag bits (the `flags` argument of the read/write entry points) — a
+// SEPARATE namespace from the kFlag* create-flags in header.hpp. Blocking is
+// the default; these are the opt-outs.
+//   kOpNonBlock   — try-semantics: kErrWouldBlock instead of parking.
+//   kOpDropNewest — write only: try-semantics PLUS a lossy policy; a message
+//                   that does not fit now is dropped and kDropped returned.
+//                   Meaningless on the read/acquire paths, which reject it
+//                   with kErrInvalidArgs rather than ignore it.
+constexpr int kOpNonBlock = 0x1;
+constexpr int kOpDropNewest = 0x2;
+
 // Snapshot of the opt-in counters (kVersionStats segments only). Plain
 // uint64s, not atomics: get_stats copies them out. Byte counts are PAYLOAD
 // bytes; the 8-byte frame header is excluded on both sides.
 struct Stats {
     uint64_t msgs_written;
     uint64_t bytes_written;
-    uint64_t msgs_dropped;  // reserved: always 0 until the drop-policy package
+    // Messages thrown away by an opt-in drop-newest write (kOpDropNewest is
+    // never implied): 0 on any channel that never asks for a lossy policy,
+    // which is every channel by default.
+    uint64_t msgs_dropped;
     uint64_t msgs_read;
     uint64_t bytes_read;
 };

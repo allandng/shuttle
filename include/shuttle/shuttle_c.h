@@ -23,6 +23,12 @@
  * cannot be opened by a binary built before v1.2 — that opener reports
  * SHUTTLE_ERR_BAD_VERSION. Opting in is therefore a decision about which
  * peers can attach; leaving it off keeps the unchanged v1 format.
+ *
+ * v1.3 adds the per-op flag SHUTTLE_DROP_NEWEST and the return SHUTTLE_DROPPED.
+ * Additive again — no signature and no existing semantic changes, so
+ * SHUTTLE_ABI_VERSION stays 1 — but READ THE NOTE ON SHUTTLE_DROPPED BELOW:
+ * it is the first POSITIVE (non-error, non-zero) return in this ABI, and only
+ * a call that opted into the flag can ever receive it.
  */
 #ifndef SHUTTLE_C_H
 #define SHUTTLE_C_H
@@ -38,6 +44,22 @@ extern "C" {
 
 /* Error codes (mirror shuttle::Err; static_asserted in the implementation). */
 #define SHUTTLE_OK 0
+
+/* NOT an error: the ONE positive return in this ABI (v1.3). shuttle_write
+ * returns it when — and only when — the caller passed SHUTTLE_DROP_NEWEST and
+ * the ring could not take the message, so the message was dropped. Nothing was
+ * written and nothing already queued was disturbed.
+ *
+ * IT IS NOT SHUTTLE_OK. Code written as `if (rc != SHUTTLE_OK) fail();` counts
+ * a successful drop as a failure. Since only a call that passed the flag can
+ * receive it, existing code is unaffected — but new code should test errors as
+ * `rc < 0`, which is correct for every entry point here, present and future:
+ *
+ *     int rc = shuttle_write(ch, p, n, SHUTTLE_DROP_NEWEST);
+ *     if (rc < 0) return rc;                 // real failure
+ *     if (rc == SHUTTLE_DROPPED) ++dropped;  // policy fired, not an error
+ */
+#define SHUTTLE_DROPPED 1
 #define SHUTTLE_ERR_INVALID_ARGS (-1)
 #define SHUTTLE_ERR_NAME_TOO_LONG (-2)
 #define SHUTTLE_ERR_EXISTS (-3)
@@ -64,6 +86,35 @@ extern "C" {
  * try-semantics ("would block" instead of parking). Passed to the read/write
  * entry points. */
 #define SHUTTLE_NONBLOCK 0x1
+
+/* Opt-in LOSSY backpressure policy for shuttle_write (v1.3), and the only way
+ * this library ever drops a message. "Backpressure, never drops" stays the
+ * default and the guarantee: this bit changes behavior for exactly the one call
+ * it is passed on, and there is no channel-wide, create-time, or fallback form
+ * of it.
+ *
+ * With it, shuttle_write NEVER parks (it implies try-semantics) and:
+ *   - message fits now      -> written; SHUTTLE_OK.
+ *   - ring cannot take it   -> message DROPPED, nothing written, nothing
+ *                              already queued disturbed; SHUTTLE_DROPPED (1).
+ *                              The drop is counted in the segment's
+ *                              msgs_dropped counter on a SHUTTLE_CREATE_STATS
+ *                              segment; on a v1 segment the drop still happens
+ *                              but there is nowhere to count it.
+ *   - len > max_payload     -> SHUTTLE_ERR_MSG_TOO_LARGE, as always. A payload
+ *                              that could never fit in ANY ring state is a
+ *                              caller bug, not backpressure, and is not
+ *                              silently swallowed as a drop.
+ * Because it never parks, it never returns SHUTTLE_ERR_PEER_DEAD either: a
+ * parked or dead consumer just means the ring stays full and writes drop.
+ *
+ * SHUTTLE_NONBLOCK|SHUTTLE_DROP_NEWEST is redundant but accepted — both ask for
+ * try-semantics, and the drop policy decides what a full ring reports.
+ *
+ * Valid ONLY on shuttle_write. There is nothing to drop on a read or on an
+ * acquire, so shuttle_read / shuttle_acquire_write / shuttle_acquire_read
+ * reject the bit with SHUTTLE_ERR_INVALID_ARGS rather than ignore it. */
+#define SHUTTLE_DROP_NEWEST 0x2
 
 /* Create-flags (v1.1): a SEPARATE namespace from the per-op flags above —
  * these are passed only to shuttle_create_ex's create_flags word, never to
@@ -92,9 +143,10 @@ extern "C" {
 typedef struct shuttle_channel shuttle_channel;
 
 /* Counter snapshot (v1.2). Byte counts are PAYLOAD bytes — the 8-byte frame
- * header is transport overhead and excluded on both sides. msgs_dropped is
- * RESERVED: nothing in this library drops a message today (a full ring blocks
- * or reports SHUTTLE_ERR_WOULD_BLOCK), so it always reads 0. */
+ * header is transport overhead and excluded on both sides. msgs_dropped counts
+ * messages thrown away by SHUTTLE_DROP_NEWEST writes (v1.3) and nothing else,
+ * so it stays 0 unless the producer opts into that policy: a full ring
+ * otherwise blocks or reports SHUTTLE_ERR_WOULD_BLOCK. */
 typedef struct shuttle_stats {
     uint64_t msgs_written;
     uint64_t bytes_written;
@@ -117,8 +169,9 @@ void shuttle_close(shuttle_channel* ch);
 int shuttle_unlink(const char* name);
 
 /* --- copy convenience path (IF-2) --- */
-int shuttle_write(shuttle_channel* ch, const void* data, size_t len,
-                  int flags);
+/* Returns SHUTTLE_OK, a negative error code, or — only when the caller passed
+ * SHUTTLE_DROP_NEWEST — the positive SHUTTLE_DROPPED. */
+int shuttle_write(shuttle_channel* ch, const void* data, size_t len, int flags);
 /* Returns payload length (>= 0) on success. If the waiting message is
  * larger than cap, returns SHUTTLE_ERR_MSG_TOO_LARGE and the message stays
  * queued. */

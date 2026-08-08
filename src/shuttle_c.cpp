@@ -27,6 +27,13 @@ static_assert(SHUTTLE_ERR_WOULD_BLOCK == shuttle::kErrWouldBlock);
 static_assert(SHUTTLE_ERR_PEER_DEAD == shuttle::kErrPeerDead);
 static_assert(SHUTTLE_ERR_NO_HUGEPAGES == shuttle::kErrNoHugePages);
 static_assert(SHUTTLE_ERR_NO_STATS == shuttle::kErrNoStats);
+// The one positive return in the ABI (v1.3), and its per-op flag. Per-op flags
+// are their own namespace, distinct from the create-flags below.
+static_assert(SHUTTLE_DROPPED == shuttle::kDropped);
+static_assert(SHUTTLE_DROPPED > SHUTTLE_OK);  // never mistaken for success
+static_assert(SHUTTLE_NONBLOCK == shuttle::kOpNonBlock);
+static_assert(SHUTTLE_DROP_NEWEST == shuttle::kOpDropNewest);
+static_assert(SHUTTLE_NONBLOCK != SHUTTLE_DROP_NEWEST);
 // Create-flag bits are a separate namespace from the per-op flags, but the C
 // value must still track the C++ header bit exactly.
 static_assert(SHUTTLE_CREATE_HUGEPAGES == shuttle::kFlagHugePages);
@@ -155,6 +162,22 @@ int shuttle_write(shuttle_channel* ch, const void* data, size_t len,
         return SHUTTLE_ERR_INVALID_ARGS;
     try {
         shuttle::Producer* p = producer(ch);
+        // Opt-in lossy policy (SHUTTLE_DROP_NEWEST). It implies try-semantics,
+        // so it takes the SAME try path as SHUTTLE_NONBLOCK and can never park
+        // — including when the consumer is parked or dead. All it changes is
+        // the verdict on a full ring: instead of reporting kErrWouldBlock back
+        // to the caller, the message is discarded here and counted. Note what
+        // is NOT done: no cursor is moved, nothing queued is overwritten, and
+        // the consumer is not touched, so a drop is invisible to the peer.
+        // Every other outcome (kOk, kErrMsgTooLarge for a payload that could
+        // never fit, kErrInvalidArgs for an outstanding reservation) passes
+        // through unchanged — those are caller bugs, not backpressure.
+        if ((flags & SHUTTLE_DROP_NEWEST) != 0) {
+            const int rc = p->try_write(data, len);
+            if (rc != shuttle::kErrWouldBlock) return rc;
+            p->count_drop();
+            return SHUTTLE_DROPPED;
+        }
         return (flags & SHUTTLE_NONBLOCK) != 0 ? p->try_write(data, len)
                                                : p->write(data, len);
     } catch (...) {
@@ -165,6 +188,11 @@ int shuttle_write(shuttle_channel* ch, const void* data, size_t len,
 long shuttle_read(shuttle_channel* ch, void* out, size_t cap, int flags) {
     if (ch == nullptr || (out == nullptr && cap != 0))
         return SHUTTLE_ERR_INVALID_ARGS;
+    // A drop policy is meaningless on a read: there is no message of ours to
+    // throw away, and discarding a QUEUED message would be the producer
+    // overwrite semantics this package explicitly rejects. Refuse rather than
+    // ignore, so a caller who mixed up the flags learns immediately.
+    if ((flags & SHUTTLE_DROP_NEWEST) != 0) return SHUTTLE_ERR_INVALID_ARGS;
     try {
         const int rc = ensure_borrow(ch, flags);
         if (rc != SHUTTLE_OK) return rc;
@@ -183,6 +211,12 @@ long shuttle_read(shuttle_channel* ch, void* out, size_t cap, int flags) {
 int shuttle_acquire_write(shuttle_channel* ch, void** ptr, size_t len,
                           int flags) {
     if (ch == nullptr || ptr == nullptr) return SHUTTLE_ERR_INVALID_ARGS;
+    // Not valid here either. A reservation has no payload yet, so there is
+    // nothing a drop could discard; the caller wanting try-semantics wants
+    // SHUTTLE_NONBLOCK, and the caller wanting the lossy copy path wants
+    // shuttle_write. (Drop-on-acquire would also have to unwind a reservation
+    // the caller may still be about to fill.)
+    if ((flags & SHUTTLE_DROP_NEWEST) != 0) return SHUTTLE_ERR_INVALID_ARGS;
     try {
         shuttle::Producer* p = producer(ch);
         return (flags & SHUTTLE_NONBLOCK) != 0 ? p->try_acquire_write(ptr, len)
@@ -204,6 +238,8 @@ int shuttle_commit_write(shuttle_channel* ch, size_t actual_len) {
 int shuttle_acquire_read(shuttle_channel* ch, const void** ptr, size_t* len,
                          int flags) {
     if (ch == nullptr || ptr == nullptr || len == nullptr)
+        return SHUTTLE_ERR_INVALID_ARGS;
+    if ((flags & SHUTTLE_DROP_NEWEST) != 0)  // consumer side: see shuttle_read
         return SHUTTLE_ERR_INVALID_ARGS;
     try {
         const int rc = ensure_borrow(ch, flags);

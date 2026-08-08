@@ -45,9 +45,10 @@
 //
 // STATISTICS COUNTERS (opt-in, kVersionStats segments only) fit this same
 //   single-writer scheme and add NO ordering obligations. stat_msgs_written /
-//   stat_bytes_written are written only by the producer, stat_msgs_read /
-//   stat_bytes_read only by the consumer, each on its own cache line, each a
-//   relaxed load + relaxed store (never an RMW) — identical to the heartbeat.
+//   stat_bytes_written / stat_msgs_dropped are written only by the producer,
+//   stat_msgs_read / stat_bytes_read only by the consumer, each on its own
+//   cache line, each a relaxed load + relaxed store (never an RMW) — identical
+//   to the heartbeat.
 //   No agent ever reads a counter to make a decision, so no publish edge is
 //   needed and none is created: an observer may see a counter that lags the
 //   cursors, which is the documented cost of keeping the hot path free of
@@ -154,6 +155,23 @@ class Producer {
     // A3: announce liveness without transferring data. Sparse-traffic
     // producers must call this periodically or the peer may declare us dead.
     void keepalive() { bump_heartbeat(); }
+
+    // Count one message the CALLER chose to throw away under an opt-in lossy
+    // policy (the C ABI's SHUTTLE_DROP_NEWEST; nothing in this class ever drops
+    // on its own — "backpressure, never drops" remains the default). This is
+    // BOOKKEEPING ONLY: it moves no cursor, publishes nothing, and never looks
+    // at the consumer, so a drop cannot be observed by the peer at all and the
+    // queued bytes are untouched. The counter is producer-owned and uses the
+    // same single-writer relaxed load+store idiom as bump_write_stats, so it
+    // adds no ordering obligation to the contract above. On a v1 segment the
+    // stats pointer is null and this is a no-op: the drop still happens, it is
+    // simply not counted (those bytes are payload there — see header.hpp).
+    void count_drop() {
+        if (stats_ == nullptr) return;
+        stats_->stat_msgs_dropped.store(
+            stats_->stat_msgs_dropped.load(std::memory_order_relaxed) + 1,
+            std::memory_order_relaxed);
+    }
 
     // Non-blocking framed write (copy path).
     // kOk | kErrWouldBlock | kErrMsgTooLarge (fail fast, never blocks: G2.3).
