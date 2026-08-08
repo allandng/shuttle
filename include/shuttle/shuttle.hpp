@@ -72,6 +72,12 @@ struct Channel {
     void* base;
     size_t map_len;
     ChannelHeader* hdr;
+    // Segment handle retained past mapping. On POSIX this is always kSegInvalid
+    // — the fd is dropped once the mapping keeps the object alive — so close()
+    // is a no-op on it. On Windows it is the live section HANDLE the creator/
+    // opener must hold for the channel's life (a named section vanishes with
+    // its last handle); close() releases it. See seg_keep_after_map().
+    SegHandle seg;
 };
 
 // FR-1: shm_open(O_CREAT|O_EXCL) + one-shot ftruncate + mmap + header init,

@@ -5,14 +5,12 @@
 // from the segment base — never by pointer; each process maps the segment
 // at a different address (App. B #1).
 
-#include <pthread.h>
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 
 #include "shuttle/bipbuffer.hpp"  // kFrameHeader (transport framing)
-#include "shuttle/platform.hpp"
+#include "shuttle/platform.hpp"   // ParkArea (the park/wake block type)
 
 namespace shuttle {
 
@@ -100,10 +98,16 @@ struct alignas(kCacheLine) ChannelHeader {
 
     // --- park/wake primitives, off the hot path (§2.3). END OF LAYOUT v1:
     //     everything below this point exists ONLY in kVersionStats segments.
-    //     ---
-    alignas(kCacheLine) pthread_mutex_t lock;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
+    //     The concrete TYPE lives behind the platform seam (ParkArea in
+    //     platform.hpp): on POSIX it is { pthread_mutex_t lock; pthread_cond_t
+    //     not_empty, not_full; } in that exact order, so `park.lock`,
+    //     `park.not_empty`, `park.not_full` land at the identical byte offsets
+    //     the v1 layout froze (the static_asserts below prove it); on Windows
+    //     it is an inert placeholder (WaitOnAddress waits on the cursors), and
+    //     the segment's data_offset is derived independently — segments never
+    //     cross an OS boundary. header.hpp thus carries no pthread type and no
+    //     platform #ifdef. ---
+    alignas(kCacheLine) ParkArea park;
 
     // --- opt-in statistics (kVersionStats / kFlagStats ONLY) ---------------
     // DANGER: on a v1 segment these bytes are not header at all — they are the
@@ -158,16 +162,29 @@ static_assert(offsetof(ChannelHeader, producer_waiting) == 4 * kCacheLine);
 static_assert(offsetof(ChannelHeader, consumer_waiting) == 5 * kCacheLine);
 static_assert(offsetof(ChannelHeader, producer_heartbeat) == 6 * kCacheLine);
 static_assert(offsetof(ChannelHeader, consumer_heartbeat) == 7 * kCacheLine);
-static_assert(offsetof(ChannelHeader, lock) == 8 * kCacheLine);
+static_assert(offsetof(ChannelHeader, park) == 8 * kCacheLine);
 
-// The v1 header size, derived from the v1 layout itself (the park block was
-// its last member, rounded up to a line) rather than from sizeof, which now
+// The v1 header size, derived from the v1 layout itself (the park block is its
+// last member, rounded up to a line) rather than from sizeof, which now
 // includes the v2 lines. This is the frozen v1 data_offset: the byte count an
-// already-shipped binary computed as sizeof(ChannelHeader).
+// already-shipped binary computed as sizeof(ChannelHeader). The park block is
+// now the ParkArea member; on POSIX its three pthread members are laid out
+// exactly as the three former standalone members were, so this value does not
+// move (proven by the hard-coded tripwire below).
 constexpr uint64_t kParkBlockEnd =
-    offsetof(ChannelHeader, not_full) + sizeof(pthread_cond_t);
+    offsetof(ChannelHeader, park) + sizeof(ParkArea);
 constexpr uint64_t kDataOffsetV1 =
     (kParkBlockEnd + kCacheLine - 1) / kCacheLine * kCacheLine;
+
+// REGRESSION TRIPWIRE (the WP8 safety rail): the POSIX v1 data_offset is a
+// cross-process on-disk ABI value. kExpectedDataOffsetV1 is hard-coded in the
+// seam (1280 on both POSIX ABIs; 0 = "no expectation", i.e. Windows, whose
+// single-OS segments derive their own offset). If a header refactor ever moves
+// the POSIX offset, this fires at COMPILE time — do not "fix" it by editing the
+// number; a moved offset is an ABI break.
+static_assert(kExpectedDataOffsetV1 == 0 ||
+                  kDataOffsetV1 == kExpectedDataOffsetV1,
+              "POSIX v1 data_offset changed — on-disk ABI break");
 
 // The v2 stats block therefore begins exactly where v1's data region began —
 // the independent proof that v1 grew by appending and nothing else.

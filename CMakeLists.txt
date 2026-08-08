@@ -32,9 +32,26 @@ elseif(NOT SHUTTLE_SAN STREQUAL "off")
   message(FATAL_ERROR "SHUTTLE_SAN must be one of: off, asan, tsan (got '${SHUTTLE_SAN}')")
 endif()
 
-add_compile_options(-Wall -Wextra -g)
+# Warning/debug flags are compiler-family specific. MSVC does not understand the
+# GNU -W/-g spellings; give it /W3 and nothing else. The sanitizer INTERFACE
+# (shuttle_san) is likewise GNU/Clang-only — on Windows CI we never pass
+# -DSHUTTLE_SAN, so it stays the empty INTERFACE target the "off" branch builds.
+if(MSVC)
+  add_compile_options(/W3)
+else()
+  add_compile_options(-Wall -Wextra -g)
+endif()
 
 find_package(Threads REQUIRED)
+
+# WaitOnAddress / WakeByAddressAll (the Windows park/wake seam) live in
+# Synchronization.lib. Linked into the two libraries so anything instantiating
+# the header-only park path resolves them; a harmless no-op name off Windows.
+if(WIN32)
+  set(SHUTTLE_WIN_SYNC synchronization)
+else()
+  set(SHUTTLE_WIN_SYNC "")
+endif()
 
 # C ABI shared library (Phase 6): deliberately UNsanitized — it is dlopen'd
 # by foreign runtimes (python3, future Rust test bins) that lack the
@@ -47,7 +64,7 @@ add_library(shuttle::c ALIAS shuttle_c)
 target_include_directories(shuttle_c PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_link_libraries(shuttle_c PRIVATE Threads::Threads)
+target_link_libraries(shuttle_c PRIVATE Threads::Threads ${SHUTTLE_WIN_SYNC})
 # ABI v1 is frozen (SHUTTLE_ABI_VERSION 1), so the soname stays libshuttle_c.so.1
 # across 1.x releases; only the full version tracks PROJECT_VERSION.
 set_target_properties(shuttle_c PROPERTIES
@@ -57,8 +74,10 @@ set_target_properties(shuttle_c PROPERTIES
 
 # The bench and the two -O2 perf tests below stay in this pre-sanitizer region
 # (see the shuttle_c note above): they must NOT be instrumented, so they are
-# guarded by SHUTTLE_BUILD_TESTS *here* rather than moved down.
-if(SHUTTLE_BUILD_TESTS)
+# guarded by SHUTTLE_BUILD_TESTS *here* rather than moved down. They are also
+# process-based (posix_spawn) and latency/CPU measurements, so they are
+# POSIX-only — the experimental Windows CI job builds neither (NOT WIN32).
+if(SHUTTLE_BUILD_TESTS AND NOT WIN32)
   # Benchmark binary (Phase 7): also UNsanitized — instrumentation overhead
   # would invalidate the transport-ratio comparison (NFR-P1). Compiled -O2
   # regardless of the default Debug build type, for the same reason.
@@ -92,12 +111,20 @@ target_include_directories(shuttle_core PUBLIC
 # The core uses pthreads (robust mutexes, futex-backed parking) directly, so the
 # exported static target carries its own Threads dependency: linking shuttle::core
 # alone must be enough to get -pthread.
-target_link_libraries(shuttle_core PUBLIC Threads::Threads)
+target_link_libraries(shuttle_core PUBLIC Threads::Threads ${SHUTTLE_WIN_SYNC})
 set_target_properties(shuttle_core PROPERTIES EXPORT_NAME core)
 
 # Everything from here to the matching endif() is test/tool-only. The body is
 # left unindented so this guard stays a pure wrapper in the diff.
-if(SHUTTLE_BUILD_TESTS)
+#
+# NOT WIN32: the full gate suite is POSIX-only. Almost every test here either
+# spawns processes (posix_spawn — the crash-recovery and FFI gates), drives the
+# robust-mutex / EOWNERDEAD path that does not exist on Windows, or links a
+# fork-based harness. None of that ports, and none of it is in scope for the
+# experimental Windows backend (compile + process-free smoke only — see the
+# WIN32 block after this one, and docs/ROADMAP.md). The POSIX path is unchanged:
+# on any non-Windows host this guard is always true.
+if(SHUTTLE_BUILD_TESTS AND NOT WIN32)
 
 add_executable(shuttle_tests tests/test_main.cpp)
 target_link_libraries(shuttle_tests PRIVATE shuttle_core)
@@ -246,6 +273,43 @@ set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      PROPERTIES TIMEOUT 300)
 
 endif()  # SHUTTLE_BUILD_TESTS
+
+# --- Windows-buildable test subset (experimental WP8 backend) ----------------
+# The windows-latest CI job (see .github/workflows/ci.yml) exercises ONLY what a
+# Windows host can honestly run: the pure-logic BipBuffer property/edge tests
+# (no OS, no threads) and a new single-process threads-in-one-process smoke that
+# drives the real Win32 seam (named CreateFileMappingW section + WaitOnAddress
+# park/wake) end to end, plus a CreateProcess two-process echo. This is a
+# COMPILE + smoke gate, not parity: no crash-recovery, no robust-mutex, no
+# posix_spawn multi-process suite (all POSIX-only, above). The bipbuffer targets
+# link shuttle_core, which forces src/shuttle.cpp and the whole platform seam to
+# compile under MSVC — the point of the job. Nothing here builds off Windows.
+if(SHUTTLE_BUILD_TESTS AND WIN32)
+  enable_testing()
+
+  add_executable(shuttle_bipbuffer_test tests/bipbuffer_test.cpp)
+  target_link_libraries(shuttle_bipbuffer_test PRIVATE shuttle_core)
+  add_test(NAME shuttle_bipbuffer_test COMMAND shuttle_bipbuffer_test)
+
+  add_executable(shuttle_bipbuffer_edge_test tests/bipbuffer_edge_test.cpp)
+  target_link_libraries(shuttle_bipbuffer_edge_test PRIVATE shuttle_core)
+  add_test(NAME shuttle_bipbuffer_edge_test COMMAND shuttle_bipbuffer_edge_test)
+
+  add_executable(shuttle_bipbuffer_oversize_test tests/bipbuffer_oversize_test.cpp)
+  target_link_libraries(shuttle_bipbuffer_oversize_test PRIVATE shuttle_core)
+  add_test(NAME shuttle_bipbuffer_oversize_test
+           COMMAND shuttle_bipbuffer_oversize_test)
+
+  # The real seam smoke: named section + WaitOnAddress, threads then processes.
+  add_executable(shuttle_windows_smoke tests/windows_smoke.cpp)
+  target_link_libraries(shuttle_windows_smoke
+                        PRIVATE shuttle_core Threads::Threads ${SHUTTLE_WIN_SYNC})
+  add_test(NAME shuttle_windows_smoke COMMAND shuttle_windows_smoke)
+
+  set_tests_properties(shuttle_bipbuffer_test shuttle_bipbuffer_edge_test
+                       shuttle_bipbuffer_oversize_test shuttle_windows_smoke
+                       PROPERTIES TIMEOUT 120)
+endif()  # SHUTTLE_BUILD_TESTS AND WIN32
 
 # --- install / packaging -----------------------------------------------------
 # Consumed three ways: find_package(shuttle CONFIG) for CMake projects,

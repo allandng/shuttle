@@ -241,3 +241,40 @@ jobs:
             -Iinclude -Istub \
             -c src/shuttle_cuda.cpp -o /tmp/shuttle_cuda_glue.o
           echo "glue compiled well-formed against the stub (no GPU behavior proven)"
+
+  # Experimental Windows backend (WP8). This job proves the Win32 platform seam
+  # COMPILES under MSVC and that its named-section + WaitOnAddress park/wake path
+  # actually moves bytes — in one process across threads, and across two
+  # processes. It does NOT prove parity, and is not meant to:
+  #
+  #   PROVEN here:
+  #     - shuttle_c, shuttle_core and the whole platform seam build with MSVC
+  #       (the bipbuffer tests and the smoke link shuttle_core, forcing
+  #       src/shuttle.cpp + include/shuttle/platform.hpp through the compiler).
+  #     - the pure-logic BipBuffer property/edge/oversize tests pass (portable).
+  #     - windows_smoke: a CreateFileMappingW named section carries byte-exact
+  #       messages producer->consumer over the copy AND zero-copy borrow paths
+  #       (threads), and across a CreateProcess parent/child pair — exercising
+  #       WaitOnAddress/WakeByAddressAll cross-process wakeups.
+  #     - the host CUDA descriptor codec (pure host code) also builds and runs.
+  #
+  #   NOT PROVEN here (POSIX-only, by design — see docs/ROADMAP.md):
+  #     - crash recovery / robust-mutex (EOWNERDEAD) semantics: Windows has no
+  #       robust mutex; heartbeat liveness is the crash story (as on macOS), and
+  #       the SIGKILL / posix_spawn multi-process gate suite is not ported.
+  #     - the cross-language FFI (Python/Rust) gate tests.
+  #     - performance: no latency/CPU gates run here.
+  #
+  # No sanitizer leg: -DSHUTTLE_SAN is never passed, so shuttle_san stays the
+  # empty INTERFACE target and MSVC gets no GNU sanitizer flags. The Visual
+  # Studio generator is multi-config, hence the explicit --config / -C Release.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (MSVC)
+        run: cmake -B build/ci-win
+      - name: Build (Release)
+        run: cmake --build build/ci-win --config Release -j
+      - name: Test
+        run: ctest --test-dir build/ci-win -C Release --output-on-failure

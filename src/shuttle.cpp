@@ -1,10 +1,8 @@
 #include "shuttle/shuttle.hpp"
 
-#include <unistd.h>
-
 #include <cerrno>
 
-#include "shuttle/platform.hpp"
+#include "shuttle/platform.hpp"  // seam: seg_*, sleep_us, monotonic_ns, ...
 
 namespace shuttle {
 
@@ -97,8 +95,8 @@ Channel* create(const char* name, size_t capacity_bytes,
         return nullptr;
     }
     void* base = seg_map(seg, map_len);
-    seg_close(seg);
     if (base == nullptr) {
+        seg_close(seg);
         (void)seg_unlink(name);
         // hugetlbfs reserves its pages at MMAP time, not at create/ftruncate
         // time: this is where a box with no free huge pages actually fails
@@ -106,6 +104,9 @@ Channel* create(const char* name, size_t capacity_bytes,
         set_err(err, explicit_huge ? kErrNoHugePages : kErrSys);
         return nullptr;
     }
+    // POSIX drops the handle now (kSegInvalid); Windows RETAINS it in the
+    // Channel — a named section vanishes with its last handle (seam decides).
+    const SegHandle seg_keep = seg_keep_after_map(seg);
 
     // Opt-in THP: advise the fresh mapping before it is touched. Advisory and
     // masked to known bits — an unknown flag must never be persisted (openers
@@ -131,10 +132,12 @@ Channel* create(const char* name, size_t capacity_bytes,
     h->data_offset = data_offset;
     h->data_capacity = capacity_bytes;
     h->max_payload = max_payload_bytes;
-    if (mutex_init_pshared(&h->lock) != 0 ||
-        cond_init_pshared_monotonic(&h->not_empty) != 0 ||
-        cond_init_pshared_monotonic(&h->not_full) != 0) {
+    if (mutex_init_pshared(&h->park.lock) != 0 ||
+        cond_init_pshared_monotonic(&h->park.not_empty) != 0 ||
+        cond_init_pshared_monotonic(&h->park.not_full) != 0) {
         seg_unmap(base, map_len);
+        seg_close(
+            seg_keep);  // release the retained handle (Windows); no-op POSIX
         (void)seg_unlink(name);
         set_err(err, kErrSys);
         return nullptr;
@@ -143,7 +146,7 @@ Channel* create(const char* name, size_t capacity_bytes,
     h->init_state.store(kInitReady, std::memory_order_release);
 
     set_err(err, kOk);
-    return new Channel{base, map_len, h};
+    return new Channel{base, map_len, h, seg_keep};
 }
 
 // The pure post-map validation, lifted verbatim out of open() (see the
@@ -226,11 +229,13 @@ Channel* open(const char* name, int* err) {
     }
     const size_t map_len = static_cast<size_t>(seg_len);
     void* base = seg_map(seg, map_len);
-    seg_close(seg);
     if (base == nullptr) {
+        seg_close(seg);
         set_err(err, kErrSys);
         return nullptr;
     }
+    // POSIX drops the handle now (kSegInvalid); Windows RETAINS it (seam).
+    const SegHandle seg_keep = seg_keep_after_map(seg);
 
     auto* h = static_cast<ChannelHeader*>(base);
     // Wait for the creator's release-publish; deadlined so a creator that
@@ -239,10 +244,12 @@ Channel* open(const char* name, int* err) {
     while (h->init_state.load(std::memory_order_acquire) != kInitReady) {
         if (monotonic_ns() > deadline) {
             seg_unmap(base, map_len);
+            seg_close(
+                seg_keep);  // release retained handle (Windows); no-op POSIX
             set_err(err, kErrInitTimeout);
             return nullptr;
         }
-        usleep(1000);
+        sleep_us(1000);
     }
 
     // FR-3 / NFR-S2: magic, version, geometry. Pure and self-contained, so it
@@ -251,6 +258,7 @@ Channel* open(const char* name, int* err) {
     const int verdict = validate_header(base, map_len);
     if (verdict != kOk) {
         seg_unmap(base, map_len);
+        seg_close(seg_keep);  // release retained handle (Windows); no-op POSIX
         set_err(err, verdict);
         return nullptr;
     }
@@ -270,12 +278,17 @@ Channel* open(const char* name, int* err) {
         advise_huge_pages(base, map_len);
 
     set_err(err, kOk);
-    return new Channel{base, map_len, h};
+    return new Channel{base, map_len, h, seg_keep};
 }
 
 void close(Channel* ch) {
     if (ch == nullptr) return;
     seg_unmap(ch->base, ch->map_len);
+    // Release the retained section handle. POSIX: ch->seg is kSegInvalid and
+    // this is a no-op (the fd was dropped at create/open). Windows: this is the
+    // last handle, so the named section is reclaimed here — the Windows analog
+    // of unlink, which cannot remove a name while a handle is open.
+    seg_close(ch->seg);
     delete ch;
 }
 

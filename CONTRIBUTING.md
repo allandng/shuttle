@@ -89,6 +89,18 @@ one-shot `ftruncate`, wait-on-address vs condvar, THP advice — gets an interfa
 in the seam with two implementations behind it. If you find yourself reaching
 for `__APPLE__` anywhere else, the seam is missing a function; add it there.
 
+This holds for the experimental Windows backend too: it is a third branch
+(`_WIN32` → `SHUTTLE_PLATFORM_WINDOWS`) *inside* `platform.hpp` and nowhere
+else. `src/`, `spsc.hpp`, and `header.hpp` must stay free of `_WIN32` — even the
+header's park block is a seam-provided type (`ParkArea`), not a pthread type, so
+the header carries no platform `#ifdef` and its POSIX offsets never move (a
+hard-coded compile-time assert guards that). Windows is compile- + smoke-tested
+in a `windows-latest` CI job and is explicitly **not at parity** (no
+robust-mutex crash recovery; the `posix_spawn` gate suite is POSIX-only); see
+the Scope section of the README and `docs/ROADMAP.md`. Keep it honest: do not
+label a Windows path "supported", and do not weaken a POSIX guarantee to make
+the Windows one look closer than it is.
+
 ## Testing philosophy
 
 The build was driven gate by gate under one rule: **one new variable per

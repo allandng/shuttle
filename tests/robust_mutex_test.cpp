@@ -38,7 +38,7 @@ int run_holder(const char* name) {
         std::fprintf(stderr, "holder: open err=%d\n", err);
         return 1;
     }
-    if (shuttle::park_mutex_lock(&ch->hdr->lock) != 0) {
+    if (shuttle::park_mutex_lock(&ch->hdr->park.lock) != 0) {
         std::fprintf(stderr, "holder: lock failed\n");
         return 1;
     }
@@ -94,26 +94,26 @@ int scenario_good(const char* self) {
     // Survivor path: the seam must absorb EOWNERDEAD and hand us a usable,
     // consistent mutex. A hang here = permanent deadlock = gate failure
     // (bounded by the ctest timeout).
-    if (shuttle::park_mutex_lock(&ch->hdr->lock) != 0) {
+    if (shuttle::park_mutex_lock(&ch->hdr->park.lock) != 0) {
         std::fprintf(stderr, "good: recovery lock failed\n");
         ++fails;
     } else {
-        shuttle::park_mutex_unlock(&ch->hdr->lock);
+        shuttle::park_mutex_unlock(&ch->hdr->park.lock);
     }
     // Mutex must be fully serviceable afterward: plain cycle + a condvar
     // timedwait (expects ETIMEDOUT — nobody signals).
-    if (shuttle::park_mutex_lock(&ch->hdr->lock) != 0) {
+    if (shuttle::park_mutex_lock(&ch->hdr->park.lock) != 0) {
         std::fprintf(stderr, "good: post-recovery lock failed\n");
         ++fails;
     } else {
         const int wrc = shuttle::cond_timedwait_rel(
-            &ch->hdr->not_empty, &ch->hdr->lock, 50ull * 1000000);
+            &ch->hdr->park.not_empty, &ch->hdr->park.lock, 50ull * 1000000);
         if (wrc != ETIMEDOUT) {
             std::fprintf(stderr, "good: timedwait rc=%d, want ETIMEDOUT\n",
                          wrc);
             ++fails;
         }
-        shuttle::park_mutex_unlock(&ch->hdr->lock);
+        shuttle::park_mutex_unlock(&ch->hdr->park.lock);
     }
     shuttle::close(ch);
     shuttle::unlink(name);
@@ -132,15 +132,15 @@ int scenario_bad(const char* self) {
 
     // Deliberately buggy recovery: raw lock -> observe EOWNERDEAD -> unlock
     // WITHOUT pthread_mutex_consistent.
-    int rc = pthread_mutex_lock(&ch->hdr->lock);
+    int rc = pthread_mutex_lock(&ch->hdr->park.lock);
     if (rc != EOWNERDEAD) {
         std::fprintf(stderr, "bad: lock rc=%d, want EOWNERDEAD\n", rc);
         ++fails;
     }
-    pthread_mutex_unlock(&ch->hdr->lock);  // the bug: no consistent()
+    pthread_mutex_unlock(&ch->hdr->park.lock);  // the bug: no consistent()
 
     // The mutex must now be permanently dead — and detectably so.
-    rc = pthread_mutex_lock(&ch->hdr->lock);
+    rc = pthread_mutex_lock(&ch->hdr->park.lock);
     if (rc != ENOTRECOVERABLE) {
         std::fprintf(stderr,
                      "bad: post-bug lock rc=%d, want ENOTRECOVERABLE — the"

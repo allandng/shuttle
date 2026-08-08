@@ -284,7 +284,7 @@ class Producer {
         // Sleep until the consumer publishes ANY progress on read (the
         // lost-wakeup guard lives inside the seam: cursor recheck under the
         // robust lock on Linux; value-atomic kernel wait on macOS).
-        park_wait_cursor(&h_->read, r_seen, &h_->lock, &h_->not_full,
+        park_wait_cursor(&h_->read, r_seen, &h_->park.lock, &h_->park.not_full,
                          detail::kParkTimeoutNs);
         h_->producer_waiting.store(0, std::memory_order_relaxed);
         return kOk;  // staleness is re-evaluated on the next iteration
@@ -303,7 +303,7 @@ class Producer {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (h_->consumer_waiting.load(std::memory_order_relaxed) != 0) {
             ++lock_count_;
-            park_wake_cursor(&h_->write, &h_->lock, &h_->not_empty);
+            park_wake_cursor(&h_->write, &h_->park.lock, &h_->park.not_empty);
         }
     }
 
@@ -481,8 +481,8 @@ class Consumer {
         }
         ++lock_count_;
         // Sleep until the producer publishes ANY progress on write.
-        park_wait_cursor(&h_->write, w_seen, &h_->lock, &h_->not_empty,
-                         detail::kParkTimeoutNs);
+        park_wait_cursor(&h_->write, w_seen, &h_->park.lock,
+                         &h_->park.not_empty, detail::kParkTimeoutNs);
         h_->consumer_waiting.store(0, std::memory_order_relaxed);
         return kOk;  // staleness is re-evaluated on the next iteration
     }
@@ -514,7 +514,7 @@ class Consumer {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (h_->producer_waiting.load(std::memory_order_relaxed) != 0) {
             ++lock_count_;
-            park_wake_cursor(&h_->read, &h_->lock, &h_->not_full);
+            park_wake_cursor(&h_->read, &h_->park.lock, &h_->park.not_full);
         }
     }
 

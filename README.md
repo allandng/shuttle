@@ -130,7 +130,9 @@ Highlights of what the suite (29 tests, ASan + TSan clean on both legs) actually
 
 ## Scope (v1.0)
 
-Same-host, single-producer/single-consumer, one-way channels. Cross-machine transport, Windows, MPMC/pub-sub, and payload schemas are explicitly out of scope. macOS crash recovery is best-effort by design (no robust mutexes exist there); Linux is the hard-guarantee platform. Proposed directions past v1 — and why each stays out of it — are triaged in [docs/ROADMAP.md](docs/ROADMAP.md).
+Same-host, single-producer/single-consumer, one-way channels. Cross-machine transport, MPMC/pub-sub, and payload schemas are explicitly out of scope. macOS crash recovery is best-effort by design (no robust mutexes exist there); Linux is the hard-guarantee platform.
+
+**Windows is an experimental third backend, not a supported platform.** A `CreateFileMappingW` named-section + `WaitOnAddress` implementation lives behind the same platform seam as Linux/macOS and is **compile- and smoke-tested in CI** (a `windows-latest`/MSVC job that builds the seam, runs the pure-logic BipBuffer tests, and runs a threads-plus-two-process named-section round-trip). It is **not at parity**: there is no robust-mutex crash recovery (heartbeat liveness is the crash story, as on macOS), the multi-process SIGKILL gate suite and the Python/Rust FFI gates are POSIX-only, and no performance is claimed. Treat it as a reviewable starting point, not a production target. Proposed directions past v1 — and why each stays where it is — are triaged in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Repository layout
 

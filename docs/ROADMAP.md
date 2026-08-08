@@ -53,6 +53,41 @@ Shipped and tested; listed here because they are frequently proposed as
   implemented: it collapses normal pages into THP, which is redundant once the
   mapping is on explicitly reserved huge pages.
 
+- **Experimental Windows backend (compile + smoke, NOT parity).** A third
+  platform branch in `include/shuttle/platform.hpp` implements the seam with
+  Win32: `CreateFileMappingW(INVALID_HANDLE_VALUE, …)` named pagefile sections
+  for the segment, `MapViewOfFile`/`UnmapViewOfFile` for mapping, and
+  `WaitOnAddress`/`WakeByAddressAll` for park/wake (replacing the futex/condvar
+  and `os_sync_wait_on_address` paths). Every Win32 `#ifdef` stays inside the
+  seam — the repo's one platform rule holds. The header carries no pthread type
+  either: the park block is now a seam-defined `ParkArea` (three pthread members
+  in the frozen order on POSIX, an inert placeholder on Windows), so the POSIX
+  v1/v2 offsets and `data_offset` are byte-for-byte unchanged (a hard-coded
+  compile-time tripwire in `header.hpp` guards it).
+
+  A `windows-latest` MSVC CI job builds `shuttle_c` + `shuttle_core` + the
+  pure-logic BipBuffer tests and runs `tests/windows_smoke.cpp` — a
+  threads-in-one-process round-trip (copy and zero-copy borrow paths) plus a
+  `CreateProcess` two-process echo across a named section. **Honest caveats,
+  because this is where Windows is NOT at parity:**
+
+  - **No robust-mutex crash recovery.** Windows has no `PTHREAD_MUTEX_ROBUST`
+    equivalent surfaced here. As on macOS, `WaitOnAddress` holds nothing a dying
+    process could orphan, and **heartbeat liveness is the crash story** — but the
+    SIGKILL / `posix_spawn` multi-process gate suite (crash_mutex, robust_mutex,
+    crash_heartbeat, crash_leak) is **POSIX-only** and does not run on Windows.
+  - **No `unlink`.** A Windows named section is refcounted and vanishes with its
+    **last handle** — there is no `shm_unlink`. The creator therefore RETAINS the
+    section handle in the `Channel` for the channel's life, and `close()` is what
+    reclaims the name. `seg_unlink` reports existence only.
+  - **Data offset differs.** Segments never cross an OS, so the Windows `ParkArea`
+    footprint (and thus `data_offset`) is derived independently and is smaller
+    than the POSIX 1280/1536; it is single-OS and needs no cross-platform match.
+  - **No FFI, no performance claim.** The Python/Rust FFI gates and all
+    latency/CPU gates are POSIX-only.
+
+  This is a reviewable starting point behind the seam, not a supported surface.
+
 - **Configurable backpressure: the drop-newest policy.** `shuttle_write` accepts
   the per-op flag `SHUTTLE_DROP_NEWEST` (`0x2`): on a full ring the message is
   discarded instead of blocking, and the call returns the new positive
@@ -132,6 +167,11 @@ committed.
   keeps the precise proven-vs-unproven ledger. It stays in v2 exactly because
   the hard part (the borrow-vs-kernel lifetime race, real multi-GPU behavior)
   cannot be settled without hardware.
-- **Windows named shared memory.** A `CreateFileMapping`-based platform seam
-  alongside the current POSIX one. v1 is Linux + macOS only; Windows is a whole
-  new backend, not a port.
+- **Windows to parity.** The experimental `CreateFileMappingW` + `WaitOnAddress`
+  backend now exists behind the seam and is compile- + smoke-tested in CI (see
+  "Landing in this change"). Getting it to *parity* is the open v2 work, and the
+  hard part is exactly what the smoke job cannot touch: a crash-recovery story as
+  strong as Linux's robust mutex (Windows has no equivalent, so this likely means
+  leaning harder on heartbeat liveness and proving it under a Windows-native
+  process-kill harness), and porting the multi-process gate suite off
+  `posix_spawn`. Until then Windows stays experimental, not supported.

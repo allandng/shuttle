@@ -6,21 +6,47 @@
 // with two implementations.
 
 #if defined(__linux__)
-  #define SHUTTLE_PLATFORM_LINUX 1
-  #define SHUTTLE_PLATFORM_NAME "linux"
+#define SHUTTLE_PLATFORM_LINUX 1
+#define SHUTTLE_PLATFORM_NAME "linux"
 #elif defined(__APPLE__)
-  #define SHUTTLE_PLATFORM_MACOS 1
-  #define SHUTTLE_PLATFORM_NAME "macos"
+#define SHUTTLE_PLATFORM_MACOS 1
+#define SHUTTLE_PLATFORM_NAME "macos"
+#elif defined(_WIN32)
+// EXPERIMENTAL third backend (WP8): named file mappings + WaitOnAddress.
+// Compile- and smoke-tested in a windows-latest CI job ONLY; NOT at parity
+// with the POSIX platforms — there is no robust-mutex crash recovery and no
+// multi-process gate suite. Heartbeat liveness is the crash story, exactly
+// as on macOS (WaitOnAddress, like os_sync_wait_on_address, holds nothing a
+// dying process could orphan). Every Win32 divergence lives in THIS file.
+#define SHUTTLE_PLATFORM_WINDOWS 1
+#define SHUTTLE_PLATFORM_NAME "windows"
 #else
-  #error "Shuttle supports Linux and macOS only (v1.0)"
+#error "Shuttle supports Linux, macOS, and Windows only"
 #endif
 
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+// WaitOnAddress / WakeByAddressAll are declared only when the target is Win8+.
+// Pin it so a bare cmake+cl build with an unset default cannot drop them.
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00  // Windows 10
+#endif
+#include <intrin.h>  // _mm_pause
+
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cerrno>
@@ -37,6 +63,48 @@
 namespace shuttle {
 
 const char* platform_name() noexcept;
+
+// ---------------------------------------------------------------------
+// Park-area type: the header's park/wake block, hidden behind the seam so
+// header.hpp carries NO platform type and no #ifdef of its own. On POSIX it is
+// the three pthread primitives in the EXACT order the frozen v1 layout froze
+// them, so every v1 offset is byte-for-byte unchanged; on Windows it is an
+// inert placeholder, because WaitOnAddress waits directly on the header's
+// cursor words and needs neither a lock nor a condition variable. The three
+// member NAMES (lock / not_empty / not_full) are kept on both platforms so the
+// shared spsc.hpp / shuttle.cpp code compiles unchanged everywhere — on Windows
+// the seam simply never dereferences them.
+// ---------------------------------------------------------------------
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+struct ParkMutex {
+    std::atomic<uint32_t> reserved{0};
+};
+struct ParkCond {
+    std::atomic<uint32_t> reserved{0};
+};
+#else
+using ParkMutex = pthread_mutex_t;
+using ParkCond = pthread_cond_t;
+#endif
+
+struct ParkArea {
+    ParkMutex lock;
+    ParkCond not_empty;
+    ParkCond not_full;
+};
+
+// Frozen POSIX v1 data_offset, hard-coded so a header refactor that moves it
+// trips a COMPILE-TIME assert in header.hpp (see the tripwire there). It is
+// identical (1280) on both POSIX ABIs: glibc/libstdc++ (mutex 40 + 2*cond 48
+// = 136, park block ends at 1160) and libc++/macOS (64 + 2*48 = 160, ends at
+// 1184) both round UP to the same cache-line multiple, 1280. 0 means "no
+// frozen expectation on this platform" — a Windows segment is single-OS and
+// carries its own, independently derived (and smaller) data_offset.
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+inline constexpr uint64_t kExpectedDataOffsetV1 = 0;
+#else
+inline constexpr uint64_t kExpectedDataOffsetV1 = 1280;
+#endif
 
 // macOS caps shm names at PSHMNAMLEN (31) chars including the leading '/';
 // we enforce 30 to stay clear of the off-by-one ambiguity in the docs.
@@ -89,11 +157,17 @@ enum class SegBacking : uint32_t {
     kHugeTLB1G = 2,  // file on a 1 GB-pagesize hugetlbfs mount (Linux only)
 };
 
-// Handle to a live segment. POSIX: a file descriptor. A Windows backend maps
-// this onto its file-mapping HANDLE, which is why callers never touch it with
-// anything but the seg_* calls.
+// Handle to a live segment. POSIX: a file descriptor. Windows: the Win32
+// file-mapping HANDLE — which is why callers never touch it with anything but
+// the seg_* calls. CreateFileMappingW / OpenFileMappingW return NULL (not
+// INVALID_HANDLE_VALUE) on failure, so the invalid sentinel is nullptr there.
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+using SegHandle = HANDLE;
+inline constexpr SegHandle kSegInvalid = nullptr;
+#else
 using SegHandle = int;
 inline constexpr SegHandle kSegInvalid = -1;
+#endif
 
 // Buffer sizes for the hugetlbfs path discovery below. A hugetlbfs mount point
 // is a plain path; eight distinct mounts is already far past anything real
@@ -101,7 +175,54 @@ inline constexpr SegHandle kSegInvalid = -1;
 inline constexpr size_t kSegPathMax = 512;
 inline constexpr size_t kMaxHugeMounts = 8;
 
-inline void seg_close(SegHandle h) noexcept { (void)::close(h); }
+inline void seg_close(SegHandle h) noexcept {
+    if (h == kSegInvalid) return;  // tolerate the "already dropped" sentinel
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    (void)::CloseHandle(h);
+#else
+    (void)::close(h);
+#endif
+}
+
+// After a successful map, the segment handle's fate diverges. POSIX drops it —
+// the mapping alone keeps the object alive — and returns kSegInvalid for the
+// Channel to store (a no-op to close later). Windows RETAINS it: a named
+// pagefile section is refcounted and vanishes with its LAST handle, so the
+// creator must hold the handle open for the channel's whole life or peers can
+// no longer OpenFileMappingW it by name. The returned handle is stored in the
+// Channel and released at close(). This is the one real lifetime divergence.
+inline SegHandle seg_keep_after_map(SegHandle h) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    return h;  // retain
+#else
+    seg_close(h);
+    return kSegInvalid;
+#endif
+}
+
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+namespace detail {
+// Build the Win32 object name "Local\\shuttle_<name>" (wide) for a channel
+// name. The channel name is ASCII and includes its leading '/', which is legal
+// in a Win32 object name — only '\\' is special there, as the namespace
+// separator. The Local\ prefix scopes the section to the current session.
+inline bool win_seg_name(const char* name, wchar_t* out,
+                         size_t out_len) noexcept {
+    static const wchar_t kPrefix[] = L"Local\\shuttle_";
+    size_t i = 0;
+    for (; kPrefix[i] != L'\0'; ++i) {
+        if (i + 1 >= out_len) return false;
+        out[i] = kPrefix[i];
+    }
+    for (size_t j = 0; name[j] != '\0'; ++j, ++i) {
+        if (i + 1 >= out_len) return false;
+        out[i] = static_cast<wchar_t>(static_cast<unsigned char>(name[j]));
+    }
+    out[i] = L'\0';
+    return true;
+}
+}  // namespace detail
+#endif
 
 // Bytes per page for a hugetlb backing; 0 for kShm (no fixed granularity).
 inline size_t seg_huge_page_size(SegBacking backing) noexcept {
@@ -238,6 +359,21 @@ inline size_t seg_map_len(size_t len, SegBacking backing) noexcept {
 // the errno; ENOENT means there was no such segment. Probes both namespaces
 // (see the note above): shm first, then hugetlbfs mounts.
 inline int seg_unlink(const char* name) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    // Windows named sections are refcounted and destroyed with their LAST
+    // handle; there is no shm_unlink equivalent, so this cannot actively remove
+    // the name. It reports existence only, mapped into the seam's errno space:
+    // 0 if a section by this name is currently open (it will vanish when the
+    // creator's retained handle closes at Channel close()), ENOENT if none
+    // exists. DOCUMENTED PARITY GAP: unlike POSIX, closing a channel — not
+    // unlink — is what reclaims the name on Windows.
+    wchar_t wname[kSegPathMax];
+    if (!detail::win_seg_name(name, wname, kSegPathMax)) return ENOENT;
+    HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, wname);
+    if (h == nullptr) return ENOENT;
+    CloseHandle(h);
+    return 0;
+#else
     if (shm_unlink(name) == 0) return 0;
     const int shm_err = errno;
 #if defined(SHUTTLE_PLATFORM_LINUX)
@@ -253,6 +389,7 @@ inline int seg_unlink(const char* name) noexcept {
     }
 #endif
     return shm_err;
+#endif  // SHUTTLE_PLATFORM_WINDOWS
 }
 
 // Create `name` exclusively, owner-only (NFR-S1), and fix its size at `len`.
@@ -308,6 +445,35 @@ inline SegHandle seg_create(const char* name, size_t len, SegBacking backing,
         return kSegInvalid;
 #endif
     }
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    // A pagefile-backed named section (INVALID_HANDLE_VALUE source), sized here
+    // once and zero-initialized by the OS — matching the shm_open + ftruncate
+    // contract, cursors/init_state included. O_EXCL semantics come from
+    // GetLastError()==ERROR_ALREADY_EXISTS: CreateFileMappingW hands back a
+    // (second) handle to the existing section, which we must drop and report as
+    // a collision.
+    wchar_t wname[kSegPathMax];
+    if (!detail::win_seg_name(name, wname, kSegPathMax)) {
+        err_out = EINVAL;
+        return kSegInvalid;
+    }
+    const uint64_t sz = static_cast<uint64_t>(len);
+    const DWORD hi = static_cast<DWORD>((sz >> 32) & 0xFFFFFFFFull);
+    const DWORD lo = static_cast<DWORD>(sz & 0xFFFFFFFFull);
+    HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                  hi, lo, wname);
+    if (h == nullptr) {
+        err_out = (GetLastError() == ERROR_ACCESS_DENIED) ? EACCES : EINVAL;
+        return kSegInvalid;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(h);
+        err_out = EEXIST;
+        return kSegInvalid;
+    }
+    err_out = 0;
+    return h;
+#else
     const int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0) {
         err_out = errno;
@@ -321,6 +487,7 @@ inline SegHandle seg_create(const char* name, size_t len, SegBacking backing,
     }
     err_out = 0;
     return fd;
+#endif
 }
 
 // Attach to an existing segment read/write. Returns kSegInvalid on failure
@@ -333,6 +500,23 @@ inline SegHandle seg_create(const char* name, size_t len, SegBacking backing,
 // hugetlbfs the filesystem dictates the page size, so a plain MAP_SHARED mmap
 // of this fd is already huge-page backed.
 inline SegHandle seg_open(const char* name, int& err_out) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    wchar_t wname[kSegPathMax];
+    if (!detail::win_seg_name(name, wname, kSegPathMax)) {
+        err_out = EINVAL;
+        return kSegInvalid;
+    }
+    HANDLE h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wname);
+    if (h == nullptr) {
+        const DWORD e = GetLastError();
+        err_out = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND)
+                      ? ENOENT
+                      : EACCES;
+        return kSegInvalid;
+    }
+    err_out = 0;
+    return h;
+#else
     const int fd = shm_open(name, O_RDWR, 0);
     if (fd >= 0) {
         err_out = 0;
@@ -357,6 +541,7 @@ inline SegHandle seg_open(const char* name, int& err_out) noexcept {
 #endif
     err_out = shm_err;
     return kSegInvalid;
+#endif  // SHUTTLE_PLATFORM_WINDOWS
 }
 
 // Byte size of the object behind `h`, or -1 if it cannot be determined — the
@@ -365,21 +550,45 @@ inline SegHandle seg_open(const char* name, int& err_out) noexcept {
 // to its huge page size, so this can exceed the geometry the header claims;
 // callers validate with >=, never ==.
 inline int64_t seg_size(SegHandle h) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    // A section object has no fstat: map the whole view (len 0 = entire
+    // section), read the region size, unmap. The section is rounded up to a
+    // page, so this can exceed the header geometry — callers validate with >=.
+    void* v = MapViewOfFile(h, FILE_MAP_READ, 0, 0, 0);
+    if (v == nullptr) return -1;
+    MEMORY_BASIC_INFORMATION mbi;
+    const SIZE_T q = VirtualQuery(v, &mbi, sizeof mbi);
+    (void)UnmapViewOfFile(v);
+    if (q == 0) return -1;
+    return static_cast<int64_t>(mbi.RegionSize);
+#else
     struct stat st;
     if (fstat(h, &st) != 0) return -1;
     return static_cast<int64_t>(st.st_size);
+#endif
 }
 
 // Map `len` bytes of `h` shared read/write at an address of the kernel's
 // choosing. Returns nullptr on failure — MAP_FAILED is a POSIX detail and
 // does not escape the seam.
 inline void* seg_map(SegHandle h, size_t len) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    // MapViewOfFile returns NULL on failure, already the seam's sentinel.
+    return MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0,
+                         static_cast<SIZE_T>(len));
+#else
     void* p = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, h, 0);
     return p == MAP_FAILED ? nullptr : p;
+#endif
 }
 
 inline void seg_unmap(void* base, size_t len) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    (void)len;
+    (void)UnmapViewOfFile(base);
+#else
     (void)munmap(base, len);
+#endif
 }
 
 // Advise the kernel that a mapping is a good candidate for transparent huge
@@ -409,7 +618,13 @@ constexpr bool kHasRobustMutex = false;
 // while holding it hands EOWNERDEAD to the next locker instead of
 // deadlocking it (FR-18). macOS has no robust attribute — its safety net is
 // the trylock loop + heartbeat (A3).
-inline int mutex_init_pshared(pthread_mutex_t* m) noexcept {
+inline int mutex_init_pshared(ParkMutex* m) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    // WaitOnAddress needs no lock: the ParkArea is inert on Windows. Nothing to
+    // initialize — succeed so create() proceeds unchanged.
+    (void)m;
+    return 0;
+#else
     pthread_mutexattr_t a;
     int rc = pthread_mutexattr_init(&a);
     if (rc != 0) return rc;
@@ -420,6 +635,7 @@ inline int mutex_init_pshared(pthread_mutex_t* m) noexcept {
     if (rc == 0) rc = pthread_mutex_init(m, &a);
     pthread_mutexattr_destroy(&a);
     return rc;
+#endif
 }
 
 // EOWNERDEAD recovery (Linux, App. B #3): we now OWN the lock the dead peer
@@ -431,7 +647,7 @@ inline int mutex_init_pshared(pthread_mutex_t* m) noexcept {
 // flag merely causes one spurious signal), the condvars need no repair
 // (every waiter is on a bounded timedwait per A3), and all data-path state
 // is owned single-writer OUTSIDE the critical section by design (§2.3).
-inline int park_mutex_recover_if_needed(pthread_mutex_t* m, int rc) noexcept {
+inline int park_mutex_recover_if_needed(ParkMutex* m, int rc) noexcept {
 #if defined(SHUTTLE_PLATFORM_LINUX)
     if (rc == EOWNERDEAD) {
         // (no state to repair — see comment above)
@@ -448,7 +664,11 @@ inline int park_mutex_recover_if_needed(pthread_mutex_t* m, int rc) noexcept {
 // (binding minor amendment): on Linux the condvar clock is CLOCK_MONOTONIC;
 // on macOS setclock is unsupported and the relative-wait entry point below
 // is monotonic by definition.
-inline int cond_init_pshared_monotonic(pthread_cond_t* c) noexcept {
+inline int cond_init_pshared_monotonic(ParkCond* c) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    (void)c;  // inert on Windows (WaitOnAddress); nothing to initialize
+    return 0;
+#else
     pthread_condattr_t a;
     int rc = pthread_condattr_init(&a);
     if (rc != 0) return rc;
@@ -459,13 +679,22 @@ inline int cond_init_pshared_monotonic(pthread_cond_t* c) noexcept {
     if (rc == 0) rc = pthread_cond_init(c, &a);
     pthread_condattr_destroy(&a);
     return rc;
+#endif
 }
 
 // Relative timed wait on a pshared condvar; mutex must be held.
 // Returns 0 on wake (incl. spurious), ETIMEDOUT on timeout, else errno.
-inline int cond_timedwait_rel(pthread_cond_t* c, pthread_mutex_t* m,
+inline int cond_timedwait_rel(ParkCond* c, ParkMutex* m,
                               uint64_t rel_ns) noexcept {
-#if defined(SHUTTLE_PLATFORM_LINUX)
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    // Not on the Windows park path (park_wait_cursor uses WaitOnAddress
+    // directly), but defined so the signature exists. Treat as an immediate
+    // timeout — a caller would re-evaluate its predicate, exactly as on wake.
+    (void)c;
+    (void)m;
+    (void)rel_ns;
+    return ETIMEDOUT;
+#elif defined(SHUTTLE_PLATFORM_LINUX)
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     ts.tv_sec += static_cast<time_t>(rel_ns / 1000000000ull);
@@ -476,8 +705,7 @@ inline int cond_timedwait_rel(pthread_cond_t* c, pthread_mutex_t* m,
     }
     // Re-acquisition inside timedwait can also surface EOWNERDEAD if the
     // peer died holding the robust mutex; recover identically.
-    return park_mutex_recover_if_needed(m,
-                                        pthread_cond_timedwait(c, m, &ts));
+    return park_mutex_recover_if_needed(m, pthread_cond_timedwait(c, m, &ts));
 #else
     timespec rel;
     rel.tv_sec = static_cast<time_t>(rel_ns / 1000000000ull);
@@ -492,8 +720,11 @@ inline int cond_timedwait_rel(pthread_cond_t* c, pthread_mutex_t* m,
 // path is a trylock loop with a short sleep; Phase 5 adds the heartbeat
 // staleness check inside this loop, and Phase 5b adds EOWNERDEAD robust
 // recovery on the Linux path.
-inline int park_mutex_lock(pthread_mutex_t* m) noexcept {
-#if defined(SHUTTLE_PLATFORM_MACOS)
+inline int park_mutex_lock(ParkMutex* m) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    (void)m;  // inert: WaitOnAddress holds no lock
+    return 0;
+#elif defined(SHUTTLE_PLATFORM_MACOS)
     for (;;) {
         const int rc = pthread_mutex_trylock(m);
         if (rc != EBUSY) return rc;
@@ -504,8 +735,13 @@ inline int park_mutex_lock(pthread_mutex_t* m) noexcept {
 #endif
 }
 
-inline int park_mutex_unlock(pthread_mutex_t* m) noexcept {
+inline int park_mutex_unlock(ParkMutex* m) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    (void)m;
+    return 0;
+#else
     return pthread_mutex_unlock(m);
+#endif
 }
 
 // ---------------------------------------------------------------------
@@ -531,9 +767,24 @@ inline int park_mutex_unlock(pthread_mutex_t* m) noexcept {
 // heartbeats at least every timeout_ns.
 // ---------------------------------------------------------------------
 inline int park_wait_cursor(std::atomic<uint64_t>* cursor, uint64_t seen,
-                            pthread_mutex_t* mu, pthread_cond_t* cv,
+                            ParkMutex* mu, ParkCond* cv,
                             uint64_t timeout_ns) noexcept {
-#if defined(SHUTTLE_PLATFORM_MACOS)
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    // WaitOnAddress sleeps while *cursor == seen, up to timeout (milliseconds).
+    // The compare-with-sleep is atomic, so a publish that changes the cursor
+    // between the caller's recheck and here cannot be lost — the same guarantee
+    // macOS gets from os_sync_wait_on_address, and why Windows (like macOS)
+    // needs no lock or condvar. A wake or timeout both just return; the caller
+    // re-evaluates its predicate and the peer heartbeat.
+    (void)mu;
+    (void)cv;
+    uint64_t compare = seen;
+    DWORD ms = static_cast<DWORD>(timeout_ns / 1000000ull);
+    if (ms == 0) ms = 1;  // never a busy 0-ms poll
+    (void)WaitOnAddress(static_cast<volatile void*>(cursor), &compare,
+                        sizeof(uint64_t), ms);
+    return 0;
+#elif defined(SHUTTLE_PLATFORM_MACOS)
     (void)mu;
     (void)cv;
     const int rc = os_sync_wait_on_address_with_timeout(
@@ -554,9 +805,13 @@ inline int park_wait_cursor(std::atomic<uint64_t>* cursor, uint64_t seen,
 #endif
 }
 
-inline void park_wake_cursor(std::atomic<uint64_t>* cursor,
-                             pthread_mutex_t* mu, pthread_cond_t* cv) noexcept {
-#if defined(SHUTTLE_PLATFORM_MACOS)
+inline void park_wake_cursor(std::atomic<uint64_t>* cursor, ParkMutex* mu,
+                             ParkCond* cv) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    (void)mu;
+    (void)cv;
+    WakeByAddressAll(static_cast<void*>(cursor));
+#elif defined(SHUTTLE_PLATFORM_MACOS)
     (void)mu;
     (void)cv;
     os_sync_wake_by_address_any(static_cast<void*>(cursor), sizeof(uint64_t),
@@ -578,12 +833,31 @@ inline void cpu_relax() noexcept {
     asm volatile("yield" ::: "memory");
 #elif defined(__x86_64__)
     asm volatile("pause" ::: "memory");
+#elif defined(_MSC_VER)
+    _mm_pause();  // MSVC intrinsic (x86/x64); the Windows spin hint
 #else
     // no hint available; plain spin
 #endif
 }
 
-inline void yield_thread() noexcept { sched_yield(); }
+inline void yield_thread() noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    (void)SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+
+// Short blocking sleep in microseconds; kept in the seam so src/ carries no
+// platform sleep primitive. POSIX: usleep. Windows: Sleep rounds UP to whole
+// milliseconds (a sub-ms request still yields at least one scheduler tick).
+inline void sleep_us(unsigned us) noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    Sleep(static_cast<DWORD>((us + 999u) / 1000u));
+#else
+    usleep(us);
+#endif
+}
 
 // Filesystem view of a named shm object, for leak checks (NFR-R2).
 // Linux exposes "/name" as /dev/shm/name — returns 1 if present, 0 if not.
@@ -624,13 +898,26 @@ inline int hugetlb_object_exists_fs(const char* name) noexcept {
 #endif
 }
 
-// Monotonic clock in nanoseconds (portable POSIX; not a platform seam, kept
-// here so test/driver code shares one definition).
+// Monotonic clock in nanoseconds. Kept here so test/driver code shares one
+// definition. POSIX uses CLOCK_MONOTONIC; Windows uses QueryPerformanceCounter
+// (steady, high-resolution), scaled to ns without overflow by splitting the
+// counter into whole seconds and a sub-second remainder.
 inline uint64_t monotonic_ns() noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    LARGE_INTEGER freq;
+    LARGE_INTEGER ctr;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&ctr);
+    const uint64_t f = static_cast<uint64_t>(freq.QuadPart);
+    const uint64_t c = static_cast<uint64_t>(ctr.QuadPart);
+    if (f == 0) return 0;
+    return (c / f) * 1000000000ull + (c % f) * 1000000000ull / f;
+#else
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
            static_cast<uint64_t>(ts.tv_nsec);
+#endif
 }
 
 }  // namespace shuttle
