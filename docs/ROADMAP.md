@@ -47,7 +47,12 @@ Plausible next steps; each carries a caveat that keeps it out of v1.
   separately-selected policy — never a default or a silent fallback.
 - **Bare-metal Linux benchmark run.** Convert the provisional headline latency
   claim into a final one by measuring on controlled hardware (shared CI runners
-  produce arbitrary numbers and cannot settle a percentile claim).
+  produce arbitrary numbers and cannot settle a percentile claim). A virtualized
+  Linux x86_64 data point now exists — cloud container, 4 vCPU, glibc,
+  unsanitized `-O2`, 2026-08-08: 62.3 µs median (p99 97.1 µs) for the 50 MB
+  blob, 101×/355× over UDS/HTTP, 5.5 GB/s on the 16 KB stream. That is a shared
+  virtual machine, so it does not settle the claim; bare metal remains the
+  missing piece.
 
 ## Exploratory / v2
 
