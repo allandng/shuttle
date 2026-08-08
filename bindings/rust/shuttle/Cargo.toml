@@ -1,0 +1,12 @@
+[package]
+name = "shuttle"
+description = "Safe Rust wrapper over the frozen Shuttle C ABI: zero-copy shared-memory SPSC IPC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[dependencies]
+shuttle-sys = { path = "../shuttle-sys", version = "1.1.0" }
