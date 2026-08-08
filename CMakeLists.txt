@@ -371,3 +371,48 @@ if(SHUTTLE_FUZZ)
   target_link_options(shuttle_header_fuzz PRIVATE ${SHUTTLE_FUZZ_FLAGS})
   target_link_libraries(shuttle_header_fuzz PRIVATE Threads::Threads)
 endif()
+
+# --- experimental CUDA IPC interop (WP9) — opt-in, additive, self-contained --
+# EXPERIMENTAL and UNPROVEN. Like the fuzz block above, this is the last thing
+# in the file and shares no target with anything else: nothing above changes
+# when SHUTTLE_CUDA is OFF (the default). Two independent pieces:
+#
+#   * The host-only descriptor CODEC TEST (shuttle_cuda_desc_test). Pure host
+#     code with NO CUDA dependency — the cudaIpc* handles are opaque bytes the
+#     codec never interprets — so it builds and runs EVERYWHERE, gated only by
+#     SHUTTLE_BUILD_TESTS like every other test. This is the ONLY part of the
+#     module proven anywhere. It compiles src/shuttle_cuda.cpp WITHOUT
+#     SHUTTLE_WITH_CUDA, so only the codec half is in the binary. It inherits
+#     the file-scope link_libraries(shuttle_san), so an -DSHUTTLE_SAN=asan build
+#     runs its fuzz-lite over-read checks under ASan.
+#
+#   * The DEVICE-GLUE library (shuttle_cuda), built ONLY when SHUTTLE_CUDA=ON,
+#     which requires a CUDA toolkit and defines SHUTTLE_WITH_CUDA. This target
+#     is NEVER built in this repo's CI matrix — there is no GPU and no toolkit.
+#     A compile-only CI job (see .github/workflows/ci.yml) checks the glue
+#     source against a stub cuda_runtime.h instead; it proves the glue is
+#     well-formed, and NOTHING about real GPU behavior.
+option(SHUTTLE_CUDA "Build the experimental CUDA IPC glue (requires CUDA toolkit)" OFF)
+
+if(SHUTTLE_BUILD_TESTS)
+  add_executable(shuttle_cuda_desc_test tests/cuda_desc_test.cpp src/shuttle_cuda.cpp)
+  target_include_directories(shuttle_cuda_desc_test PRIVATE include)
+  add_test(NAME shuttle_cuda_desc_test COMMAND shuttle_cuda_desc_test)
+  set_tests_properties(shuttle_cuda_desc_test PROPERTIES TIMEOUT 60)
+endif()
+
+if(SHUTTLE_CUDA)
+  # CUDAToolkit gives us CUDA::cudart without enabling the CUDA LANGUAGE: the
+  # glue is plain C++ that #includes <cuda_runtime.h> and links the runtime, so
+  # no .cu compilation and no nvcc are involved. This path is not exercised by
+  # CI (see the note above); it exists for a developer who actually has a GPU.
+  find_package(CUDAToolkit REQUIRED)
+  add_library(shuttle_cuda STATIC src/shuttle_cuda.cpp)
+  add_library(shuttle::cuda ALIAS shuttle_cuda)
+  target_include_directories(shuttle_cuda PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:include>)
+  target_compile_definitions(shuttle_cuda PRIVATE SHUTTLE_WITH_CUDA)
+  target_link_libraries(shuttle_cuda PRIVATE CUDA::cudart)
+  set_target_properties(shuttle_cuda PROPERTIES EXPORT_NAME cuda)
+endif()

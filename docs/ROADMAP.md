@@ -114,6 +114,24 @@ committed.
 
 - **CUDA IPC / GPU-direct interop.** Let GPU-bound payloads move without a
   CPU-RAM round-trip, for pipelines where both ends already live on the device.
+  An **experimental, opt-in module now exists in the tree** as a first sketch of
+  this direction — `include/shuttle/shuttle_cuda.h`, `src/shuttle_cuda.cpp`,
+  design in [docs/CUDA_DESIGN.md](CUDA_DESIGN.md). The idea: GPU data never
+  rides the channel; instead the producer sends a small fixed-layout
+  **descriptor** (the opaque 64-byte `cudaIpcMemHandle_t`, device id, offset,
+  length, optional event handle) as an ordinary Shuttle message, and the
+  consumer opens it with `cudaIpcOpenMemHandle` and reads device memory
+  directly. The descriptor codec is **pure host code** (the handle is just
+  bytes), so it is fully unit-tested here — `tests/cuda_desc_test.cpp`, built and
+  run on every platform, no CUDA required. The device glue is compile-guarded
+  behind `-DSHUTTLE_CUDA=ON` and has **never run**: there is no GPU in CI, so a
+  compile-only job proves only that the glue is well-formed against the CUDA
+  headers. **Nothing about actual cross-process device visibility, event
+  synchronization, or performance is proven.** This is a research sketch, not a
+  supported surface, and explicitly not part of the v1 ABI — the design doc
+  keeps the precise proven-vs-unproven ledger. It stays in v2 exactly because
+  the hard part (the borrow-vs-kernel lifetime race, real multi-GPU behavior)
+  cannot be settled without hardware.
 - **Windows named shared memory.** A `CreateFileMapping`-based platform seam
   alongside the current POSIX one. v1 is Linux + macOS only; Windows is a whole
   new backend, not a port.

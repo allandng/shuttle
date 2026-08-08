@@ -164,3 +164,80 @@ jobs:
           name: fuzz-crashes
           path: fuzz-artifacts/
           if-no-files-found: ignore
+
+  # Experimental CUDA IPC module (WP9). This job proves TWO things and, just as
+  # importantly, does NOT prove a third.
+  #
+  #   PROVEN here:
+  #     1. The host DESCRIPTOR CODEC works. It is pure host code with no CUDA
+  #        dependency, so it builds and RUNS on this plain runner — the same
+  #        shuttle_cuda_desc_test the linux-asan/tsan jobs already run, invoked
+  #        explicitly here so the guarantee lives in one legible place.
+  #     2. The DEVICE GLUE is WELL-FORMED. src/shuttle_cuda.cpp is compiled with
+  #        -DSHUTTLE_WITH_CUDA against a MINIMAL stub cuda_runtime.h written
+  #        below (NOT vendored into the repo), so its calls to cudaIpc* type-
+  #        check and its C++ parses. Compile only — there is nothing to link or
+  #        run against a stub.
+  #
+  #   NOT PROVEN here (no GPU, no CUDA toolkit on any GitHub runner):
+  #     - that cross-process device memory actually becomes visible,
+  #     - that the event handle synchronizes streams correctly,
+  #     - the handle-cache refcount behavior against real cudaIpcOpenMemHandle,
+  #     - performance, multi-GPU / MIG, or the borrow-vs-kernel lifetime race.
+  #     - the CMake -DSHUTTLE_CUDA=ON path (find_package(CUDAToolkit) +
+  #       CUDA::cudart) is likewise NOT exercised: we bypass it and drive g++
+  #       directly against the stub, because a stub has no CMake package.
+  #
+  # Why the stub and not apt's nvidia-cuda-toolkit: the apt package is ~GB, slow,
+  # and its CMake CUDAToolkit discovery is flaky on hosted runners — and even
+  # with it installed there is still no GPU, so it would prove nothing the stub
+  # does not. The stub is deterministic, seconds-fast, and makes the guarantee
+  # ("the glue is well-formed") exactly match what a GPU-less runner can honestly
+  # assert. See docs/CUDA_DESIGN.md for the full proven-vs-unproven ledger.
+  cuda-glue-compile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ cmake
+      - name: Host codec test (pure host code, actually RUNS)
+        run: |
+          cmake -B build/ci-cuda -DSHUTTLE_CUDA=OFF
+          cmake --build build/ci-cuda -j --target shuttle_cuda_desc_test
+          ctest --test-dir build/ci-cuda -R shuttle_cuda_desc_test \
+            --output-on-failure
+      - name: Write a minimal cuda_runtime.h stub (NOT committed to the repo)
+        run: |
+          mkdir -p stub
+          cat > stub/cuda_runtime.h <<'EOF'
+          /* MINIMAL stub — declarations only, just enough to compile the glue.
+           * NOT a real CUDA header; proves well-formedness, nothing about GPU
+           * behavior. */
+          #ifndef CUDA_RUNTIME_H_STUB
+          #define CUDA_RUNTIME_H_STUB
+          #include <stddef.h>
+          typedef enum cudaError { cudaSuccess = 0, cudaErrorAlreadyMapped = 207 } cudaError_t;
+          typedef struct CUevent_st* cudaEvent_t;
+          typedef struct cudaIpcMemHandle_st { char reserved[64]; } cudaIpcMemHandle_t;
+          typedef struct cudaIpcEventHandle_st { char reserved[64]; } cudaIpcEventHandle_t;
+          #define cudaIpcMemLazyEnablePeerAccess 0x01
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          cudaError_t cudaIpcGetMemHandle(cudaIpcMemHandle_t* handle, void* devPtr);
+          cudaError_t cudaIpcOpenMemHandle(void** devPtr, cudaIpcMemHandle_t handle, unsigned int flags);
+          cudaError_t cudaIpcCloseMemHandle(void* devPtr);
+          cudaError_t cudaIpcGetEventHandle(cudaIpcEventHandle_t* handle, cudaEvent_t event);
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          EOF
+      - name: Compile-only glue against the stub (-DSHUTTLE_WITH_CUDA)
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -g -DSHUTTLE_WITH_CUDA \
+            -Iinclude -Istub \
+            -c src/shuttle_cuda.cpp -o /tmp/shuttle_cuda_glue.o
+          echo "glue compiled well-formed against the stub (no GPU behavior proven)"
