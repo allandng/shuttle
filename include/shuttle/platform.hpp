@@ -15,6 +15,7 @@
   #error "Shuttle supports Linux and macOS only (v1.0)"
 #endif
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -49,6 +50,100 @@ inline bool shm_name_ok(const char* name) noexcept {
 #endif
     const size_t n = std::strlen(name);
     return n >= 2 && n <= kMax;
+}
+
+// ---------------------------------------------------------------------
+// Segment backend: the named object a channel's bytes live in.
+//
+// Every syscall that creates, sizes, maps, unmaps, or destroys that object
+// goes through the six functions below, so a new way of obtaining the pages
+// — explicit hugetlbfs on Linux, a Windows file mapping — arrives as a new
+// SegBacking value plus a branch *here*, never as a syscall (or an #ifdef)
+// in src/. Today there is exactly one backing.
+//
+// Error convention: functions that return a resource report failure with a
+// sentinel (kSegInvalid / nullptr) and write a POSIX errno-style code into
+// `err_out`; the two that return nothing useful return 0-or-errno directly.
+// A future non-POSIX backend translates its native error into that space,
+// so callers keep one platform-independent errno -> shuttle::Err mapping.
+// ---------------------------------------------------------------------
+
+// How a segment's pages are obtained. Additive by design: kHugeTLB2M /
+// kHugeTLB1G slot in beside kShm without changing a single signature below.
+enum class SegBacking : uint32_t {
+    kShm = 0,  // POSIX shm object; default page size (THP advice is separate)
+};
+
+// Handle to a live segment. POSIX: a file descriptor. A Windows backend maps
+// this onto its file-mapping HANDLE, which is why callers never touch it with
+// anything but the seg_* calls.
+using SegHandle = int;
+inline constexpr SegHandle kSegInvalid = -1;
+
+inline void seg_close(SegHandle h) noexcept { (void)::close(h); }
+
+// Destroy the name (the mapping, if any, outlives it — FR-5). Returns 0, or
+// the errno; ENOENT means there was no such segment.
+inline int seg_unlink(const char* name) noexcept {
+    return shm_unlink(name) == 0 ? 0 : errno;
+}
+
+// Create `name` exclusively, owner-only (NFR-S1), and fix its size at `len`.
+// Returns kSegInvalid on failure with err_out set; a name collision reports
+// EEXIST. Sizing is ONE-SHOT: macOS forbids re-truncating an shm object, so
+// this ftruncate is the only one the object will ever see, and any backing
+// added later must likewise settle its size right here. A failure after the
+// object exists leaves nothing behind — it is closed and unlinked.
+inline SegHandle seg_create(const char* name, size_t len, SegBacking backing,
+                            int& err_out) noexcept {
+    (void)backing;  // kShm is the only backing today
+    const int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd < 0) {
+        err_out = errno;
+        return kSegInvalid;
+    }
+    if (ftruncate(fd, static_cast<off_t>(len)) != 0) {
+        err_out = errno;
+        seg_close(fd);
+        (void)seg_unlink(name);
+        return kSegInvalid;
+    }
+    err_out = 0;
+    return fd;
+}
+
+// Attach to an existing segment read/write. Returns kSegInvalid on failure
+// with err_out set; ENOENT means no such segment.
+inline SegHandle seg_open(const char* name, int& err_out) noexcept {
+    const int fd = shm_open(name, O_RDWR, 0);
+    if (fd < 0) {
+        err_out = errno;
+        return kSegInvalid;
+    }
+    err_out = 0;
+    return fd;
+}
+
+// Byte size of the object behind `h`, or -1 if it cannot be determined — the
+// opener sizes its mapping from this (the creator already knows `len`). Note
+// macOS rounds an shm object up to a page, so this can exceed the geometry
+// the header claims; callers validate with >=, never ==.
+inline int64_t seg_size(SegHandle h) noexcept {
+    struct stat st;
+    if (fstat(h, &st) != 0) return -1;
+    return static_cast<int64_t>(st.st_size);
+}
+
+// Map `len` bytes of `h` shared read/write at an address of the kernel's
+// choosing. Returns nullptr on failure — MAP_FAILED is a POSIX detail and
+// does not escape the seam.
+inline void* seg_map(SegHandle h, size_t len) noexcept {
+    void* p = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, h, 0);
+    return p == MAP_FAILED ? nullptr : p;
+}
+
+inline void seg_unmap(void* base, size_t len) noexcept {
+    (void)munmap(base, len);
 }
 
 // Advise the kernel that a mapping is a good candidate for transparent huge

@@ -1,8 +1,5 @@
 #include "shuttle/shuttle.hpp"
 
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -41,25 +38,19 @@ Channel* create(const char* name, size_t capacity_bytes,
         return nullptr;
     }
 
-    int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
-    if (fd < 0) {
-        set_err(err, errno == EEXIST ? kErrExists : kErrSys);
-        return nullptr;
-    }
     const size_t map_len = kDataOffset + capacity_bytes;
-    // One-shot sizing: macOS forbids re-truncating an shm object, so this is
-    // the only ftruncate this object will ever see (platform seam note).
-    if (ftruncate(fd, static_cast<off_t>(map_len)) != 0) {
-        ::close(fd);
-        shm_unlink(name);
-        set_err(err, kErrSys);
+    // Backing choice is a seam concern (kShm today; hugetlbfs backings land
+    // there later); creation is exclusive and sizes the object once, for good.
+    int seg_err = 0;
+    const SegHandle seg = seg_create(name, map_len, SegBacking::kShm, seg_err);
+    if (seg == kSegInvalid) {
+        set_err(err, seg_err == EEXIST ? kErrExists : kErrSys);
         return nullptr;
     }
-    void* base =
-        mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (base == MAP_FAILED) {
-        shm_unlink(name);
+    void* base = seg_map(seg, map_len);
+    seg_close(seg);
+    if (base == nullptr) {
+        (void)seg_unlink(name);
         set_err(err, kErrSys);
         return nullptr;
     }
@@ -70,7 +61,7 @@ Channel* create(const char* name, size_t capacity_bytes,
     const uint32_t flags = create_flags & kFlagHugePages;
     if (flags & kFlagHugePages) advise_huge_pages(base, map_len);
 
-    // ftruncate zero-fills, so init_state is already 0 (uninitialized) and
+    // Creation zero-fills, so init_state is already 0 (uninitialized) and
     // cursors/heartbeats are already 0; set the rest explicitly. flags is part
     // of the cold identity block: written once here, before the init_state
     // release-store publish, and immutable after (single-init contract).
@@ -84,8 +75,8 @@ Channel* create(const char* name, size_t capacity_bytes,
     if (mutex_init_pshared(&h->lock) != 0 ||
         cond_init_pshared_monotonic(&h->not_empty) != 0 ||
         cond_init_pshared_monotonic(&h->not_full) != 0) {
-        munmap(base, map_len);
-        shm_unlink(name);
+        seg_unmap(base, map_len);
+        (void)seg_unlink(name);
         set_err(err, kErrSys);
         return nullptr;
     }
@@ -101,23 +92,24 @@ Channel* open(const char* name, int* err) {
         set_err(err, kErrInvalidArgs);
         return nullptr;
     }
-    int fd = shm_open(name, O_RDWR, 0);
-    if (fd < 0) {
-        set_err(err, errno == ENOENT ? kErrNotFound : kErrSys);
+    int seg_err = 0;
+    const SegHandle seg = seg_open(name, seg_err);
+    if (seg == kSegInvalid) {
+        set_err(err, seg_err == ENOENT ? kErrNotFound : kErrSys);
         return nullptr;
     }
-    struct stat st;
-    if (fstat(fd, &st) != 0 ||
-        st.st_size < static_cast<off_t>(sizeof(ChannelHeader))) {
-        ::close(fd);
+    // An unreadable size (-1) and a too-small object are the same verdict:
+    // whatever is behind this name, it is not a channel.
+    const int64_t seg_len = seg_size(seg);
+    if (seg_len < static_cast<int64_t>(sizeof(ChannelHeader))) {
+        seg_close(seg);
         set_err(err, kErrCorrupt);
         return nullptr;
     }
-    const size_t map_len = static_cast<size_t>(st.st_size);
-    void* base =
-        mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (base == MAP_FAILED) {
+    const size_t map_len = static_cast<size_t>(seg_len);
+    void* base = seg_map(seg, map_len);
+    seg_close(seg);
+    if (base == nullptr) {
         set_err(err, kErrSys);
         return nullptr;
     }
@@ -128,7 +120,7 @@ Channel* open(const char* name, int* err) {
     const uint64_t deadline = monotonic_ns() + kInitWaitNs;
     while (h->init_state.load(std::memory_order_acquire) != kInitReady) {
         if (monotonic_ns() > deadline) {
-            munmap(base, map_len);
+            seg_unmap(base, map_len);
             set_err(err, kErrInitTimeout);
             return nullptr;
         }
@@ -137,12 +129,12 @@ Channel* open(const char* name, int* err) {
 
     // FR-3: magic first, then version, distinct errors.
     if (h->magic != kMagic) {
-        munmap(base, map_len);
+        seg_unmap(base, map_len);
         set_err(err, kErrBadMagic);
         return nullptr;
     }
     if (h->version != kVersion) {
-        munmap(base, map_len);
+        seg_unmap(base, map_len);
         set_err(err, kErrBadVersion);
         return nullptr;
     }
@@ -152,7 +144,7 @@ Channel* open(const char* name, int* err) {
     if (h->data_offset != kDataOffset ||
         h->data_capacity > map_len - kDataOffset ||
         h->max_payload + kFrameHeader > h->data_capacity) {
-        munmap(base, map_len);
+        seg_unmap(base, map_len);
         set_err(err, kErrCorrupt);
         return nullptr;
     }
@@ -168,14 +160,15 @@ Channel* open(const char* name, int* err) {
 
 void close(Channel* ch) {
     if (ch == nullptr) return;
-    munmap(ch->base, ch->map_len);
+    seg_unmap(ch->base, ch->map_len);
     delete ch;
 }
 
 int unlink(const char* name) {
     if (name == nullptr || name[0] != '/') return kErrInvalidArgs;
-    if (shm_unlink(name) != 0) {
-        return errno == ENOENT ? kErrNotFound : kErrSys;
+    const int seg_err = seg_unlink(name);
+    if (seg_err != 0) {
+        return seg_err == ENOENT ? kErrNotFound : kErrSys;
     }
     return kOk;
 }
