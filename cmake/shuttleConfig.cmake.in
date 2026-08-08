@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+# shuttle_core is a static library and shuttle_c links pthread internally, so
+# a consumer that links only shuttle::core must still pull in Threads. The
+# exported targets name Threads::Threads, which only exists after find_package
+# (Threads) has run in the consumer's project — hence the find_dependency here.
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/shuttleTargets.cmake")
+
+check_required_components(shuttle)

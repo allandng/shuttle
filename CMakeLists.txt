@@ -1,9 +1,16 @@
 cmake_minimum_required(VERSION 3.25)
-project(shuttle LANGUAGES CXX)
+project(shuttle VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Consumers that pull shuttle in via add_subdirectory()/FetchContent want the
+# two libraries and nothing else: no test binaries, no bench, no tools, and no
+# add_test() entries polluting their ctest run. Both default to ON only when
+# shuttle is the top-level project.
+option(SHUTTLE_BUILD_TESTS "Build shuttle tests, bench, and tools" ${PROJECT_IS_TOP_LEVEL})
+option(SHUTTLE_INSTALL "Generate shuttle install and packaging rules" ${PROJECT_IS_TOP_LEVEL})
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug)
@@ -36,35 +43,61 @@ find_package(Threads REQUIRED)
 # link_libraries(shuttle_san) directive below, which sanitizes everything
 # that follows.
 add_library(shuttle_c SHARED src/shuttle_c.cpp src/shuttle.cpp)
-target_include_directories(shuttle_c PUBLIC include)
+add_library(shuttle::c ALIAS shuttle_c)
+target_include_directories(shuttle_c PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
 target_link_libraries(shuttle_c PRIVATE Threads::Threads)
+# ABI v1 is frozen (SHUTTLE_ABI_VERSION 1), so the soname stays libshuttle_c.so.1
+# across 1.x releases; only the full version tracks PROJECT_VERSION.
+set_target_properties(shuttle_c PROPERTIES
+    VERSION ${PROJECT_VERSION}
+    SOVERSION 1
+    EXPORT_NAME c)  # so find_package() and add_subdirectory() agree on shuttle::c
 
-# Benchmark binary (Phase 7): also UNsanitized — instrumentation overhead
-# would invalidate the transport-ratio comparison (NFR-P1). Compiled -O2
-# regardless of the default Debug build type, for the same reason.
-add_executable(shuttle_bench bench/bench_main.cpp src/shuttle.cpp)
-target_include_directories(shuttle_bench PRIVATE include)
-target_compile_options(shuttle_bench PRIVATE -O2)
-target_link_libraries(shuttle_bench PRIVATE Threads::Threads)
+# The bench and the two -O2 perf tests below stay in this pre-sanitizer region
+# (see the shuttle_c note above): they must NOT be instrumented, so they are
+# guarded by SHUTTLE_BUILD_TESTS *here* rather than moved down.
+if(SHUTTLE_BUILD_TESTS)
+  # Benchmark binary (Phase 7): also UNsanitized — instrumentation overhead
+  # would invalidate the transport-ratio comparison (NFR-P1). Compiled -O2
+  # regardless of the default Debug build type, for the same reason.
+  add_executable(shuttle_bench bench/bench_main.cpp src/shuttle.cpp)
+  target_include_directories(shuttle_bench PRIVATE include)
+  target_compile_options(shuttle_bench PRIVATE -O2)
+  target_link_libraries(shuttle_bench PRIVATE Threads::Threads)
 
-# G7.2 CPU-accounting proof: also unsanitized + -O2 (instrumentation would
-# distort the copy-CPU comparison).
-add_executable(shuttle_nocopy_cpu_test tests/nocopy_cpu_test.cpp src/shuttle.cpp)
-target_include_directories(shuttle_nocopy_cpu_test PRIVATE include)
-target_compile_options(shuttle_nocopy_cpu_test PRIVATE -O2)
-target_link_libraries(shuttle_nocopy_cpu_test PRIVATE Threads::Threads)
+  # G7.2 CPU-accounting proof: also unsanitized + -O2 (instrumentation would
+  # distort the copy-CPU comparison).
+  add_executable(shuttle_nocopy_cpu_test tests/nocopy_cpu_test.cpp src/shuttle.cpp)
+  target_include_directories(shuttle_nocopy_cpu_test PRIVATE include)
+  target_compile_options(shuttle_nocopy_cpu_test PRIVATE -O2)
+  target_link_libraries(shuttle_nocopy_cpu_test PRIVATE Threads::Threads)
 
-# G7.3 wake-under-load latency: unsanitized + -O2 (latency measurement).
-add_executable(shuttle_wake_under_load_test tests/wake_under_load_test.cpp src/shuttle.cpp)
-target_include_directories(shuttle_wake_under_load_test PRIVATE include)
-target_compile_options(shuttle_wake_under_load_test PRIVATE -O2)
-target_link_libraries(shuttle_wake_under_load_test PRIVATE Threads::Threads)
+  # G7.3 wake-under-load latency: unsanitized + -O2 (latency measurement).
+  add_executable(shuttle_wake_under_load_test tests/wake_under_load_test.cpp src/shuttle.cpp)
+  target_include_directories(shuttle_wake_under_load_test PRIVATE include)
+  target_compile_options(shuttle_wake_under_load_test PRIVATE -O2)
+  target_link_libraries(shuttle_wake_under_load_test PRIVATE Threads::Threads)
+endif()
 
 link_libraries(shuttle_san)  # every target below is sanitizer-instrumented
 
 # Core library: must stay free of any test/bench dependency.
 add_library(shuttle_core STATIC src/shuttle.cpp)
-target_include_directories(shuttle_core PUBLIC include)
+add_library(shuttle::core ALIAS shuttle_core)
+target_include_directories(shuttle_core PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+# The core uses pthreads (robust mutexes, futex-backed parking) directly, so the
+# exported static target carries its own Threads dependency: linking shuttle::core
+# alone must be enough to get -pthread.
+target_link_libraries(shuttle_core PUBLIC Threads::Threads)
+set_target_properties(shuttle_core PROPERTIES EXPORT_NAME core)
+
+# Everything from here to the matching endif() is test/tool-only. The body is
+# left unindented so this guard stays a pure wrapper in the diff.
+if(SHUTTLE_BUILD_TESTS)
 
 add_executable(shuttle_tests tests/test_main.cpp)
 target_link_libraries(shuttle_tests PRIVATE shuttle_core)
@@ -198,3 +231,72 @@ set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_bench_g71 shuttle_nocopy_cpu_test
                      shuttle_wake_under_load_test
                      PROPERTIES TIMEOUT 300)
+
+endif()  # SHUTTLE_BUILD_TESTS
+
+# --- install / packaging -----------------------------------------------------
+# Consumed three ways: find_package(shuttle CONFIG) for CMake projects,
+# pkg-config for everyone else, and add_subdirectory/FetchContent (which skips
+# this block entirely unless SHUTTLE_INSTALL is forced on).
+if(SHUTTLE_INSTALL)
+  include(GNUInstallDirs)
+  include(CMakePackageConfigHelpers)
+
+  # shuttle_san is the INTERFACE flags carrier that link_libraries() above
+  # attaches to every target below it, shuttle_core included. CMake refuses to
+  # export a target whose link interface names a target outside the export set,
+  # so it rides along. In a non-sanitized build (the only kind worth installing)
+  # it carries no flags at all.
+  set_target_properties(shuttle_san PROPERTIES EXPORT_NAME san)
+  install(TARGETS shuttle_san EXPORT shuttleTargets)
+
+  # No INCLUDES DESTINATION here: the $<INSTALL_INTERFACE:include> on both
+  # targets already supplies the exported include dir, and naming it twice
+  # duplicates the entry in INTERFACE_INCLUDE_DIRECTORIES.
+  install(TARGETS shuttle_core shuttle_c
+          EXPORT shuttleTargets
+          RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+          ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+  install(DIRECTORY include/shuttle
+          DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+  install(EXPORT shuttleTargets
+          NAMESPACE shuttle::
+          DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shuttle)
+
+  configure_package_config_file(
+      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/shuttleConfig.cmake.in
+      ${CMAKE_CURRENT_BINARY_DIR}/shuttleConfig.cmake
+      INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shuttle)
+
+  # SameMajorVersion: the C ABI is frozen at v1, so any 1.x satisfies a
+  # find_package(shuttle 1.x) request.
+  write_basic_package_version_file(
+      ${CMAKE_CURRENT_BINARY_DIR}/shuttleConfigVersion.cmake
+      VERSION ${PROJECT_VERSION}
+      COMPATIBILITY SameMajorVersion)
+
+  install(FILES
+          ${CMAKE_CURRENT_BINARY_DIR}/shuttleConfig.cmake
+          ${CMAKE_CURRENT_BINARY_DIR}/shuttleConfigVersion.cmake
+          DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/shuttle)
+
+  # pkg-config: keep libdir/includedir prefix-relative unless GNUInstallDirs
+  # handed back absolute paths.
+  if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}")
+    set(SHUTTLE_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+  else()
+    set(SHUTTLE_PC_LIBDIR "\${exec_prefix}/${CMAKE_INSTALL_LIBDIR}")
+  endif()
+  if(IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+    set(SHUTTLE_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+  else()
+    set(SHUTTLE_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+  endif()
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/shuttle.pc.in
+                 ${CMAKE_CURRENT_BINARY_DIR}/shuttle.pc @ONLY)
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/shuttle.pc
+          DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+endif()
