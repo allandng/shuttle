@@ -1,0 +1,24 @@
+# Shuttle house style. Derived from the code that already exists, not imposed
+# on it: Google style is the base because the include grouping, 80-column
+# limit, attached braces, left-aligned pointers (`void* base`) and
+# short-if-on-one-line habits in this tree already match it. Four deviations,
+# each observed in the source:
+#
+#   IndentWidth 4              — the tree indents 4, Google's default is 2.
+#   AccessModifierOffset -3    — yields ` public:` at one space, as written.
+#   AlwaysBreakBeforeMultiline
+#     Strings: false           — the printf/snprintf format strings in bench/
+#                                and tools/ stay on the call's first line.
+#   IncludeIsMainRegex '$'     — do NOT treat foo.hpp as the "main header" of
+#                                foo_test.cpp; tests here include the unit
+#                                under test inside the normal project block.
+#
+# Running clang-format over the tree is very close to a no-op (see
+# CONTRIBUTING.md). Reformat only what you touch; a whole-tree sweep would
+# bury real history under noise.
+Language: Cpp
+BasedOnStyle: Google
+IndentWidth: 4
+AccessModifierOffset: -3
+AlwaysBreakBeforeMultilineStrings: false
+IncludeIsMainRegex: '$'
