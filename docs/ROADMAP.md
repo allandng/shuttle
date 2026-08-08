@@ -127,6 +127,34 @@ Shipped and tested; listed here because they are frequently proposed as
   still protects the ring if it stops draining. It is documented as the
   recommended pattern in `docs/API.md`.
 
+## Shipped in v1.4
+
+Listed for the same reason as "Already in v1": these were never proposed here,
+they landed directly, and without a line in this file a reader would reasonably
+propose them as future work. All three are opt-in, additive to the frozen ABI,
+and documented in [API.md](API.md); measurements are in
+[EXPERIMENTS.md](EXPERIMENTS.md).
+
+- **Page-aligned payload spans** (`SHUTTLE_CREATE_ALIGNED_SPANS`, `0x10`). Every
+  payload span starts on a system page, so a borrowed pointer can go straight
+  to `cudaHostRegister` or `newBufferWithBytesNoCopy`. Paid for in internal
+  fragmentation, and deliberately backed by geometry rather than by the
+  ignore-unknown-bits rule: an aligned segment's page-rounded `data_offset` is
+  what makes a pre-v1.4 binary refuse it (`CORRUPT`, by design).
+- **File-backed channels** (`shuttle_create_file` / `shuttle_open_file` /
+  `shuttle_unlink_file`). The segment lives in a file at a path you choose, so
+  capacity is bounded by the filesystem instead of by RAM or `/dev/shm`. The
+  crash story was re-argued rather than assumed — robust-mutex `EOWNERDEAD`
+  recovery is *observed* on a file mapping, not inferred. **Durability stays an
+  explicit non-goal** (no `msync`, ever, on this path); a persistence use case
+  would need its own design.
+- **Peek and prefetch** (`shuttle_peek_next`, plus automatic `MADV_WILLNEED` on
+  file-backed channels). Peek is the read-only lookahead that makes pipelined
+  consumption possible under strict release-before-acquire borrows. The
+  prefetch hint is advisory and carries an honest caveat: on the one host it
+  has been measured on it is **not** a speedup (E4 in EXPERIMENTS.md), and it
+  is documented that way rather than sold.
+
 ## v1.x candidates
 
 Plausible next steps; each carries a caveat that keeps it out of v1.
@@ -138,9 +166,11 @@ Plausible next steps; each carries a caveat that keeps it out of v1.
   produce arbitrary numbers and cannot settle a percentile claim). A virtualized
   Linux x86_64 data point now exists — cloud container, 4 vCPU, glibc,
   unsanitized `-O2`, 2026-08-08: 62.3 µs median (p99 97.1 µs) for the 50 MB
-  blob, 101×/355× over UDS/HTTP, 5.5 GB/s on the 16 KB stream. That is a shared
-  virtual machine, so it does not settle the claim; bare metal remains the
-  missing piece.
+  blob, 101×/355× over UDS/HTTP, 5.5 GB/s on the 16 KB stream, re-confirmed
+  against the v1.4 tree at 63.5 µs median (E1 in [EXPERIMENTS.md](EXPERIMENTS.md)).
+  That is a shared virtual machine, so it does not settle the claim; bare metal
+  remains the missing piece. The re-run also showed the p99 is not stable enough
+  on that host to quote, which is itself an argument for the controlled box.
 
 ## Exploratory / v2
 

@@ -24,11 +24,29 @@ The ten functions `shuttle_create` .. `shuttle_keepalive` are frozen v1.
 `shuttle_create_ex` is an additive v1.1 symbol and `shuttle_get_stats` an
 additive v1.2 symbol (new symbols only, no existing signature or semantic
 touched); v1.3 adds only the `SHUTTLE_DROP_NEWEST` flag bit and the
-`SHUTTLE_DROPPED` return, both opt-in. v1.4 adds the
-`SHUTTLE_CREATE_ALIGNED_SPANS` flag, the three path-typed lifecycle symbols
-`shuttle_create_file` / `shuttle_open_file` / `shuttle_unlink_file`, and the
-read-only lookahead `shuttle_peek_next`, all additive. The ABI version stays
-`1`.
+`SHUTTLE_DROPPED` return, both opt-in.
+
+**C ABI v1.4 — the complete additive set.** Every entry below is a *new* symbol
+or a *new* create-flag bit; no v1/v1.1/v1.2/v1.3 signature, error code, flag
+value, or semantic is changed, so `SHUTTLE_ABI_VERSION` stays `1` and the
+segment layout version stays 1 (or 2, with `SHUTTLE_CREATE_STATS`).
+
+| Addition | Kind | Section |
+|---|---|---|
+| `SHUTTLE_CREATE_ALIGNED_SPANS` (`0x10`) | create-flag bit | **Page-aligned payload spans** |
+| `SHUTTLE_CREATE_FILE_BACKED` (`0x20`) | create-flag bit, set by `shuttle_create_file`, persisted and informational | **File-backed channels**, **The `0x20` asymmetry** |
+| `shuttle_create_file` | function | **shuttle_create_file / shuttle_open_file / shuttle_unlink_file** |
+| `shuttle_open_file` | function | same |
+| `shuttle_unlink_file` | function | same |
+| `shuttle_peek_next` | function | **shuttle_peek_next** |
+
+There is no new error code, no new per-op flag, and no new struct in v1.4. The
+automatic `MADV_WILLNEED` prefetch on file-backed channels adds **no symbol at
+all** — it is behavior, not surface (**Prefetch on file-backed channels**).
+
+Dated measurements of the v1.4 features on real hardware — including a worked
+KV-cache handoff example and a null result for the prefetch hook — are in
+[EXPERIMENTS.md](EXPERIMENTS.md).
 
 ---
 
@@ -413,15 +431,38 @@ int shuttle_acquire_read(shuttle_channel* ch, const void** ptr, size_t* len, int
 ```
 
 Zero-copy borrow, consumer side: borrow the next message in place. `*ptr` points
-into the shared segment; `*len` is the payload length. At most one outstanding
-borrow per handle; must be paired with `shuttle_release_read`.
+into the shared segment; `*len` is the payload length. At most one borrow is
+outstanding per handle, and it must be released with `shuttle_release_read`.
+
+**Calling it again before releasing is idempotent, not an error.** A second
+`shuttle_acquire_read` while a borrow is outstanding returns `SHUTTLE_OK` and
+hands back the *same* pointer and the *same* length — it does not advance the
+read cursor, does not create a second borrow, and does not fail. It is the
+already-held message, restated. (Earlier revisions of this page claimed
+`INVALID_ARGS` here; the implementation has always been idempotent — see the
+note at the end of this section.)
 
 - Blocking / non-blocking as for `shuttle_read`. `SHUTTLE_DROP_NEWEST` is
   **not** valid here and returns `INVALID_ARGS`.
 - The borrowed payload is guaranteed contiguous (see Zero-copy borrow rules).
+- With a borrow outstanding, `shuttle_acquire_read` is *not* how you reach the
+  next message — nothing reaches it until the release. Use `shuttle_peek_next`
+  to learn that it exists and how big it is.
 - Errors: `INVALID_ARGS` (`ch`, `ptr`, or `len` NULL, or `flags` contains
   `SHUTTLE_DROP_NEWEST`), `WOULD_BLOCK` (non-blocking, empty), `PEER_DEAD`,
   `CORRUPT`, `SYS`.
+
+**Documentation note (v1.4).** This page previously asserted, in *Zero-copy
+borrow rules*, that "a second acquire before releasing the first returns
+`INVALID_ARGS`". That was true of the producer side only. The consumer side has
+always reused the active borrow (`ensure_borrow` in `src/shuttle_c.cpp`), and
+the behavior is deliberately kept: it composes with `shuttle_peek_next` — a
+lookahead loop can re-ask for the message it is holding without bookkeeping —
+and it is the more forgiving contract for bindings, which cannot always know
+whether a borrow is live. The **documentation was corrected to match the
+implementation**, not the other way round; no code changed, so no caller's
+behavior changed. The observation is recorded as E5 in
+[EXPERIMENTS.md](EXPERIMENTS.md).
 
 ### shuttle_release_read
 
@@ -525,7 +566,7 @@ it — because the counters live in the segment, not in the handle.
 |-------|-------------------------------|--------------------------|
 | **1** | **`SHUTTLE_DROPPED`**         | **Not an error.** `shuttle_write` with `SHUTTLE_DROP_NEWEST`: the ring could not take the message, so it was dropped. The only positive return in the ABI; unreachable without the flag. |
 | 0     | `SHUTTLE_OK`                  | Success. |
-| -1    | `SHUTTLE_ERR_INVALID_ARGS`    | NULL handle/pointer, malformed name, zero size, misuse (double reservation/borrow, wrong role). |
+| -1    | `SHUTTLE_ERR_INVALID_ARGS`    | NULL handle/pointer, malformed name or path, zero size, misuse (double write *reservation*, wrong role, a per-op flag the call refuses). A double read *borrow* is **not** in this list — it is idempotent; see `shuttle_acquire_read`. |
 | -2    | `SHUTTLE_ERR_NAME_TOO_LONG`   | Name exceeds the platform shm-name limit (macOS 30, Linux 254). |
 | -3    | `SHUTTLE_ERR_EXISTS`          | `create`: a segment with that name already exists. |
 | -4    | `SHUTTLE_ERR_NOT_FOUND`       | `open`/`unlink`: no such segment. |
@@ -733,6 +774,13 @@ Properties worth being precise about:
   memory-ordering contract in `include/shuttle/spsc.hpp` says why that adds no
   edge.
 - **Windows:** no-op, like the file backing itself.
+- **Not documented as a speedup.** The only host it has been measured on
+  (a virtualized Linux container with 8 MiB of device read-ahead) shows a cost
+  of roughly 25 µs per acquire and no net win even against a dropped page
+  cache; it did tighten the p99. That is a null result, honestly inconclusive
+  because the environment never reproduced a genuine disk-stall regime — see
+  **E4** in [EXPERIMENTS.md](EXPERIMENTS.md). Budget for the hint as advice the
+  kernel may ignore, not as throughput.
 
 ### Combining flags
 
@@ -861,9 +909,14 @@ producer side.
   from `shuttle_acquire_write`) is valid only until the matching release
   (`shuttle_release_read` / `shuttle_commit_write`). After release the bytes may
   be reused by the peer; dereferencing the stale pointer is undefined.
-- **Mandatory release**: every acquire must be paired with exactly one release.
-  At most one borrow/reservation may be outstanding per handle; a second acquire
-  before releasing the first returns `INVALID_ARGS`.
+- **Mandatory release**: every acquire must be paired with exactly one release,
+  and at most one borrow/reservation is outstanding per handle. The two sides
+  differ in what a *second* acquire does, and the difference is deliberate:
+  `shuttle_acquire_write` with a reservation already outstanding returns
+  `INVALID_ARGS` (the reserved span may be half-filled; there is no sane
+  answer), while `shuttle_acquire_read` is **idempotent** — it returns
+  `SHUTTLE_OK` with the same pointer and length, moving nothing. See
+  `shuttle_acquire_read`.
 - **Release before acquire, and the window through it**: a consumer holding
   message N cannot acquire N+1 — the read cursor does not move until the
   release. Use `shuttle_peek_next` to learn that N+1 exists, and how large it
