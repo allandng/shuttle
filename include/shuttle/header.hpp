@@ -61,6 +61,33 @@ constexpr uint32_t kFlagHugeTLB1G = 0x4;
 // behavior: it must not map a header shape it does not know.
 constexpr uint32_t kFlagStats = 0x8;
 
+// PAGE-ALIGNED PAYLOAD SPANS (v1.4). Every payload the channel carries starts
+// on a system-page boundary, so a borrowed span can be handed straight to an
+// API that requires page-aligned host memory — Metal's
+// newBufferWithBytesNoCopy, cudaHostRegister — with no copy and no bounce
+// buffer. Framing becomes, per message (see bipbuffer.hpp's FRAME GEOMETRY):
+//
+//     [8B length header][pad to page][payload][pad to page]
+//
+// so the payload sits at frame_start + page and the frame stride is
+// page + round_up(len, page). data_offset is rounded up to a page too, which is
+// what keeps every frame start page-aligned across wraps.
+//
+// SPECIAL, exactly like kFlagStats and for the same reason: an opener that
+// merely IGNORED this bit would misparse every frame, because the bit changes
+// the on-segment framing rather than adding to it. Ignoring is therefore not an
+// option, and the geometry is what enforces it — an aligned segment's
+// data_offset (4096) is not the value the unaligned rule demands (1280/1536),
+// so a binary that does not know the bit REJECTS the segment at its geometry
+// check with kErrCorrupt. Corrupt rather than kErrBadVersion is the deliberate,
+// accurate verdict: the offset genuinely disagrees with the layout rule that
+// binary knows, and no layout VERSION was added (the header shape is
+// unchanged). See docs/API.md, "Page-aligned payload spans".
+//
+// The alignment unit is the SYSTEM page (platform.hpp's page_size()), never a
+// huge page: 0x10 composes with the hugetlb backings and with kFlagStats.
+constexpr uint32_t kFlagAlignedSpans = 0x10;
+
 // Hot atomics get a full line each. 128 B = Apple Silicon line size; also
 // correct (2x conservative) on x86 (binding minor amendment).
 constexpr size_t kCacheLine = 128;
@@ -202,6 +229,10 @@ static_assert(offsetof(ChannelHeader, stat_bytes_read) ==
 // The data region starts immediately after the header — whose size now depends
 // on the layout version. There is deliberately no version-agnostic kDataOffset
 // constant any more: every site must say which layout it means.
+// (kFlagAlignedSpans segments round whichever of these applies UP to a system
+// page — see data_offset_for below. That rounding is a property of the FLAGS,
+// not of a layout version: the header shape is identical either way, only the
+// gap between the header and the data region grows.)
 constexpr uint64_t kDataOffsetV2 = sizeof(ChannelHeader);
 static_assert(kDataOffsetV2 == kDataOffsetV1 + 2 * kCacheLine,
               "v2 appends exactly the two stats lines");
@@ -219,6 +250,29 @@ static_assert(sizeof(std::atomic<uint32_t>) == 4);
 // future v3 that keeps the block inherits it.
 inline bool has_stats(const ChannelHeader* h) noexcept {
     return h != nullptr && h->version >= kVersionStats;
+}
+
+// The gate on the aligned framing, and the mirror of has_stats: here the FLAG
+// is the gate, because 0x10 adds no header fields and so bumps no version (see
+// kFlagAlignedSpans). Producer and Consumer resolve it ONCE at construction,
+// exactly as they resolve the stats pointer, so the default path pays a single
+// perfectly-predictable branch per message and nothing else.
+inline bool has_aligned_spans(const ChannelHeader* h) noexcept {
+    return h != nullptr && (h->flags & kFlagAlignedSpans) != 0;
+}
+
+// The ONLY legal data_offset for a segment with this version and these flags.
+// The version picks the header size (v1 vs the v2 stats layout); the aligned
+// flag then rounds that up to a page so the data region — and therefore every
+// frame start in it — is page-aligned. Both create() and validate_header()
+// compute the offset here, so the writer and the reader of a segment can never
+// disagree about it. (fuzz/header_fuzz.cpp deliberately does NOT call this: its
+// oracle restates the rule independently, which is the point of an oracle.)
+inline uint64_t data_offset_for(uint32_t version, uint32_t flags,
+                                uint64_t page) noexcept {
+    const uint64_t base =
+        version == kVersionStats ? kDataOffsetV2 : kDataOffsetV1;
+    return (flags & kFlagAlignedSpans) != 0 ? round_up_page(base, page) : base;
 }
 
 // The one sanctioned way to turn a segment offset into a local address.

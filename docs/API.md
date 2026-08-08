@@ -54,10 +54,11 @@ consumer yet — the role is bound lazily on first use of the corresponding path
 ### shuttle_create_ex
 
 ```c
-#define SHUTTLE_CREATE_HUGEPAGES   0x1
-#define SHUTTLE_CREATE_HUGETLB_2MB 0x2
-#define SHUTTLE_CREATE_HUGETLB_1GB 0x4
-#define SHUTTLE_CREATE_STATS       0x8
+#define SHUTTLE_CREATE_HUGEPAGES     0x1
+#define SHUTTLE_CREATE_HUGETLB_2MB   0x2
+#define SHUTTLE_CREATE_HUGETLB_1GB   0x4
+#define SHUTTLE_CREATE_STATS         0x8
+#define SHUTTLE_CREATE_ALIGNED_SPANS 0x10
 shuttle_channel* shuttle_create_ex(const char* name, size_t capacity_bytes,
                                    size_t max_payload_bytes,
                                    uint32_t create_flags, int* err);
@@ -83,6 +84,10 @@ not be mixed. Unknown flag bits are masked off and ignored (never persisted).
   with **explicit, reserved huge pages** of that size. See **Explicit huge
   pages (hugetlbfs)** below — this is a guarantee-or-error flag, not advice,
   and it never falls back to normal pages.
+- `SHUTTLE_CREATE_ALIGNED_SPANS`: make every payload span start on a system
+  page. See **Page-aligned payload spans** below — this one changes the
+  **framing**, which raises the `CAPACITY_TOO_SMALL` floor and means older
+  binaries cannot open the segment.
 - Errors: `shuttle_create`'s set, plus `INVALID_ARGS` if **both** hugetlb bits
   are set (they name two different page sizes; neither can be silently
   dropped), and `NO_HUGEPAGES` if a hugetlb request cannot be honored. Passing
@@ -159,6 +164,70 @@ mount point (`mount -o uid=,gid=,mode=`, or `chmod`). 1 GB pages generally
 require the `hugepagesz=1G hugepages=N` kernel command line, since they cannot
 usually be reserved at runtime.
 
+#### Page-aligned payload spans (`SHUTTLE_CREATE_ALIGNED_SPANS`, v1.4)
+
+Every payload the channel carries starts on a **system-page boundary**, so the
+pointer from `shuttle_acquire_read` — or from `shuttle_acquire_write` — can be
+handed straight to an API that demands page-aligned host memory:
+`cudaHostRegister`, Metal's `newBufferWithBytesNoCopy`, a driver ioctl that maps
+a user range. Without the flag those calls need a bounce buffer, which is
+exactly the copy the rest of this library exists to avoid.
+
+No new function comes with it. The acquire/read entry points already return the
+span pointers; the flag only changes where they land.
+
+**Framing.** Each message becomes:
+
+```
+[8-byte length][pad to page][payload][pad to page]
+ ^ frame start                ^ frame start + page = the pointer you get
+```
+
+so the frame stride is `page + round_up(len, page)`. Frame starts stay
+page-aligned across wraps because every stride is a whole number of pages, the
+data region itself starts page-aligned (`data_offset` is rounded up to a page),
+and an early wrap restarts at offset 0.
+
+**The alignment unit is the system page** — `sysconf(_SC_PAGESIZE)`, 4096 on
+x86-64 and 16384 on Apple Silicon. Because Shuttle is same-host IPC, that is a
+host constant: every process mapping a given segment computes the same value, so
+neither side has to be told. It stays the system page even on a hugetlbfs-backed
+segment (`0x10|0x2` is legal): the APIs above want ordinary page granularity, and
+rounding every message to 2 MB or 1 GB would be a far worse trade.
+
+**Cost: internal fragmentation, stated as a number.** Padding per message is
+`(page - 8)` for the tail of the header page, plus up to `page - 1` for the
+payload's rounding — a worst case of **`2*page - 8 - 1` = 8183 bytes** at a
+4 KiB page, hit when `len % page == 1`. That is 0.016% of a 50 MB payload and
+100x the size of a 64-byte one, so the flag is for channels carrying pages, not
+packets. Capacity is spent on padding too, which is why
+`CAPACITY_TOO_SMALL` now means `capacity < page + round_up(max_payload, page)`
+on an aligned channel.
+
+**Cost: older binaries cannot open the segment.** Unknown flag bits are normally
+ignored (see **Segment layout**), but an ignorer would misparse every frame
+here, so this bit is deliberately backed by geometry: an aligned segment's
+`data_offset` is page-rounded (4096, not 1280/1536), and a binary built before
+v1.4 rejects that at its geometry check with **`SHUTTLE_ERR_CORRUPT`**.
+
+`CORRUPT` rather than `BAD_VERSION` is the accurate verdict and is chosen on
+purpose. No layout *version* was added — the header's shape and every field
+offset are unchanged — so there is nothing for a version check to report. What
+genuinely disagrees is the offset, against the layout rule that binary knows,
+and `CORRUPT` is what this library has always returned for that. Deciding to set
+the flag is therefore a decision about **which peers can attach**, exactly like
+`SHUTTLE_CREATE_STATS` (which reports `BAD_VERSION` for the same class of
+reason: there, the header shape really did change).
+
+**Combining flags.** All orthogonal:
+
+| Combination | Result |
+|---|---|
+| `0x10` | v1 header, `data_offset` = `round_up(1280, page)` = 4096 |
+| `0x18` (`\|STATS`) | v2 header, `data_offset` = `round_up(1536, page)` = 4096; byte counters still count **payload** bytes, never the padded stride |
+| `0x12` / `0x14` (`\|HUGETLB_*`) | hugetlbfs-backed, alignment unit stays the **system** page |
+| `0x11` (`\|HUGEPAGES`) | THP advice, unchanged and still advisory |
+
 ### shuttle_open
 
 ```c
@@ -176,9 +245,12 @@ it looks in the POSIX shm namespace first, then on hugetlbfs mounts (see
 pages with no `MAP_HUGETLB` and no special call.
 
 Two layout versions are accepted: `1` (the default) and `2` (created with
-`SHUTTLE_CREATE_STATS`). The version selects the only legal `data_offset`, so a
-segment whose version and geometry disagree is `CORRUPT`, while a version this
-binary does not know at all is `BAD_VERSION` — the two verdicts stay distinct.
+`SHUTTLE_CREATE_STATS`). The version **and the flags** select the only legal
+`data_offset` — `SHUTTLE_CREATE_ALIGNED_SPANS` rounds it up to a page — so a
+segment whose header and geometry disagree is `CORRUPT`, while a version this
+binary does not know at all is `BAD_VERSION`; the two verdicts stay distinct.
+This is the check that makes an aligned segment unopenable by a pre-v1.4 binary,
+which is intended: see **Page-aligned payload spans**.
 
 - Blocking: bounded. Spins up to a 5 s deadline waiting for creator init.
 - Errors (via `*err`): `INVALID_ARGS` (`name` NULL or `name[0] != '/'`),
@@ -496,6 +568,11 @@ producer side.
   whole-unit, so a payload is never split across the physical wrap. A borrowed or
   reserved span is always one contiguous run of bytes, safe to expose directly as
   a slice / `memoryview` / NumPy array with no copy and no stitching.
+- **Alignment**: by default a payload lands 8 bytes past its frame start and has
+  no alignment guarantee beyond that. Create the channel with
+  `SHUTTLE_CREATE_ALIGNED_SPANS` to get every span page-aligned, which is what
+  `cudaHostRegister` and `newBufferWithBytesNoCopy` require — see
+  **Page-aligned payload spans**.
 
 ---
 
@@ -535,9 +612,9 @@ masks `create_flags` down to the bits it actually implements, so an unknown (or
 merely reserved-and-unimplemented) bit is never persisted into a segment.
 Recorded bits: `SHUTTLE_CREATE_HUGEPAGES` = `0x1`,
 `SHUTTLE_CREATE_HUGETLB_2MB` = `0x2`, `SHUTTLE_CREATE_HUGETLB_1GB` = `0x4`,
-`SHUTTLE_CREATE_STATS` = `0x8`. The hugetlb bits are persisted but
-informational — an opener takes no action on them, because the segment's
-location already determines its page size.
+`SHUTTLE_CREATE_STATS` = `0x8`, `SHUTTLE_CREATE_ALIGNED_SPANS` = `0x10`. The
+hugetlb bits are persisted but informational — an opener takes no action on
+them, because the segment's location already determines its page size.
 
 **Version gate**: `flags` is ignorable, `version` is not. A version selects the
 physical size of the header, so an opener that does not recognize one cannot
@@ -546,6 +623,25 @@ know where the data region starts and must refuse the segment. That is why
 why a binary built before v1.2 reports `BAD_VERSION` when handed a v2 segment,
 rather than silently ignoring the stats bit. Plain `shuttle_create` writes the
 v1 layout, byte for byte as before.
+
+**Geometry gate**: `SHUTTLE_CREATE_ALIGNED_SPANS` is the second exception, by a
+different mechanism. It adds no header field, so there is no version to bump —
+but it changes the **framing**, and an opener that ignored it would misparse
+every message. So the flag also selects the segment's `data_offset`
+(`round_up(header_size, page)`), and `data_offset` is validated exactly. A
+binary that does not know the bit computes the unaligned offset, finds a
+mismatch, and returns `CORRUPT`. In other words: **a flag that changes how bytes
+are laid out must be backed by something version- or geometry-checked, never
+left to the ignore-unknown-bits rule.** That rule is for bits an old reader can
+safely do nothing about.
+
+The two exceptions and their verdicts:
+
+| Flag | What it changes | Old opener sees |
+|---|---|---|
+| `SHUTTLE_CREATE_STATS` (`0x8`) | header SIZE (layout version 1 → 2) | `BAD_VERSION` |
+| `SHUTTLE_CREATE_ALIGNED_SPANS` (`0x10`) | `data_offset` + frame layout | `CORRUPT` |
+| everything else | nothing an opener must act on | opens normally |
 
 ---
 
@@ -565,7 +661,12 @@ read with `shuttle_get_stats`. Five counters live in the segment, so either peer
 
 - **Payload bytes, not frame bytes**: the 8-byte length prefix is transport
   overhead and is excluded on both sides, so `bytes_written` / `bytes_read` are
-  directly comparable to the lengths the caller passed and to each other.
+  directly comparable to the lengths the caller passed and to each other. The
+  same holds on a `SHUTTLE_CREATE_ALIGNED_SPANS` channel: the page padding is
+  transport overhead too and is **not** counted, so the counters do not silently
+  change meaning when the flag is added. (Ring occupancy on such a channel is
+  therefore *larger* than `bytes_written - bytes_read` suggests — that is the
+  fragmentation, and it is measured by the stride, not by these counters.)
 - **Cost**: each counter has exactly one writer and is updated with a relaxed
   load + relaxed store (never a read-modify-write) on a cache line that side
   already owns — the same discipline as the heartbeats. The producer's and

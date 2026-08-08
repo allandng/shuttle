@@ -1,17 +1,22 @@
 //! Raw FFI declarations for the frozen Shuttle C ABI.
 //!
-//! This crate is the complete v1.1 surface and nothing else: the ten frozen v1
-//! functions `shuttle_create`..`shuttle_keepalive`, plus the additive v1.1
-//! `shuttle_create_ex`. Every declaration is transcribed by hand from
-//! `include/shuttle/shuttle_c.h`, which is the single source of truth. No
-//! symbol appears here that the header does not declare.
+//! This crate is the complete surface as of ABI v1.4 and nothing else: the ten
+//! frozen v1 functions `shuttle_create`..`shuttle_keepalive`, plus the additive
+//! `shuttle_create_ex` (v1.1) and `shuttle_get_stats` (v1.2). Every declaration
+//! is transcribed by hand from `include/shuttle/shuttle_c.h`, which is the
+//! single source of truth. No symbol appears here that the header does not
+//! declare.
+//!
+//! `SHUTTLE_ABI_VERSION` is still 1: everything since v1.1 has been a new
+//! symbol or a new constant, never a changed signature.
 //!
 //! **bindgen is deliberately not used.** It would pull libclang into every
 //! build of a crate whose entire job is eleven stable signatures that cannot
 //! change without an ABI break. The same decision is recorded for the
 //! reference bindings in `tests/ffi/rust/shuttle.rs`. The cost is that a drift
 //! between this file and the header would not be caught by the compiler — it
-//! is caught by the repo's byte-exact FFI integration tests instead.
+//! is caught by the repo's byte-exact FFI integration tests instead, and by
+//! this crate's own layout assertions on [`shuttle_stats`].
 //!
 //! Everything here is `unsafe` to call. Use the `shuttle` crate for a safe
 //! interface; this one exists so that a caller who needs the raw ABI can have
@@ -42,15 +47,68 @@ pub const SHUTTLE_ERR_CORRUPT: c_int = -10;
 pub const SHUTTLE_ERR_MSG_TOO_LARGE: c_int = -11;
 pub const SHUTTLE_ERR_WOULD_BLOCK: c_int = -12;
 pub const SHUTTLE_ERR_PEER_DEAD: c_int = -13;
+/// `shuttle_create_ex` with a hugetlb bit: the explicit huge pages could not be
+/// delivered. Never a silent downgrade to normal pages.
+pub const SHUTTLE_ERR_NO_HUGEPAGES: c_int = -14;
+/// `shuttle_get_stats` on a segment created without [`SHUTTLE_CREATE_STATS`].
+pub const SHUTTLE_ERR_NO_STATS: c_int = -15;
+
+/// NOT an error, and the only POSITIVE return in this ABI (v1.3): a
+/// [`SHUTTLE_DROP_NEWEST`] write found no room and discarded the message.
+/// Only a call that opted into the flag can receive it, which is why error
+/// tests here are `rc < 0` and never `rc != SHUTTLE_OK`.
+pub const SHUTTLE_DROPPED: c_int = 1;
 
 /// Per-op flag: try-semantics instead of parking. Passed to the read/write
 /// entry points only.
 pub const SHUTTLE_NONBLOCK: c_int = 0x1;
 
+/// Per-op flag (v1.3), `shuttle_write` only: opt into the lossy drop-newest
+/// policy. Implies try-semantics; a message that does not fit is discarded and
+/// [`SHUTTLE_DROPPED`] returned. Rejected with `INVALID_ARGS` on the read and
+/// acquire paths, where there is nothing to drop.
+pub const SHUTTLE_DROP_NEWEST: c_int = 0x2;
+
 /// Create-flag (v1.1): advise transparent huge pages for the mapping. A
 /// **separate namespace** from [`SHUTTLE_NONBLOCK`] — it is only ever passed as
 /// `shuttle_create_ex`'s `create_flags`, never as a per-op `flags`.
 pub const SHUTTLE_CREATE_HUGEPAGES: u32 = 0x1;
+/// Create-flags (v1.2): back the segment with EXPLICIT reserved huge pages of
+/// the named size. Guarantee-or-error — [`SHUTTLE_ERR_NO_HUGEPAGES`] if they
+/// cannot be obtained, never a fallback to normal pages. Setting both is
+/// `INVALID_ARGS`.
+pub const SHUTTLE_CREATE_HUGETLB_2MB: u32 = 0x2;
+pub const SHUTTLE_CREATE_HUGETLB_1GB: u32 = 0x4;
+/// Create-flag (v1.2): allocate the statistics counters (segment layout
+/// version 2). Changes the LAYOUT VERSION, so a peer built before v1.2 reports
+/// [`SHUTTLE_ERR_BAD_VERSION`] rather than ignoring the bit.
+pub const SHUTTLE_CREATE_STATS: u32 = 0x8;
+/// Create-flag (v1.4): every payload span starts on a system page, so a
+/// borrowed pointer can go straight to an API that requires page-aligned host
+/// memory (`cudaHostRegister`, Metal's `newBufferWithBytesNoCopy`).
+///
+/// Two costs, both real: padding of up to `2*page - 9` bytes per message, and —
+/// like [`SHUTTLE_CREATE_STATS`] — a restriction on who can attach. The
+/// segment's `data_offset` is page-rounded, which a peer built before v1.4
+/// rejects with [`SHUTTLE_ERR_CORRUPT`]. That is deliberate: such a peer would
+/// otherwise misparse every frame.
+pub const SHUTTLE_CREATE_ALIGNED_SPANS: u32 = 0x10;
+
+/// Counter snapshot (v1.2). A plain five-`u64` record, in exactly this order —
+/// the C struct is the ABI shape, and the caller allocates it.
+///
+/// Byte counts are PAYLOAD bytes: the 8-byte frame header, and any page padding
+/// added by [`SHUTTLE_CREATE_ALIGNED_SPANS`], are transport overhead and are
+/// excluded on both sides.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct shuttle_stats {
+    pub msgs_written: u64,
+    pub bytes_written: u64,
+    pub msgs_dropped: u64,
+    pub msgs_read: u64,
+    pub bytes_read: u64,
+}
 
 /// Opaque channel handle. Never constructed on this side; only ever held
 /// behind the pointer the C layer returns.
@@ -147,4 +205,13 @@ extern "C" {
     /// Bump this side's heartbeat without transferring data. Null-safe,
     /// never fails.
     pub fn shuttle_keepalive(ch: *mut shuttle_channel);
+
+    // --- statistics (v1.2) -------------------------------------------------
+
+    /// Copy the segment's counters into `*out`. Either side may call it, and
+    /// so may a third process that merely opened the segment. Returns
+    /// `SHUTTLE_OK`, `SHUTTLE_ERR_INVALID_ARGS` (NULL argument), or
+    /// [`SHUTTLE_ERR_NO_STATS`] (segment created without
+    /// [`SHUTTLE_CREATE_STATS`]).
+    pub fn shuttle_get_stats(ch: *mut shuttle_channel, out: *mut shuttle_stats) -> c_int;
 }

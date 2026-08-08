@@ -13,6 +13,7 @@ than failing, since a missing build is not a binding bug.
     cmake -B build -S . && cmake --build build --target shuttle_c
     SHUTTLE_C_LIB=build/libshuttle_c.so pytest bindings/python/tests
 """
+import mmap
 import os
 
 import pytest
@@ -329,6 +330,235 @@ def test_context_managers_close_the_handles():
         assert consumer.closed
     assert producer.closed
     shuttle_ipc.unlink(name)
+
+
+# --- v1.2 surface: statistics ----------------------------------------------
+
+
+@pytest.fixture
+def stats_pair():
+    """A pair on a channel created with the counters (layout version 2)."""
+    name = unique_name()
+    producer = Channel.create(name, CAPACITY, MAX_PAYLOAD,
+                              flags=shuttle_ipc.CREATE_STATS)
+    consumer = Channel.open(name)
+    try:
+        yield producer, consumer
+    finally:
+        consumer.close()
+        producer.close()
+        try:
+            Channel.unlink(name)
+        except shuttle_ipc.NotFound:
+            pass
+
+
+def test_stats_roundtrip_counts_payload_bytes(stats_pair):
+    producer, consumer = stats_pair
+    messages = [os.urandom(n) for n in (1, 100, 4096, 5000)]
+
+    zero = producer.get_stats()
+    assert zero == shuttle_ipc.Stats(0, 0, 0, 0, 0)
+
+    for msg in messages:
+        producer.write(msg)
+    mid = producer.get_stats()
+    assert mid.msgs_written == len(messages)
+    assert mid.bytes_written == sum(len(m) for m in messages)
+    # Nothing has been released yet, so the read side is still at zero.
+    assert mid.msgs_read == 0 and mid.bytes_read == 0
+
+    for msg in messages:
+        with consumer.acquire_read() as view:
+            assert bytes(view) == msg
+
+    # Read from the OTHER handle: the counters live in the segment, not in the
+    # handle that wrote them.
+    final = consumer.get_stats()
+    assert final.msgs_read == len(messages)
+    assert final.bytes_read == sum(len(m) for m in messages)
+    # Payload bytes on both sides — the 8-byte frame header is excluded, so the
+    # two totals are directly comparable.
+    assert final.bytes_read == final.bytes_written
+    assert final.msgs_dropped == 0
+
+
+def test_stats_on_a_v1_segment_raises_no_stats(pair):
+    producer, _ = pair
+    with pytest.raises(shuttle_ipc.NoStats) as excinfo:
+        producer.get_stats()
+    assert excinfo.value.code == shuttle_ipc.ERR_NO_STATS == -15
+
+
+# --- v1.3 surface: drop-newest ---------------------------------------------
+
+
+def test_drop_newest_drops_instead_of_blocking():
+    """The one lossy path, and it must be visible to the caller."""
+    name = unique_name()
+    # Small ring: a couple of large messages fill it.
+    producer = Channel.create(name, 1 << 16, 1 << 15,
+                              flags=shuttle_ipc.CREATE_STATS)
+    consumer = Channel.open(name)
+    try:
+        payload = b"x" * (1 << 15)
+        written = dropped = 0
+        for _ in range(8):
+            if producer.write(payload, drop_newest=True):
+                written += 1
+            else:
+                dropped += 1
+        assert written >= 1, "nothing fit at all — the test proves nothing"
+        assert dropped >= 1, "the ring never filled — no drop was exercised"
+
+        stats = producer.get_stats()
+        assert stats.msgs_dropped == dropped
+        assert stats.msgs_written == written
+        # A drop disturbs nothing already queued: the messages that WERE
+        # accepted are all still there, intact and in order.
+        for _ in range(written):
+            assert consumer.read() == payload
+
+        # An oversized payload stays an error, not a silent drop: it could
+        # never fit in any ring state, so it is a caller bug.
+        with pytest.raises(shuttle_ipc.TooBig):
+            producer.write(b"y" * ((1 << 15) + 1), drop_newest=True)
+    finally:
+        consumer.close()
+        producer.close()
+        Channel.unlink(name)
+
+
+def test_drop_newest_rejects_a_blocking_policy_too():
+    name = unique_name()
+    with Channel.create(name, CAPACITY, MAX_PAYLOAD) as producer:
+        with pytest.raises(ValueError):
+            producer.write(b"a", drop_newest=True, nonblock=True)
+        with pytest.raises(ValueError):
+            producer.write(b"a", drop_newest=True, timeout=0.1)
+    Channel.unlink(name)
+
+
+# --- v1.4 surface: page-aligned spans --------------------------------------
+
+
+def test_aligned_spans_give_page_aligned_borrows():
+    """The whole point of the flag: an address a no-copy API will accept."""
+    name = unique_name()
+    page = mmap.PAGESIZE
+    producer = Channel.create(name, 64 * page, 4096,
+                              flags=shuttle_ipc.CREATE_ALIGNED_SPANS)
+    consumer = Channel.open(name)
+    try:
+        # Consecutive frames are page + round_up(len, page) apart — the padded
+        # stride, which is what keeps the NEXT payload aligned too.
+        strides = []
+        for length in (1, 4096):
+            producer.write(b"s" * length)
+            borrow = consumer.acquire_read()
+            strides.append(borrow.address)
+            borrow.release()
+            assert strides[-1] % page == 0
+        assert strides[1] - strides[0] == page + page  # len 1 -> two pages
+
+        for length in (0, 1, 100, 4096):
+            payload = os.urandom(length)
+            # The producer's reserved span is aligned too, not just the read.
+            reservation = producer.acquire_write(length)
+            assert reservation.address % page == 0
+            if length:
+                reservation.view[:] = payload
+            reservation.commit(length)
+
+            borrow = consumer.acquire_read()
+            try:
+                assert borrow.address % page == 0, (
+                    "payload at {:#x} is not page-aligned".format(
+                        borrow.address))
+                assert bytes(borrow.view) == payload
+            finally:
+                borrow.release()
+            # The address is a borrow-lifetime property like the view is.
+            with pytest.raises(shuttle_ipc.ShuttleError):
+                borrow.address
+    finally:
+        consumer.close()
+        producer.close()
+        Channel.unlink(name)
+
+
+def test_unaligned_channel_is_not_page_aligned():
+    """The negative control: without the flag the payload lands 8 bytes in.
+
+    Without this, the assertion above could pass on a build where the payload
+    happened to be aligned for unrelated reasons.
+    """
+    name = unique_name()
+    producer = Channel.create(name, 64 * mmap.PAGESIZE, 4096)
+    consumer = Channel.open(name)
+    try:
+        addresses = []
+        for _ in range(2):
+            producer.write(b"z" * 64)
+            borrow = consumer.acquire_read()
+            addresses.append(borrow.address)
+            borrow.release()
+        # The classic v1 data_offset (1280) is not a page multiple, so a
+        # borrow on a default channel is not page-aligned...
+        assert addresses[0] % mmap.PAGESIZE != 0
+        # ...and consecutive frames are 8 + len apart, not a padded stride.
+        assert addresses[1] - addresses[0] == 8 + 64
+    finally:
+        consumer.close()
+        producer.close()
+        Channel.unlink(name)
+
+
+def test_aligned_capacity_floor_is_the_padded_stride():
+    """FR-4 is measured in the channel's own geometry."""
+    page = mmap.PAGESIZE
+    # One frame for a (page + 1)-byte payload costs page + 2*page.
+    with pytest.raises(shuttle_ipc.CapacityTooSmall):
+        Channel.create(unique_name(), 3 * page - 1, page + 1,
+                       flags=shuttle_ipc.CREATE_ALIGNED_SPANS)
+    # The same numbers are fine without the flag: the floor moved because the
+    # framing did.
+    name = unique_name()
+    Channel.create(name, 3 * page - 1, page + 1).close()
+    Channel.unlink(name)
+
+
+def test_aligned_and_stats_compose():
+    """0x18: counters on an aligned channel still count PAYLOAD bytes."""
+    name = unique_name()
+    flags = shuttle_ipc.CREATE_ALIGNED_SPANS | shuttle_ipc.CREATE_STATS
+    producer = Channel.create(name, 64 * mmap.PAGESIZE, 4096, flags=flags)
+    consumer = Channel.open(name)
+    try:
+        lengths = (1, 4095, 4096)
+        for n in lengths:
+            producer.write(b"q" * n)
+            with consumer.acquire_read() as view:
+                assert len(view) == n
+        stats = producer.get_stats()
+        assert stats.msgs_written == stats.msgs_read == len(lengths)
+        # Not the padded stride, which would be far larger.
+        assert stats.bytes_written == sum(lengths)
+        assert stats.bytes_read == sum(lengths)
+    finally:
+        consumer.close()
+        producer.close()
+        Channel.unlink(name)
+
+
+def test_unknown_create_bits_are_masked_not_rejected():
+    """An older library must tolerate a flag it does not implement."""
+    name = unique_name()
+    with Channel.create(name, CAPACITY, MAX_PAYLOAD, flags=1 << 30) as producer:
+        producer.write(b"still works")
+        with Channel.open(name) as consumer:
+            assert consumer.read() == b"still works"
+    Channel.unlink(name)
 
 
 # --- library discovery -----------------------------------------------------

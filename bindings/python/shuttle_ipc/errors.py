@@ -22,6 +22,9 @@ __all__ = [
     "ERR_MSG_TOO_LARGE",
     "ERR_WOULD_BLOCK",
     "ERR_PEER_DEAD",
+    "ERR_NO_HUGEPAGES",
+    "ERR_NO_STATS",
+    "DROPPED",
     "ShuttleError",
     "LibraryNotFoundError",
     "InvalidArgs",
@@ -38,6 +41,8 @@ __all__ = [
     "MsgTooLarge",
     "WouldBlock",
     "PeerDead",
+    "NoHugePages",
+    "NoStats",
     "error_for_code",
     "check",
 ]
@@ -58,6 +63,14 @@ ERR_CORRUPT = -10
 ERR_MSG_TOO_LARGE = -11
 ERR_WOULD_BLOCK = -12
 ERR_PEER_DEAD = -13
+ERR_NO_HUGEPAGES = -14
+ERR_NO_STATS = -15
+
+#: SHUTTLE_DROPPED. NOT an error and not OK: the one positive return in the ABI
+#: (v1.3), produced only by a write that opted into ``DROP_NEWEST``. It is
+#: listed here beside the codes because it shares their integer space, and it is
+#: why ``check`` below tests ``rc < 0`` rather than ``rc != 0``.
+DROPPED = 1
 
 
 class ShuttleError(Exception):
@@ -173,6 +186,27 @@ class PeerDead(ShuttleError):
     code = ERR_PEER_DEAD
 
 
+class NoHugePages(ShuttleError):
+    """create: explicit huge pages were requested and cannot be delivered.
+
+    No hugetlbfs mount of that page size, no free reserved pages, no permission
+    on the mount, or a platform without hugetlbfs. There is deliberately no
+    silent fallback to normal pages — that is what ``CREATE_HUGEPAGES``
+    (advisory THP) is for.
+    """
+
+    code = ERR_NO_HUGEPAGES
+
+
+class NoStats(ShuttleError):
+    """get_stats: the segment has no counters (created without CREATE_STATS).
+
+    On such a segment those bytes are payload, so nothing may read them.
+    """
+
+    code = ERR_NO_STATS
+
+
 _MESSAGES = {
     ERR_INVALID_ARGS: "invalid arguments",
     ERR_NAME_TOO_LONG: "name too long",
@@ -187,6 +221,8 @@ _MESSAGES = {
     ERR_MSG_TOO_LARGE: "message too large",
     ERR_WOULD_BLOCK: "would block",
     ERR_PEER_DEAD: "peer dead",
+    ERR_NO_HUGEPAGES: "explicit huge pages unavailable",
+    ERR_NO_STATS: "segment has no statistics block",
 }
 
 _BY_CODE = {
@@ -203,6 +239,8 @@ _BY_CODE = {
     ERR_MSG_TOO_LARGE: TooBig,
     ERR_WOULD_BLOCK: WouldBlock,
     ERR_PEER_DEAD: PeerDead,
+    ERR_NO_HUGEPAGES: NoHugePages,
+    ERR_NO_STATS: NoStats,
 }
 
 
@@ -220,7 +258,9 @@ def check(rc, context=None):
     """Return ``rc`` if it is not an error code, else raise.
 
     Used for every int-returning entry point. ``shuttle_read`` returns a
-    non-negative length on success, so the test is strictly ``rc < 0``.
+    non-negative length on success, and a drop-newest write returns the
+    positive ``DROPPED``, so the test is strictly ``rc < 0`` — never
+    ``rc != OK``, which would count a successful drop as a failure.
     """
     if rc < 0:
         raise error_for_code(rc, context=context)

@@ -607,6 +607,38 @@ inline void advise_huge_pages(void* base, size_t len) noexcept {
 #endif
 }
 
+// The system's ordinary page size, and the alignment unit for
+// kFlagAlignedSpans (SHUTTLE_CREATE_ALIGNED_SPANS). Same-host IPC makes this a
+// HOST CONSTANT: every process that maps a given segment runs on the same
+// kernel and therefore computes the same value, which is what lets the frame
+// geometry it selects be agreed on without storing it in the segment.
+//
+// Deliberately the SYSTEM page size even on a hugetlbfs-backed segment. The
+// point of the flag is that a borrowed payload can be handed to an API that
+// wants page-aligned host memory (MTLBuffer newBufferWithBytesNoCopy,
+// cudaHostRegister); those want the ordinary page granularity, and rounding
+// every frame to 2 MB or 1 GB instead would turn a small message into a
+// huge-page-sized hole.
+//
+// GUARANTEED A POWER OF TWO. The mask arithmetic in bipbuffer.hpp
+// (round_up_page / floor_page) depends on that, so a platform that reports
+// anything else — no supported target does; POSIX effectively requires it —
+// falls back to 4096 rather than silently corrupting the geometry.
+inline size_t page_size() noexcept {
+#if defined(SHUTTLE_PLATFORM_WINDOWS)
+    SYSTEM_INFO si;
+    ::GetSystemInfo(&si);
+    const size_t ps = static_cast<size_t>(si.dwPageSize);
+    // dwPageSize, not dwAllocationGranularity: the granularity (64 KiB) is what
+    // a view's BASE is aligned to, and it is a multiple of the page size, so a
+    // page-aligned offset from a view base is still page-aligned.
+#else
+    const long raw = ::sysconf(_SC_PAGESIZE);
+    const size_t ps = raw > 0 ? static_cast<size_t>(raw) : 0;
+#endif
+    return (ps != 0 && (ps & (ps - 1)) == 0) ? ps : 4096;
+}
+
 // True where PTHREAD_MUTEX_ROBUST / EOWNERDEAD semantics exist (FR-18).
 #if defined(SHUTTLE_PLATFORM_LINUX)
 constexpr bool kHasRobustMutex = true;

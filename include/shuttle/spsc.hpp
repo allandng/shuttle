@@ -150,7 +150,14 @@ class Producer {
           // STATS GATE, resolved once: null on a v1 segment, where the stats
           // fields alias the data region and must never be touched. The hot
           // path then pays one perfectly-predictable branch per commit.
-          stats_(has_stats(ch->hdr) ? ch->hdr : nullptr) {}
+          stats_(has_stats(ch->hdr) ? ch->hdr : nullptr),
+          // FRAME-GEOMETRY GATE, resolved once from the same immutable flags
+          // word, by the same argument: 0 = the classic 8-byte framing, the
+          // page size = kFlagAlignedSpans framing (bipbuffer.hpp). Both ends of
+          // a channel read it from the segment, so creator and opener cannot
+          // disagree, and neither can be configured out of step by its caller.
+          align_(has_aligned_spans(ch->hdr) ? static_cast<uint64_t>(page_size())
+                                            : 0) {}
 
     // A3: announce liveness without transferring data. Sparse-traffic
     // producers must call this periodically or the peer may declare us dead.
@@ -178,7 +185,10 @@ class Producer {
     int try_write(const void* payload, uint64_t len) {
         if (res_active_) return kErrInvalidArgs;  // outstanding acquire owns the next span
         if (len > h_->max_payload) return kErrMsgTooLarge;
-        const uint64_t n = kFrameHeader + len;
+        // max_payload is validated at create/open to leave room for a whole
+        // frame of the channel's geometry (FR-4), so the span cannot overflow
+        // here — the guard above is what bounds it.
+        const uint64_t n = frame_span(len, align_);
         uint64_t off = 0;
         bool wrap = false;
         if (!try_reserve(n, &off, &wrap)) return kErrWouldBlock;
@@ -186,8 +196,10 @@ class Producer {
         for (unsigned i = 0; i < 8; ++i) {
             dst[i] = static_cast<unsigned char>((len >> (8 * i)) & 0xFF);
         }
-        if (len != 0) std::memcpy(dst + kFrameHeader, payload, len);
-        commit(n, off, wrap);  // P1/P2 publish
+        if (len != 0) {
+            std::memcpy(dst + frame_header_span(align_), payload, len);
+        }
+        commit(n, off, wrap, len);  // P1/P2 publish
         return kOk;
     }
 
@@ -202,7 +214,7 @@ class Producer {
         }
         for (;;) {
             if ((rc = try_write(payload, len)) != kErrWouldBlock) return rc;
-            const int prc = park_until_space(kFrameHeader + len);
+            const int prc = park_until_space(frame_span(len, align_));
             if (prc != kOk) return prc;
         }
     }
@@ -216,14 +228,17 @@ class Producer {
         if (len > h_->max_payload) return kErrMsgTooLarge;
         uint64_t off = 0;
         bool wrap = false;
-        if (!try_reserve(kFrameHeader + len, &off, &wrap)) {
+        if (!try_reserve(frame_span(len, align_), &off, &wrap)) {
             return kErrWouldBlock;
         }
         res_off_ = off;
         res_len_ = len;
         res_wrap_ = wrap;
         res_active_ = true;
-        *ptr = data_ + off + kFrameHeader;
+        // The aligned span the caller fills starts a whole page into the frame,
+        // and off is a page multiple, so this pointer is page-aligned — the
+        // producer-side mirror of what Consumer::parse hands out.
+        *ptr = data_ + off + frame_header_span(align_);
         return kOk;
     }
 
@@ -232,7 +247,7 @@ class Producer {
         for (;;) {
             if ((rc = try_acquire_write(ptr, len)) != kErrWouldBlock)
                 return rc;
-            const int prc = park_until_space(kFrameHeader + len);
+            const int prc = park_until_space(frame_span(len, align_));
             if (prc != kOk) return prc;
         }
     }
@@ -246,7 +261,11 @@ class Producer {
                 static_cast<unsigned char>((actual_len >> (8 * i)) & 0xFF);
         }
         res_active_ = false;
-        commit(kFrameHeader + actual_len, res_off_, res_wrap_);
+        // A partial commit shrinks the frame to the geometry of what was
+        // actually written (aligned mode: still a whole number of pages, so the
+        // next frame start stays aligned), exactly as the classic path shrinks
+        // it to 8 + actual_len.
+        commit(frame_span(actual_len, align_), res_off_, res_wrap_, actual_len);
         return kOk;
     }
 
@@ -347,8 +366,10 @@ class Producer {
     // Producer-owned counters: single-writer plain load+store, exactly the
     // heartbeat idiom (never an RMW — nothing else writes this line). Counted
     // at the commit that publishes the message, so a message is "written" iff
-    // the consumer can see it. Payload bytes only: n includes the frame
-    // header, which is transport overhead and not part of the caller's data.
+    // the consumer can see it. PAYLOAD bytes only — the caller's own length,
+    // passed down explicitly rather than derived from the frame span, so that
+    // an aligned channel's header page and tail padding (transport overhead,
+    // like the 8-byte header before it) are excluded exactly the same way.
     void bump_write_stats(uint64_t payload_len) {
         if (stats_ == nullptr) return;  // v1 segment: those bytes are data
         stats_->stat_msgs_written.store(
@@ -360,7 +381,7 @@ class Producer {
             std::memory_order_relaxed);
     }
 
-    void commit(uint64_t n, uint64_t off, bool wrap) {
+    void commit(uint64_t n, uint64_t off, bool wrap, uint64_t payload_len) {
         if (wrap) {
             // P2: watermark first (relaxed), sequenced before the write
             // release below — consumers acquire both atomically-in-effect.
@@ -370,7 +391,7 @@ class Producer {
         } else {
             h_->write.store(off + n, std::memory_order_release);  // P1
         }
-        bump_write_stats(n - kFrameHeader);
+        bump_write_stats(payload_len);
         wake_consumer_if_waiting();  // A4 signaler side
         bump_heartbeat();
     }
@@ -380,6 +401,7 @@ class Producer {
     uint64_t cap_;
     uint64_t stale_ns_;
     ChannelHeader* stats_;  // == h_ on a v2 segment, nullptr on v1
+    uint64_t align_;        // 0 = classic framing, page = kFlagAlignedSpans
     detail::StaleTracker peer_stale_;
     // Outstanding zero-copy reservation (process-local per A1).
     uint64_t res_off_ = 0;
@@ -398,7 +420,13 @@ class Consumer {
           stale_ns_(stale_threshold_ns),
           // Same gate as the producer's: null on v1, where those bytes are the
           // data region (see header.hpp).
-          stats_(has_stats(ch->hdr) ? ch->hdr : nullptr) {}
+          stats_(has_stats(ch->hdr) ? ch->hdr : nullptr),
+          // ...and the same frame-geometry gate, read from the same immutable
+          // flags word the producer read. Neither side is told the mode by its
+          // caller: the SEGMENT says it, which is why an opener that knows the
+          // bit parses an aligned channel correctly with no extra API.
+          align_(has_aligned_spans(ch->hdr) ? static_cast<uint64_t>(page_size())
+                                            : 0) {}
 
     // A3: announce liveness without consuming data.
     void keepalive() { bump_heartbeat(); }
@@ -445,9 +473,14 @@ class Consumer {
     // C1: publish that the borrowed message's bytes are free to reuse.
     void release() {
         const uint64_t r = h_->read.load(std::memory_order_relaxed);
+        // borrowed_ is the frame SPAN — 8 + len classically, page +
+        // round_up(len, page) in aligned mode — so the cursor always lands on
+        // the next frame start, and in aligned mode that start stays page
+        // -aligned.
         h_->read.store(r + borrowed_, std::memory_order_release);
-        bump_read_stats(borrowed_);
+        bump_read_stats();
         borrowed_ = 0;
+        borrowed_len_ = 0;
         wake_producer_if_waiting();  // A4 signaler side
         bump_heartbeat();
     }
@@ -496,17 +529,20 @@ class Consumer {
 
     // Consumer-owned counters, mirroring the producer's: single-writer plain
     // load+store, counted at the release that frees the message's bytes, and
-    // payload-only (`span` is kFrameHeader + payload). A release with no
-    // active borrow (span 0) counts nothing — the A->B handoff store of
+    // payload-only. The payload length is kept alongside the span rather than
+    // recovered from it, so the aligned framing's header page and tail padding
+    // are excluded exactly as the 8-byte header is — bytes_read stays directly
+    // comparable to bytes_written and to the lengths the caller saw. A release
+    // with no active borrow (span 0) counts nothing — the A->B handoff store of
     // read = 0 is not a message and must not be counted either.
-    void bump_read_stats(uint64_t span) {
-        if (stats_ == nullptr || span < kFrameHeader) return;
+    void bump_read_stats() {
+        if (stats_ == nullptr || borrowed_ == 0) return;
         stats_->stat_msgs_read.store(
             stats_->stat_msgs_read.load(std::memory_order_relaxed) + 1,
             std::memory_order_relaxed);
         stats_->stat_bytes_read.store(
-            stats_->stat_bytes_read.load(std::memory_order_relaxed) + span -
-                kFrameHeader,
+            stats_->stat_bytes_read.load(std::memory_order_relaxed) +
+                borrowed_len_,
             std::memory_order_relaxed);
     }
 
@@ -540,21 +576,29 @@ class Consumer {
         // The `l > max_payload` guard ahead of it already catches such an l on
         // a validated segment, but keeping this form makes the backstop a real
         // backstop rather than one that overflows in the same way (the class
-        // of bug fuzz/header_fuzz.cpp surfaced in validate_header).
-        if (l > h_->max_payload || avail < kFrameHeader ||
-            l > avail - kFrameHeader)
+        // of bug fuzz/header_fuzz.cpp surfaced in validate_header). frame_fits
+        // IS that form, for both framings (bipbuffer.hpp).
+        if (l > h_->max_payload || !frame_fits(l, avail, align_))
             return kErrCorrupt;
-        *payload = blk + kFrameHeader;
+        // Aligned mode: the header occupies the whole first page of the frame
+        // and the payload begins at the next page boundary. `at` is a frame
+        // start, hence a page multiple, and the data region itself starts
+        // page-aligned — so this pointer is page-aligned, which is the entire
+        // promise of kFlagAlignedSpans.
+        *payload = blk + frame_header_span(align_);
         *len = l;
-        borrowed_ = kFrameHeader + l;
+        borrowed_ = frame_span(l, align_);
+        borrowed_len_ = l;
         return kOk;
     }
 
     ChannelHeader* h_;
     unsigned char* data_;
-    uint64_t borrowed_ = 0;  // consumer-private span of the active borrow
+    uint64_t borrowed_ = 0;      // consumer-private span of the active borrow
+    uint64_t borrowed_len_ = 0;  // ...and its payload length (stats only)
     uint64_t stale_ns_;
     ChannelHeader* stats_;  // == h_ on a v2 segment, nullptr on v1
+    uint64_t align_;        // 0 = classic framing, page = kFlagAlignedSpans
     detail::StaleTracker peer_stale_;
 };
 

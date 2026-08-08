@@ -29,6 +29,15 @@
  * SHUTTLE_ABI_VERSION stays 1 — but READ THE NOTE ON SHUTTLE_DROPPED BELOW:
  * it is the first POSITIVE (non-error, non-zero) return in this ABI, and only
  * a call that opted into the flag can ever receive it.
+ *
+ * v1.4 adds the create-flag SHUTTLE_CREATE_ALIGNED_SPANS. It is additive in the
+ * ABI sense — one new constant, no new function, no signature and no existing
+ * semantic touched, so SHUTTLE_ABI_VERSION stays 1 — and the acquire/read
+ * entry points already hand back the span pointers it aligns. But it belongs in
+ * the same class as SHUTTLE_CREATE_STATS: it changes what is ON THE SEGMENT, so
+ * a segment created with it cannot be opened by a binary built before v1.4.
+ * That opener reports SHUTTLE_ERR_CORRUPT (not BAD_VERSION — see the flag's
+ * note below). Opting in is therefore a decision about which peers can attach.
  */
 #ifndef SHUTTLE_C_H
 #define SHUTTLE_C_H
@@ -139,6 +148,39 @@ extern "C" {
  * it the segment is the unchanged version-1 format and shuttle_get_stats
  * returns SHUTTLE_ERR_NO_STATS. */
 #define SHUTTLE_CREATE_STATS 0x8
+/* Page-aligned payload spans (v1.4). Every payload this channel carries starts
+ * on a system-page boundary, so a pointer from shuttle_acquire_read (or
+ * shuttle_acquire_write) can be handed straight to an API that requires
+ * page-aligned host memory — Metal's newBufferWithBytesNoCopy, cudaHostRegister
+ * — with no copy and no bounce buffer. No new function is needed: those calls
+ * already return the span pointers; this flag only changes where they land.
+ *
+ * Framing becomes, per message:
+ *     [8-byte length][pad to page][payload][pad to page]
+ * so the payload sits one page into the frame and the frame stride is
+ * page + round_up(len, page). The alignment unit is the SYSTEM page (4096 on
+ * every supported target), including on a hugetlbfs-backed segment — rounding
+ * small messages to 2 MB or 1 GB would be a different, much worse trade.
+ *
+ * COSTS, stated plainly:
+ *   - internal fragmentation of at most 2*page - 9 bytes per message (8183 at
+ *     page = 4096): the tail of the header page plus the payload's rounding.
+ *     capacity is spent on padding, so size the channel for the stride, not the
+ *     payload. SHUTTLE_ERR_CAPACITY_TOO_SMALL now means
+ *     capacity < page + round_up(max_payload, page).
+ *   - OLD BINARIES CANNOT OPEN THE SEGMENT. Unknown flag bits are normally
+ *     ignored, but an ignorer would misparse every frame here, so this bit is
+ *     backed by geometry: an aligned segment's data_offset is page-rounded,
+ *     which a pre-v1.4 opener rejects with SHUTTLE_ERR_CORRUPT at its header
+ *     check. Deliberate, and CORRUPT rather than BAD_VERSION is the accurate
+ *     verdict — the offset really does disagree with the layout rule that
+ *     binary knows, and no layout version was added.
+ *
+ * Composes with everything else: |SHUTTLE_CREATE_STATS (0x18) is an aligned v2
+ * segment whose byte counters still count PAYLOAD bytes, never the padded
+ * stride; |SHUTTLE_CREATE_HUGETLB_2MB and |SHUTTLE_CREATE_HUGEPAGES are legal
+ * and leave the alignment unit at the system page. */
+#define SHUTTLE_CREATE_ALIGNED_SPANS 0x10
 
 typedef struct shuttle_channel shuttle_channel;
 

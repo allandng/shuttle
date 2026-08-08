@@ -40,6 +40,11 @@ static_assert(SHUTTLE_CREATE_HUGEPAGES == shuttle::kFlagHugePages);
 static_assert(SHUTTLE_CREATE_HUGETLB_2MB == shuttle::kFlagHugeTLB2M);
 static_assert(SHUTTLE_CREATE_HUGETLB_1GB == shuttle::kFlagHugeTLB1G);
 static_assert(SHUTTLE_CREATE_STATS == shuttle::kFlagStats);
+static_assert(SHUTTLE_CREATE_ALIGNED_SPANS == shuttle::kFlagAlignedSpans);
+// It is a CREATE-flag: it must never collide with a per-op bit, which is passed
+// through the same `int flags` slot on the read/write calls.
+static_assert(SHUTTLE_CREATE_ALIGNED_SPANS !=
+              (SHUTTLE_NONBLOCK | SHUTTLE_DROP_NEWEST));
 // The C struct is the ABI shape callers allocate; it must stay a plain
 // five-u64 record in the order the C++ Stats declares.
 static_assert(sizeof(shuttle_stats) == 5 * sizeof(uint64_t));

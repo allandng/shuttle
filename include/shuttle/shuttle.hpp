@@ -83,12 +83,16 @@ struct Channel {
 // FR-1: shm_open(O_CREAT|O_EXCL) + one-shot ftruncate + mmap + header init,
 // publishing init last with a release store. Owner-only permissions (NFR-S1).
 // create_flags carries opt-in create-time bits (kFlagHugePages, kFlagStats,
-// kFlagHugeTLB2M, kFlagHugeTLB1G); unknown bits are masked off. Defaulted for
-// source-compatibility with pre-flags callers. kFlagStats additionally selects
-// the kVersionStats layout; without it the segment written is byte-for-byte the
-// v1 format as before. A hugetlb bit instead selects the segment's BACKING (a
-// hugetlbfs file) and can fail with kErrNoHugePages; setting both is
-// kErrInvalidArgs.
+// kFlagHugeTLB2M, kFlagHugeTLB1G, kFlagAlignedSpans); unknown bits are masked
+// off. Defaulted for source-compatibility with pre-flags callers. kFlagStats
+// additionally selects the kVersionStats layout; without it the segment written
+// is byte-for-byte the v1 format as before. A hugetlb bit instead selects the
+// segment's BACKING (a hugetlbfs file) and can fail with kErrNoHugePages;
+// setting both is kErrInvalidArgs. kFlagAlignedSpans changes the FRAMING —
+// every payload span starts on a system page — which also raises the FR-4
+// capacity floor to page + round_up(max_payload, page) and makes the segment
+// unopenable by a binary that predates the bit (kErrCorrupt, by design; see
+// header.hpp).
 Channel* create(const char* name, size_t capacity_bytes,
                 size_t max_payload_bytes, int* err, uint32_t create_flags = 0);
 

@@ -9,13 +9,24 @@ Blocking control mirrors the ABI: blocking is the default, ``nonblock=True``
 sets ``SHUTTLE_NONBLOCK`` (try-semantics). ``timeout=`` is a convenience layered
 on top, not an ABI feature — see ``_attempt``.
 """
+import collections
 import time
 
 from . import _ffi
-from .errors import (ERR_WOULD_BLOCK, InvalidArgs, ShuttleError, TooBig,
-                     WouldBlock, check, error_for_code)
+from .errors import (DROPPED, ERR_WOULD_BLOCK, InvalidArgs, ShuttleError,
+                     TooBig, WouldBlock, check, error_for_code)
 
-__all__ = ["Channel", "BorrowedMessage", "Reservation", "unlink"]
+__all__ = ["Channel", "BorrowedMessage", "Reservation", "Stats", "unlink"]
+
+#: Snapshot of a segment's counters (``shuttle_get_stats``, v1.2). Byte counts
+#: are PAYLOAD bytes: the 8-byte frame header — and, on a channel created with
+#: ``CREATE_ALIGNED_SPANS``, the page padding — are transport overhead and are
+#: excluded, so these are directly comparable to the lengths you passed in.
+#: Each field is individually exact and monotonic; the five are not sampled
+#: atomically, so a snapshot taken while traffic flows may show ``msgs_read``
+#: trailing ``msgs_written``.
+Stats = collections.namedtuple(
+    "Stats", "msgs_written bytes_written msgs_dropped msgs_read bytes_read")
 
 # Polling schedule for the emulated `timeout=` (see _attempt): start tight,
 # back off to a millisecond so a long timeout does not burn a core.
@@ -37,13 +48,14 @@ class _Guard:
     memoryview is invalidated and every later access raises.
     """
 
-    __slots__ = ("_channel", "_base", "_view", "_len", "_released")
+    __slots__ = ("_channel", "_base", "_view", "_len", "_released", "_address")
 
-    def __init__(self, channel, view, base, length):
+    def __init__(self, channel, view, base, length, address=0):
         self._channel = channel
         self._base = base
         self._view = view
         self._len = length
+        self._address = address
         self._released = False
 
     @property
@@ -51,6 +63,24 @@ class _Guard:
         if self._released:
             raise ShuttleError(self._stale_message)
         return self._view
+
+    @property
+    def address(self):
+        """The span's address in this process, as an integer.
+
+        The reason it is exposed: the APIs a zero-copy handoff targets take a
+        raw pointer, not a buffer object — ``cudaHostRegister``, Metal's
+        ``newBufferWithBytesNoCopy``, an ``mmap``-style ioctl. Several of them
+        also require it to be page-aligned, which is what
+        ``CREATE_ALIGNED_SPANS`` guarantees:
+
+            assert borrow.address % mmap.PAGESIZE == 0
+
+        Valid only until release, exactly like ``view``.
+        """
+        if self._released:
+            raise ShuttleError(self._stale_message)
+        return self._address
 
     def __len__(self):
         return self._len
@@ -196,26 +226,47 @@ class Channel:
 
     @classmethod
     def create(cls, name, capacity, max_payload, huge_pages=False,
-               library=None):
+               flags=0, library=None):
         """Create a new channel and return a handle on it.
 
         ``name`` must start with ``/`` (max 30 chars on macOS, 254 on Linux)
         and must not already exist. ``capacity`` must be at least
         ``max_payload + 8`` — the 8 bytes are the frame header, and the rule is
-        what makes a permanently-unsatisfiable write impossible.
+        what makes a permanently-unsatisfiable write impossible. (With
+        ``CREATE_ALIGNED_SPANS`` the floor rises to
+        ``page + round_up(max_payload, page)``, because that is what one frame
+        costs there; too small is ``CapacityTooSmall`` either way.)
 
         ``huge_pages=True`` sets ``SHUTTLE_CREATE_HUGEPAGES`` and routes through
         ``shuttle_create_ex`` (v1.1). It is advisory: it takes effect only where
         the kernel THP policy permits, and is a no-op elsewhere.
+
+        ``flags`` carries any other create-time bits, OR'd together::
+
+            from shuttle_ipc import CREATE_STATS, CREATE_ALIGNED_SPANS
+            Channel.create(name, cap, maxp,
+                           flags=CREATE_STATS | CREATE_ALIGNED_SPANS)
+
+        Two of them decide **which peers can attach**, so choose deliberately:
+        ``CREATE_STATS`` bumps the segment layout version (pre-v1.2 openers get
+        ``BadVersion``) and ``CREATE_ALIGNED_SPANS`` page-rounds the segment's
+        geometry (pre-v1.4 openers get ``Corrupt``). Unknown bits are masked off
+        by the C layer and never persisted, so passing a flag an older library
+        does not implement is not an error — it simply does nothing.
         """
         lib_ = _resolve_library(library)
         ffi = lib_.ffi
         errp = ffi.new("int*")
         cname = _encode(name)
         if huge_pages:
-            handle = lib_.lib.shuttle_create_ex(
-                cname, capacity, max_payload, _ffi.CREATE_HUGEPAGES, errp)
+            flags |= _ffi.CREATE_HUGEPAGES
+        if flags:
+            handle = lib_.lib.shuttle_create_ex(cname, capacity, max_payload,
+                                                flags, errp)
         else:
+            # Plain shuttle_create, not create_ex(..., 0, ...): identical in
+            # behavior, but it keeps the frozen v1 entry point on the default
+            # path, where the binding's own coverage is thickest.
             handle = lib_.lib.shuttle_create(cname, capacity, max_payload,
                                              errp)
         if handle == ffi.NULL:
@@ -286,12 +337,24 @@ class Channel:
 
     # --- producer side -------------------------------------------------
 
-    def write(self, data, nonblock=False, timeout=None):
+    def write(self, data, nonblock=False, timeout=None, drop_newest=False):
         """Copy path: frame and enqueue ``data`` as one message.
 
         Blocking by default (the C layer spins briefly, then parks).
         ``nonblock=True`` raises ``WouldBlock`` instead of parking.
         ``timeout=`` gives up after that many seconds, raising ``WouldBlock``.
+
+        ``drop_newest=True`` (v1.3) opts into the LOSSY policy for this one
+        call: it never parks, and a message that does not fit right now is
+        thrown away rather than reported as an error. Returns ``True`` if the
+        message was written and ``False`` if it was dropped — so a caller has to
+        look, which is the point. Nothing already queued is disturbed by a drop,
+        and the drop is counted in ``msgs_dropped`` on a ``CREATE_STATS``
+        segment. An oversized payload is still ``TooBig``: a message that could
+        never fit in any ring state is a bug, not backpressure.
+
+        Without ``drop_newest`` the return is always ``True`` — the call either
+        succeeded or raised.
         """
         handle = self._require_handle()
         # from_buffer keeps this zero-copy on the way in and gets the byte
@@ -300,9 +363,19 @@ class Channel:
         length = len(buf)
         if length == 0:
             buf = self._ffi.NULL
+        if drop_newest:
+            if nonblock or timeout is not None:
+                raise ValueError(
+                    "drop_newest already implies try-semantics; do not combine "
+                    "it with nonblock= or timeout=")
+            rc = check(
+                self._lib.shuttle_write(handle, buf, length,
+                                        _ffi.DROP_NEWEST), "write")
+            return rc != DROPPED
         self._attempt(
             lambda flags: self._lib.shuttle_write(handle, buf, length, flags),
             nonblock, timeout, "write")
+        return True
 
     def acquire_write(self, length, nonblock=False, timeout=None):
         """Zero-copy path: reserve ``length`` contiguous writable bytes.
@@ -319,7 +392,7 @@ class Channel:
                 handle, ptrp, length, flags),
             nonblock, timeout, "acquire_write")
         base = memoryview(self._ffi.buffer(ptrp[0], length))
-        res = Reservation(self, base, base, length)
+        res = Reservation(self, base, base, length, self._address_of(ptrp[0]))
         self._reservation = res
         return res
 
@@ -386,7 +459,12 @@ class Channel:
             base = memoryview(self._ffi.buffer(ptrp[0], length))
         else:
             base = memoryview(b"")
-        msg = BorrowedMessage(self, base.toreadonly(), base, length)
+        # The address comes from the pointer the ABI returned, not from the
+        # memoryview: an empty message has no buffer to take an address from,
+        # and its span is still a real (page-aligned, under
+        # CREATE_ALIGNED_SPANS) location in the segment.
+        msg = BorrowedMessage(self, base.toreadonly(), base, length,
+                              self._address_of(ptrp[0]))
         self._borrow = msg
         return msg
 
@@ -399,7 +477,27 @@ class Channel:
         check(self._lib.shuttle_release_read(self._require_handle()),
               "release_read")
 
+    # --- statistics ----------------------------------------------------
+
+    def get_stats(self):
+        """Copy out the segment's counters as a ``Stats`` tuple.
+
+        Either side may call it, and so may any third process that merely
+        opened the segment — the counters live in the segment, not the handle.
+        Raises ``NoStats`` if the channel was not created with ``CREATE_STATS``
+        (on such a segment those bytes are payload, and nothing reads them).
+        """
+        out = self._ffi.new("shuttle_stats*")
+        check(self._lib.shuttle_get_stats(self._require_handle(), out),
+              "get_stats")
+        return Stats(out.msgs_written, out.bytes_written, out.msgs_dropped,
+                     out.msgs_read, out.bytes_read)
+
     # --- internals -----------------------------------------------------
+
+    def _address_of(self, ptr):
+        """The integer address of a cdata pointer into the segment."""
+        return int(self._ffi.cast("uintptr_t", ptr))
 
     def _require_handle(self):
         if self._handle is None:

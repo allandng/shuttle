@@ -158,12 +158,19 @@ int run_driver(const char* self) {
     //   * SHUTTLE_CREATE_HUGETLB_2MB|1GB (0x2|0x4) now select an explicit
     //     hugetlbfs backing, and setting both is INVALID_ARGS by design
     //     (tests/hugetlb_test.cpp owns that contract, positive path included).
+    //   * SHUTTLE_CREATE_ALIGNED_SPANS (0x10) now changes the FRAMING and the
+    //     data_offset, so including it would make this an aligned-segment test
+    //     (tests/aligned_spans_test.cpp owns that contract).
     // The probe is therefore every genuinely unknown bit, plus the one known
-    // bit whose effect this test is about.
-    constexpr uint32_t kMaskProbe = SHUTTLE_CREATE_HUGEPAGES | 0xFFFFFFF0u;
+    // bit whose effect this test is about. It shrinks by exactly the bits that
+    // become known, and never by more: the low nibble is spelled out so a new
+    // bit cannot be waved through, and the static_assert below fails the build
+    // if a bit named here ever gains a meaning.
+    constexpr uint32_t kMaskProbe = SHUTTLE_CREATE_HUGEPAGES | 0xFFFFFFE0u;
     static_assert(
-        (kMaskProbe & (SHUTTLE_CREATE_STATS | SHUTTLE_CREATE_HUGETLB_2MB |
-                       SHUTTLE_CREATE_HUGETLB_1GB)) == 0,
+        (kMaskProbe &
+         (SHUTTLE_CREATE_STATS | SHUTTLE_CREATE_HUGETLB_2MB |
+          SHUTTLE_CREATE_HUGETLB_1GB | SHUTTLE_CREATE_ALIGNED_SPANS)) == 0,
         "probe must contain no known bit but HUGEPAGES");
     shuttle_channel* masked =
         shuttle_create_ex(mask_name, kCapacity, kMaxPayload, kMaskProbe, &err);

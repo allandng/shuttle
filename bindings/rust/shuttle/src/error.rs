@@ -50,6 +50,16 @@ pub enum Error {
     ///
     /// [`keepalive`]: crate::Producer::keepalive
     PeerDead,
+    /// `create`: explicit huge pages were requested (a `HUGETLB_*` create-flag)
+    /// and cannot be delivered — no hugetlbfs mount of that page size, no free
+    /// reserved pages, or a platform without hugetlbfs. There is deliberately
+    /// no silent fallback to normal pages.
+    NoHugePages,
+    /// `stats`: the segment has no counters, i.e. it was created without
+    /// [`CreateFlags::STATS`]. On such a segment those bytes are payload.
+    ///
+    /// [`CreateFlags::STATS`]: crate::CreateFlags::STATS
+    NoStats,
     /// A code this crate does not name. Carries the raw integer.
     Unknown(i32),
 }
@@ -72,6 +82,8 @@ impl Error {
             sys::SHUTTLE_ERR_MSG_TOO_LARGE => Error::TooBig,
             sys::SHUTTLE_ERR_WOULD_BLOCK => Error::WouldBlock,
             sys::SHUTTLE_ERR_PEER_DEAD => Error::PeerDead,
+            sys::SHUTTLE_ERR_NO_HUGEPAGES => Error::NoHugePages,
+            sys::SHUTTLE_ERR_NO_STATS => Error::NoStats,
             other => Error::Unknown(other),
         }
     }
@@ -92,6 +104,8 @@ impl Error {
             Error::TooBig => sys::SHUTTLE_ERR_MSG_TOO_LARGE,
             Error::WouldBlock => sys::SHUTTLE_ERR_WOULD_BLOCK,
             Error::PeerDead => sys::SHUTTLE_ERR_PEER_DEAD,
+            Error::NoHugePages => sys::SHUTTLE_ERR_NO_HUGEPAGES,
+            Error::NoStats => sys::SHUTTLE_ERR_NO_STATS,
             Error::Unknown(code) => code,
         }
     }
@@ -113,6 +127,8 @@ impl fmt::Display for Error {
             Error::TooBig => "message too large",
             Error::WouldBlock => "would block",
             Error::PeerDead => "peer dead",
+            Error::NoHugePages => "explicit huge pages unavailable",
+            Error::NoStats => "segment has no statistics block",
             Error::Unknown(_) => "unknown error",
         };
         write!(f, "{} (code {})", text, self.code())
@@ -125,10 +141,15 @@ impl std::error::Error for Error {}
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// Turn an `int`-returning ABI call into a `Result`.
+///
+/// Strictly `rc < 0` is the error test in this ABI, because `SHUTTLE_DROPPED`
+/// (1) is a successful, non-error outcome. This helper is used only where the
+/// call cannot produce it; [`crate::Producer::write_or_drop`] handles that
+/// return itself rather than routing it through here.
 pub(crate) fn check(rc: i32) -> Result<()> {
-    if rc == sys::SHUTTLE_OK {
-        Ok(())
-    } else {
+    if rc < 0 {
         Err(Error::from_code(rc))
+    } else {
+        Ok(())
     }
 }

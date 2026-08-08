@@ -21,17 +21,23 @@
 //   way the code under test writes it.
 //
 // REACHING kOk. Blind bytes essentially never produce a valid header: the
-// magic alone is eight exact bytes, and data_offset must hit kDataOffsetV1 or
-// kDataOffsetV2 exactly. So the input is decoded through a mode byte, and two
-// of the four modes START from a valid header and let the fuzzer perturb it —
-// structure-aware fuzzing, which is what puts the interesting near-miss
-// geometries (off-by-one capacities, saturated max_payload) within reach.
+// magic alone is eight exact bytes, and data_offset must hit the one value the
+// header's own version AND FLAGS select. So the input is decoded through a mode
+// byte, and two of the four modes START from a valid header and let the fuzzer
+// perturb it — structure-aware fuzzing, which is what puts the interesting
+// near-miss geometries (off-by-one capacities, saturated max_payload) within
+// reach. A second bit of the mode byte picks which FRAMING the seeded header
+// starts from, because since v1.4 the legal offset and the frame overhead both
+// depend on kFlagAlignedSpans.
 //
 // POSITIVE CONTROLS. A validator that rejected everything would pass every
 // safety assertion above while being completely broken, and the fuzzer would
-// happily report full coverage of it. So a hand-built valid v1 header and a
-// hand-built valid v2 header are asserted to return kOk before any fuzzing
+// happily report full coverage of it. So hand-built valid headers — v1 and v2,
+// each in both framings — are asserted to return kOk before any fuzzing
 // happens; if the accept path ever dies, the harness aborts on its first run.
+// The same block asserts the one REJECTION the aligned framing is built on: an
+// aligned geometry read under the unaligned rule (what a pre-v1.4 binary does)
+// must be kErrCorrupt, never accepted and then misparsed.
 
 #include <cstddef>
 #include <cstdint>
@@ -112,52 +118,110 @@ class Tape {
     size_t i_ = 0;
 };
 
+// The alignment unit an aligned segment's geometry is stated in. Sampled once,
+// here; everything derived from it below is spelled out longhand rather than
+// called through the library's helpers, because an oracle that shared code with
+// the thing it judges would agree with it even when both are wrong.
+uint64_t page() {
+    static const uint64_t p = static_cast<uint64_t>(shuttle::page_size());
+    return p;
+}
+
 // Overflow-safe restatement of what a kOk verdict promises. Deliberately NOT
 // written the way src/shuttle.cpp writes it — `a + b > c` in uint64 is the
 // shape that can wrap, so this uses subtraction against a checked floor.
 bool geometry_is_sound(const shuttle::ChannelHeader* h, size_t map_len) {
-    const uint64_t want = h->version == shuttle::kVersionStats
-                              ? shuttle::kDataOffsetV2
-                              : shuttle::kDataOffsetV1;
+    uint64_t want = h->version == shuttle::kVersionStats
+                        ? shuttle::kDataOffsetV2
+                        : shuttle::kDataOffsetV1;
+    // FLAGS-DEPENDENT OFFSET (v1.4). kFlagAlignedSpans rounds the data region
+    // up to a page — and rounds the FRAMING with it, so the frame-overhead term
+    // below changes too. Restated here in longhand for the same reason as the
+    // rest of this function: an oracle that called data_offset_for() and
+    // frame_fits() would agree with a wrong implementation of them.
+    const bool aligned = (h->flags & shuttle::kFlagAlignedSpans) != 0;
+    if (aligned) {
+        // round_up(want, page) on a constant — no attacker input, no overflow.
+        want = ((want + page() - 1) / page()) * page();
+    }
     if (h->data_offset != want) return false;
     if (map_len < want) return false;
     // data_offset + data_capacity <= map_len, without forming the sum.
     if (h->data_capacity > map_len - want) return false;
-    // max_payload + kFrameHeader <= data_capacity, without forming the sum.
-    if (h->data_capacity < shuttle::kFrameHeader) return false;
-    if (h->max_payload > h->data_capacity - shuttle::kFrameHeader) return false;
+    // One whole frame of the channel's own geometry must fit in data_capacity,
+    // again without forming a sum that can wrap past 2^64:
+    //   classic: 8 + max_payload            <= data_capacity
+    //   aligned: page + round_up(max, page) <= data_capacity
+    // and `round_up(max, page) <= room` is exactly `max <= room - room % page`.
+    const uint64_t overhead = aligned ? page() : shuttle::kFrameHeader;
+    if (h->data_capacity < overhead) return false;
+    const uint64_t room = h->data_capacity - overhead;
+    if (h->max_payload > (aligned ? room - room % page() : room)) return false;
     return true;
 }
 
-// Build a header that must be accepted, sized to the segment it sits in.
-void write_valid(Segment& seg, uint32_t version) {
-    const uint64_t want = version == shuttle::kVersionStats
+// The legal data_offset for a (version, aligned) pair, and the frame overhead
+// that geometry implies. Both restated locally — see geometry_is_sound.
+uint64_t want_offset(uint32_t version, bool aligned) {
+    const uint64_t base = version == shuttle::kVersionStats
                               ? shuttle::kDataOffsetV2
                               : shuttle::kDataOffsetV1;
-    FCHECK(seg.size() >= want + shuttle::kFrameHeader,
-           "control segment too small for v%u\n", version);
+    return aligned ? ((base + page() - 1) / page()) * page() : base;
+}
+
+uint64_t frame_overhead(bool aligned) {
+    return aligned ? page() : shuttle::kFrameHeader;
+}
+
+// Build a header that must be accepted, sized to the segment it sits in.
+void write_valid(Segment& seg, uint32_t version, bool aligned) {
+    const uint64_t want = want_offset(version, aligned);
+    const uint64_t overhead = frame_overhead(aligned);
+    FCHECK(seg.size() >= want + overhead,
+           "control segment too small for v%u (aligned=%d)\n", version,
+           static_cast<int>(aligned));
     shuttle::ChannelHeader* h = seg.hdr();
     h->magic = shuttle::kMagic;
     h->version = version;
-    h->flags = version == shuttle::kVersionStats ? shuttle::kFlagStats : 0u;
+    h->flags = (version == shuttle::kVersionStats ? shuttle::kFlagStats : 0u) |
+               (aligned ? shuttle::kFlagAlignedSpans : 0u);
     h->data_offset = want;
     h->data_capacity = seg.size() - want;
-    h->max_payload = h->data_capacity - shuttle::kFrameHeader;
+    const uint64_t room = h->data_capacity - overhead;
+    // The largest payload one frame of THIS geometry can carry.
+    h->max_payload = aligned ? room - room % page() : room;
 }
 
 // The reject-everything canary. Runs once, before any fuzz input is decoded.
+// Four controls, not two: the aligned framing is a second geometry rule, and a
+// validator that accepted only the classic one would otherwise look healthy.
 bool positive_controls() {
     for (const uint32_t v : {shuttle::kVersion, shuttle::kVersionStats}) {
+        for (const bool aligned : {false, true}) {
+            Segment seg(kMaxSeg);
+            write_valid(seg, v, aligned);
+            const int rc = shuttle::validate_header(seg.data(), seg.size());
+            FCHECK(rc == shuttle::kOk,
+                   "POSITIVE CONTROL FAILED: a hand-built valid v%u header "
+                   "(aligned=%d) was rejected with %d — the accept path is "
+                   "broken, so every 'rejected' verdict below proves nothing\n",
+                   v, static_cast<int>(aligned), rc);
+            FCHECK(geometry_is_sound(seg.hdr(), seg.size()),
+                   "control v%u (aligned=%d) is not sound by the harness's own "
+                   "rule\n",
+                   v, static_cast<int>(aligned));
+        }
+        // ...and the compatibility verdict the flag is BUILT on: a valid
+        // aligned header whose flag bit is cleared — which is exactly what a
+        // binary predating v1.4 sees, since it applies the unaligned rule — is
+        // corrupt, never accepted-and-misparsed.
         Segment seg(kMaxSeg);
-        write_valid(seg, v);
-        const int rc = shuttle::validate_header(seg.data(), seg.size());
-        FCHECK(rc == shuttle::kOk,
-               "POSITIVE CONTROL FAILED: a hand-built valid v%u header was "
-               "rejected with %d — the accept path is broken, so every "
-               "'rejected' verdict below proves nothing\n",
-               v, rc);
-        FCHECK(geometry_is_sound(seg.hdr(), seg.size()),
-               "control v%u header is not sound by the harness's own rule\n",
+        write_valid(seg, v, true);
+        seg.hdr()->flags &= ~shuttle::kFlagAlignedSpans;
+        FCHECK(shuttle::validate_header(seg.data(), seg.size()) ==
+                   shuttle::kErrCorrupt,
+               "an aligned v%u geometry read under the UNALIGNED rule was not "
+               "kErrCorrupt — old binaries would misparse every frame\n",
                v);
     }
     // A short mapping must be refused rather than read into.
@@ -209,8 +273,15 @@ void check_verdict(Segment& seg, size_t map_len) {
         volatile const unsigned char* d = seg.data();
         (void)d[off];
         (void)d[off + cap - 1];
-        // ...and a max_payload-sized frame fits in it.
-        (void)d[off + h->max_payload + shuttle::kFrameHeader - 1];
+        // ...and a max_payload-sized frame OF THIS CHANNEL'S GEOMETRY fits in
+        // it — the padded stride when the aligned flag is set, which is the
+        // larger claim and the one that would run off the end if the geometry
+        // rule and the framing rule ever disagreed.
+        const bool aligned = (h->flags & shuttle::kFlagAlignedSpans) != 0;
+        const uint64_t span =
+            aligned ? page() + ((h->max_payload + page() - 1) / page()) * page()
+                    : shuttle::kFrameHeader + h->max_payload;
+        (void)d[off + span - 1];
     }
 }
 
@@ -223,6 +294,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     Tape t(data, size);
     const uint8_t mode = t.u8();
+    // Second axis of the mode byte (v1.4): which FRAMING the seeded header
+    // starts from. The geometry rule is now flags-dependent, so both branches
+    // of it need a route to a header that is valid before the fuzzer pokes it.
+    const bool aligned = (mode & 4u) != 0;
 
     switch (mode & 3u) {
         case 0: {
@@ -242,17 +317,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             // wrong are always one increment away from a legal segment.
             const uint32_t version =
                 (mode & 3u) == 1 ? shuttle::kVersion : shuttle::kVersionStats;
-            const uint64_t want = version == shuttle::kVersionStats
-                                      ? shuttle::kDataOffsetV2
-                                      : shuttle::kDataOffsetV1;
+            const uint64_t want = want_offset(version, aligned);
+            const uint64_t overhead = frame_overhead(aligned);
             // Segment size drawn from the tape, but never below what the
             // control header needs — the point of this mode is to start valid.
-            const size_t room =
-                kMaxSeg - static_cast<size_t>(want) - shuttle::kFrameHeader;
+            const size_t room = kMaxSeg - static_cast<size_t>(want) -
+                                static_cast<size_t>(overhead);
             const size_t extra = t.u16() % room;
-            Segment seg(static_cast<size_t>(want) + shuttle::kFrameHeader +
-                        extra);
-            write_valid(seg, version);
+            Segment seg(static_cast<size_t>(want) +
+                        static_cast<size_t>(overhead) + extra);
+            write_valid(seg, version, aligned);
             // Pokes land only in the identity block (magic..max_payload = the
             // first 40 bytes); anything past it is cursors and lock state,
             // which validate_header does not read.
@@ -290,14 +364,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
                     break;
             }
             h->flags = t.u32();
-            // data_offset likewise: mostly one of the two legal values, so the
-            // fuzzer spends its budget on the capacity arithmetic instead.
+            // data_offset likewise: mostly one of the legal values — now three
+            // of them, since the aligned framing rounds both headers up to the
+            // same page — so the fuzzer spends its budget on the capacity
+            // arithmetic instead. flags above is fully random, so every
+            // (flags, offset) pairing including the mismatched ones is reached.
             switch ((sel >> 3) & 3u) {
                 case 0:
                     h->data_offset = shuttle::kDataOffsetV1;
                     break;
                 case 1:
                     h->data_offset = shuttle::kDataOffsetV2;
+                    break;
+                case 2:
+                    h->data_offset = want_offset(h->version, true);
                     break;
                 default:
                     h->data_offset = t.u64();

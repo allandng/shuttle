@@ -29,25 +29,33 @@ Channel* create(const char* name, size_t capacity_bytes,
         set_err(err, kErrNameTooLong);
         return nullptr;
     }
+    // Known-bits mask: every bit whose behavior has shipped. An unknown bit is
+    // masked off and therefore never persisted, so no segment in the wild
+    // carries a promise this binary did not keep.
+    const uint32_t flags =
+        create_flags & (kFlagHugePages | kFlagStats | kFlagHugeTLB2M |
+                        kFlagHugeTLB1G | kFlagAlignedSpans);
+    // Frame geometry, decided here and recorded in flags for the opener to
+    // rediscover (bipbuffer.hpp). It changes what "a whole frame" costs, so it
+    // has to be known before the FR-4 capacity rule below is applied.
+    const uint64_t page = static_cast<uint64_t>(page_size());
+    const uint64_t align = (flags & kFlagAlignedSpans) != 0 ? page : 0;
+
     // FR-4: a write that can never be satisfied must be impossible by
     // construction, or blocking backpressure would park the producer forever.
     // Written as subtraction against a checked floor, never as the sum
     // `max_payload_bytes + kFrameHeader`: that addition wraps for a
     // max_payload near 2^64 and would let this guard pass on a geometry
     // open()/validate_header now correctly reject (see validate_header's
-    // overflow note). Rejecting it here too keeps create() from minting a
-    // segment no opener will accept.
-    if (capacity_bytes < kFrameHeader ||
-        max_payload_bytes > capacity_bytes - kFrameHeader) {
+    // overflow note). frame_fits() is that subtraction form for BOTH framings —
+    // on an aligned channel the largest message costs page + round_up(max,
+    // page) bytes, not 8 + max, and a capacity that cannot hold one is just as
+    // unsatisfiable. Rejecting it here keeps create() from minting a segment no
+    // opener will accept.
+    if (!frame_fits(max_payload_bytes, capacity_bytes, align)) {
         set_err(err, kErrCapacityTooSmall);
         return nullptr;
     }
-
-    // Known-bits mask: every bit whose behavior has shipped. An unknown bit is
-    // masked off and therefore never persisted, so no segment in the wild
-    // carries a promise this binary did not keep.
-    const uint32_t flags = create_flags & (kFlagHugePages | kFlagStats |
-                                           kFlagHugeTLB2M | kFlagHugeTLB1G);
     // The two hugetlb bits select a page size, so asking for both is asking
     // for two different segments. Not maskable, not resolvable — reject.
     if ((flags & kFlagHugeTLB2M) && (flags & kFlagHugeTLB1G)) {
@@ -66,7 +74,16 @@ Channel* create(const char* name, size_t capacity_bytes,
     // orthogonal to the backing: a stats + hugetlb segment (flags 0x8|0x2) is
     // an ordinary v2 header that happens to live on hugetlbfs.
     const bool with_stats = (flags & kFlagStats) != 0;
-    const uint64_t data_offset = with_stats ? kDataOffsetV2 : kDataOffsetV1;
+    const uint32_t version = with_stats ? kVersionStats : kVersion;
+    // The version picks the header size; kFlagAlignedSpans then rounds it up to
+    // a page so the data region — and so every frame start inside it — is page
+    // aligned. Computed by the shared rule both create() and validate_header()
+    // use, which is why a segment this writes always satisfies the check the
+    // opener applies. It is ALSO what makes an aligned segment unopenable by a
+    // binary that predates the flag: 4096 is not the 1280/1536 its rule
+    // demands, so it stops at kErrCorrupt instead of misparsing every frame
+    // (deliberate; see header.hpp's kFlagAlignedSpans and docs/API.md).
+    const uint64_t data_offset = data_offset_for(version, flags, page);
 
     // hugetlbfs sizes objects in whole huge pages, so the mapping may cover
     // more than data_offset + capacity_bytes. data_capacity below still
@@ -127,7 +144,7 @@ Channel* create(const char* name, size_t capacity_bytes,
     // init_state release-store publish, and immutable after (single-init).
     auto* h = static_cast<ChannelHeader*>(base);
     h->magic = kMagic;
-    h->version = with_stats ? kVersionStats : kVersion;
+    h->version = version;
     h->flags = flags;
     h->data_offset = data_offset;
     h->data_capacity = capacity_bytes;
@@ -193,12 +210,27 @@ int validate_header(const void* base, size_t map_len) noexcept {
     // disarms Consumer::parse's `l > h_->max_payload` length guard, and a
     // forged frame length of 2^64-8 is then handed to the caller as a valid
     // span. Keep these in subtraction form.
-    const uint64_t want_offset =
-        h->version == kVersionStats ? kDataOffsetV2 : kDataOffsetV1;
+    //
+    // FLAGS-DEPENDENT GEOMETRY (v1.4). The version alone no longer names the
+    // legal offset: kFlagAlignedSpans rounds it up to a page, and rounds the
+    // frame layout with it. Reading flags here is safe and in keeping with the
+    // rest of this function — it lives in the same cold identity block as the
+    // fields above, written once before the init_state release-store, and it is
+    // read only AFTER magic and version have been accepted. An UNKNOWN flag bit
+    // is still ignored, exactly as the contract says; 0x10 is not unknown here.
+    //
+    // The deliberate consequence for a binary that predates the bit: it applies
+    // the unaligned rule, sees data_offset 4096 where it wants 1280/1536, and
+    // returns kErrCorrupt. That is the designed outcome — an ignorer would
+    // misparse every frame — and kErrCorrupt is the honest verdict, because the
+    // offset genuinely disagrees with the layout rule that binary knows. There
+    // is no kVersion bump to report instead: the header shape did not change.
+    const uint64_t page = static_cast<uint64_t>(page_size());
+    const uint64_t want_offset = data_offset_for(h->version, h->flags, page);
+    const uint64_t align = (h->flags & kFlagAlignedSpans) != 0 ? page : 0;
     if (h->data_offset != want_offset || map_len < want_offset ||
         h->data_capacity > map_len - want_offset ||
-        h->data_capacity < kFrameHeader ||
-        h->max_payload > h->data_capacity - kFrameHeader) {
+        !frame_fits(h->max_payload, h->data_capacity, align)) {
         return kErrCorrupt;
     }
     return kOk;
