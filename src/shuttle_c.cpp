@@ -25,9 +25,51 @@ static_assert(SHUTTLE_ERR_CORRUPT == shuttle::kErrCorrupt);
 static_assert(SHUTTLE_ERR_MSG_TOO_LARGE == shuttle::kErrMsgTooLarge);
 static_assert(SHUTTLE_ERR_WOULD_BLOCK == shuttle::kErrWouldBlock);
 static_assert(SHUTTLE_ERR_PEER_DEAD == shuttle::kErrPeerDead);
+static_assert(SHUTTLE_ERR_NO_HUGEPAGES == shuttle::kErrNoHugePages);
+static_assert(SHUTTLE_ERR_NO_STATS == shuttle::kErrNoStats);
+// The one positive return in the ABI (v1.3), and its per-op flag. Per-op flags
+// are their own namespace, distinct from the create-flags below.
+static_assert(SHUTTLE_DROPPED == shuttle::kDropped);
+static_assert(SHUTTLE_DROPPED > SHUTTLE_OK);  // never mistaken for success
+static_assert(SHUTTLE_NONBLOCK == shuttle::kOpNonBlock);
+static_assert(SHUTTLE_DROP_NEWEST == shuttle::kOpDropNewest);
+static_assert(SHUTTLE_NONBLOCK != SHUTTLE_DROP_NEWEST);
 // Create-flag bits are a separate namespace from the per-op flags, but the C
 // value must still track the C++ header bit exactly.
 static_assert(SHUTTLE_CREATE_HUGEPAGES == shuttle::kFlagHugePages);
+static_assert(SHUTTLE_CREATE_HUGETLB_2MB == shuttle::kFlagHugeTLB2M);
+static_assert(SHUTTLE_CREATE_HUGETLB_1GB == shuttle::kFlagHugeTLB1G);
+static_assert(SHUTTLE_CREATE_STATS == shuttle::kFlagStats);
+static_assert(SHUTTLE_CREATE_ALIGNED_SPANS == shuttle::kFlagAlignedSpans);
+static_assert(SHUTTLE_CREATE_FILE_BACKED == shuttle::kFlagFileBacked);
+// It is a CREATE-flag: it must never collide with a per-op bit, which is passed
+// through the same `int flags` slot on the read/write calls.
+static_assert(SHUTTLE_CREATE_ALIGNED_SPANS !=
+              (SHUTTLE_NONBLOCK | SHUTTLE_DROP_NEWEST));
+// shuttle_peek_next (v1.4) adds NO error code and NO flag bit — the house rule
+// asks for a mirroring assert whenever one of those arrives, and the honest
+// mirror here is that its ENTIRE return set is already asserted above. Restated
+// as one assertion so the claim is checked by the compiler rather than by prose
+// in the header: OK, WOULD_BLOCK (nothing new is committed), INVALID_ARGS (null
+// argument), CORRUPT (a length the producer could never have written).
+static_assert(SHUTTLE_OK == shuttle::kOk &&
+              SHUTTLE_ERR_WOULD_BLOCK == shuttle::kErrWouldBlock &&
+              SHUTTLE_ERR_INVALID_ARGS == shuttle::kErrInvalidArgs &&
+              SHUTTLE_ERR_CORRUPT == shuttle::kErrCorrupt);
+// The C struct is the ABI shape callers allocate; it must stay a plain
+// five-u64 record in the order the C++ Stats declares.
+static_assert(sizeof(shuttle_stats) == 5 * sizeof(uint64_t));
+static_assert(sizeof(shuttle_stats) == sizeof(shuttle::Stats));
+static_assert(offsetof(shuttle_stats, msgs_written) ==
+              offsetof(shuttle::Stats, msgs_written));
+static_assert(offsetof(shuttle_stats, bytes_written) ==
+              offsetof(shuttle::Stats, bytes_written));
+static_assert(offsetof(shuttle_stats, msgs_dropped) ==
+              offsetof(shuttle::Stats, msgs_dropped));
+static_assert(offsetof(shuttle_stats, msgs_read) ==
+              offsetof(shuttle::Stats, msgs_read));
+static_assert(offsetof(shuttle_stats, bytes_read) ==
+              offsetof(shuttle::Stats, bytes_read));
 
 struct shuttle_channel {
     shuttle::Channel* ch = nullptr;
@@ -111,6 +153,49 @@ shuttle_channel* shuttle_open(const char* name, int* err) {
     }
 }
 
+// --- file-backed lifecycle (v1.4) ------------------------------------------
+// Path-typed twins of create_ex/open/unlink. The handle they return is an
+// ordinary shuttle_channel — every other entry point in this file works on it
+// unchanged, shuttle_close included, because what differs is where the segment
+// object lives and nothing about the channel itself.
+
+shuttle_channel* shuttle_create_file(const char* path, size_t capacity_bytes,
+                                     size_t max_payload_bytes,
+                                     uint32_t create_flags, int* err) {
+    try {
+        int e = 0;
+        shuttle::Channel* ch = shuttle::create_file(
+            path, capacity_bytes, max_payload_bytes, &e, create_flags);
+        set_err(err, e);
+        if (ch == nullptr) return nullptr;
+        return new shuttle_channel{ch, nullptr, nullptr, nullptr, 0, false};
+    } catch (...) {
+        set_err(err, SHUTTLE_ERR_SYS);
+        return nullptr;
+    }
+}
+
+shuttle_channel* shuttle_open_file(const char* path, int* err) {
+    try {
+        int e = 0;
+        shuttle::Channel* ch = shuttle::open_file(path, &e);
+        set_err(err, e);
+        if (ch == nullptr) return nullptr;
+        return new shuttle_channel{ch, nullptr, nullptr, nullptr, 0, false};
+    } catch (...) {
+        set_err(err, SHUTTLE_ERR_SYS);
+        return nullptr;
+    }
+}
+
+int shuttle_unlink_file(const char* path) {
+    try {
+        return shuttle::unlink_file(path);
+    } catch (...) {
+        return SHUTTLE_ERR_SYS;
+    }
+}
+
 void shuttle_close(shuttle_channel* ch) {
     if (ch == nullptr) return;
     try {
@@ -136,6 +221,22 @@ int shuttle_write(shuttle_channel* ch, const void* data, size_t len,
         return SHUTTLE_ERR_INVALID_ARGS;
     try {
         shuttle::Producer* p = producer(ch);
+        // Opt-in lossy policy (SHUTTLE_DROP_NEWEST). It implies try-semantics,
+        // so it takes the SAME try path as SHUTTLE_NONBLOCK and can never park
+        // — including when the consumer is parked or dead. All it changes is
+        // the verdict on a full ring: instead of reporting kErrWouldBlock back
+        // to the caller, the message is discarded here and counted. Note what
+        // is NOT done: no cursor is moved, nothing queued is overwritten, and
+        // the consumer is not touched, so a drop is invisible to the peer.
+        // Every other outcome (kOk, kErrMsgTooLarge for a payload that could
+        // never fit, kErrInvalidArgs for an outstanding reservation) passes
+        // through unchanged — those are caller bugs, not backpressure.
+        if ((flags & SHUTTLE_DROP_NEWEST) != 0) {
+            const int rc = p->try_write(data, len);
+            if (rc != shuttle::kErrWouldBlock) return rc;
+            p->count_drop();
+            return SHUTTLE_DROPPED;
+        }
         return (flags & SHUTTLE_NONBLOCK) != 0 ? p->try_write(data, len)
                                                : p->write(data, len);
     } catch (...) {
@@ -146,6 +247,11 @@ int shuttle_write(shuttle_channel* ch, const void* data, size_t len,
 long shuttle_read(shuttle_channel* ch, void* out, size_t cap, int flags) {
     if (ch == nullptr || (out == nullptr && cap != 0))
         return SHUTTLE_ERR_INVALID_ARGS;
+    // A drop policy is meaningless on a read: there is no message of ours to
+    // throw away, and discarding a QUEUED message would be the producer
+    // overwrite semantics this package explicitly rejects. Refuse rather than
+    // ignore, so a caller who mixed up the flags learns immediately.
+    if ((flags & SHUTTLE_DROP_NEWEST) != 0) return SHUTTLE_ERR_INVALID_ARGS;
     try {
         const int rc = ensure_borrow(ch, flags);
         if (rc != SHUTTLE_OK) return rc;
@@ -164,6 +270,12 @@ long shuttle_read(shuttle_channel* ch, void* out, size_t cap, int flags) {
 int shuttle_acquire_write(shuttle_channel* ch, void** ptr, size_t len,
                           int flags) {
     if (ch == nullptr || ptr == nullptr) return SHUTTLE_ERR_INVALID_ARGS;
+    // Not valid here either. A reservation has no payload yet, so there is
+    // nothing a drop could discard; the caller wanting try-semantics wants
+    // SHUTTLE_NONBLOCK, and the caller wanting the lossy copy path wants
+    // shuttle_write. (Drop-on-acquire would also have to unwind a reservation
+    // the caller may still be about to fill.)
+    if ((flags & SHUTTLE_DROP_NEWEST) != 0) return SHUTTLE_ERR_INVALID_ARGS;
     try {
         shuttle::Producer* p = producer(ch);
         return (flags & SHUTTLE_NONBLOCK) != 0 ? p->try_acquire_write(ptr, len)
@@ -186,11 +298,40 @@ int shuttle_acquire_read(shuttle_channel* ch, const void** ptr, size_t* len,
                          int flags) {
     if (ch == nullptr || ptr == nullptr || len == nullptr)
         return SHUTTLE_ERR_INVALID_ARGS;
+    if ((flags & SHUTTLE_DROP_NEWEST) != 0)  // consumer side: see shuttle_read
+        return SHUTTLE_ERR_INVALID_ARGS;
     try {
         const int rc = ensure_borrow(ch, flags);
         if (rc != SHUTTLE_OK) return rc;
         *ptr = ch->borrow_ptr;
         *len = static_cast<size_t>(ch->borrow_len);
+        return SHUTTLE_OK;
+    } catch (...) {
+        return SHUTTLE_ERR_SYS;
+    }
+}
+
+// v1.4 additive: read-only lookahead at the next UN-BORROWED message.
+//
+// It deliberately does NOT consult ch->borrow_active or ch->borrow_len. Those
+// cache what THIS layer handed out; the position peek must report on is the one
+// the Consumer knows — `read + borrowed_`, where borrowed_ is the span of the
+// borrow the Consumer itself is holding (spsc.hpp). Those two agree by
+// construction: ensure_borrow only ever sets borrow_active after a Consumer
+// read that set borrowed_, and shuttle_release_read clears both. So a peek with
+// a borrow outstanding looks past that borrow, and a peek without one looks at
+// the head of the queue, with no accounting of our own to keep in step.
+//
+// Like every other consumer-side entry point, calling it binds this handle's
+// consumer role (lazily constructing the Consumer) — peeking is something only
+// a consumer can do.
+int shuttle_peek_next(shuttle_channel* ch, size_t* len_out) {
+    if (ch == nullptr || len_out == nullptr) return SHUTTLE_ERR_INVALID_ARGS;
+    try {
+        uint64_t len = 0;
+        const int rc = consumer(ch)->peek_next(&len);
+        if (rc != SHUTTLE_OK) return rc;
+        *len_out = static_cast<size_t>(len);
         return SHUTTLE_OK;
     } catch (...) {
         return SHUTTLE_ERR_SYS;
@@ -205,6 +346,23 @@ int shuttle_release_read(shuttle_channel* ch) {
         ch->borrow_active = false;
         ch->borrow_ptr = nullptr;
         ch->borrow_len = 0;
+        return SHUTTLE_OK;
+    } catch (...) {
+        return SHUTTLE_ERR_SYS;
+    }
+}
+
+int shuttle_get_stats(shuttle_channel* ch, shuttle_stats* out) {
+    if (ch == nullptr || out == nullptr) return SHUTTLE_ERR_INVALID_ARGS;
+    try {
+        shuttle::Stats s{};
+        const int rc = shuttle::get_stats(ch->ch, s);
+        if (rc != shuttle::kOk) return rc;
+        out->msgs_written = s.msgs_written;
+        out->bytes_written = s.bytes_written;
+        out->msgs_dropped = s.msgs_dropped;
+        out->msgs_read = s.msgs_read;
+        out->bytes_read = s.bytes_read;
         return SHUTTLE_OK;
     } catch (...) {
         return SHUTTLE_ERR_SYS;

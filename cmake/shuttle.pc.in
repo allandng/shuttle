@@ -1,0 +1,12 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=@SHUTTLE_PC_LIBDIR@
+includedir=@SHUTTLE_PC_INCLUDEDIR@
+
+Name: shuttle
+Description: A zero-copy shared-memory IPC framework for local AI workloads
+URL: https://github.com/allandng/shuttle
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lshuttle_c
+Libs.private: -lpthread
+Cflags: -I${includedir}

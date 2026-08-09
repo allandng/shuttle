@@ -41,7 +41,7 @@ int run_crasher(const char* name) {
     shuttle::Producer p(ch);
     static const char kMarker[] = "marker";
     if (p.write(kMarker, sizeof(kMarker)) != shuttle::kOk) return 1;
-    if (shuttle::park_mutex_lock(&ch->hdr->lock) != 0) {
+    if (shuttle::park_mutex_lock(&ch->hdr->park.lock) != 0) {
         std::fprintf(stderr, "crasher: mutex lock failed\n");
         return 1;
     }
@@ -160,11 +160,11 @@ int run_driver(const char* self) {
     // Where robust mutexes exist, the orphaned lock must be recoverable
     // and serviceable afterward — not poisoned.
     if (shuttle::kHasRobustMutex) {
-        if (shuttle::park_mutex_lock(&ch->hdr->lock) != 0) {
+        if (shuttle::park_mutex_lock(&ch->hdr->park.lock) != 0) {
             std::fprintf(stderr, "driver: post-crash mutex unusable\n");
             ++fails;
         } else {
-            shuttle::park_mutex_unlock(&ch->hdr->lock);
+            shuttle::park_mutex_unlock(&ch->hdr->park.lock);
         }
     }
     shuttle::close(ch);

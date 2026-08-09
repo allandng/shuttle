@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "shuttle-ipc"
+version = "1.1.0"
+description = "Python bindings for Shuttle, a zero-copy shared-memory SPSC IPC library (C ABI v1.1)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "../../LICENSE" }
+keywords = ["ipc", "shared-memory", "zero-copy", "spsc", "cffi"]
+dependencies = ["cffi>=1.15"]
+
+classifiers = [
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Networking",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["shuttle_ipc"]
+
+[tool.hatch.build.targets.sdist]
+include = ["shuttle_ipc", "tests", "README.md", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

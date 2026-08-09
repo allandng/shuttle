@@ -27,14 +27,21 @@ int main(int argc, char** argv) {
         close(fd);
         return 1;
     }
-    if (st.st_size < static_cast<off_t>(sizeof(shuttle::ChannelHeader))) {
+    // The v1 header is the smallest thing that can still be a channel, so that
+    // is the bar; a v1 segment must keep dumping cleanly now that
+    // sizeof(ChannelHeader) is the LARGER v2 size. Map no more than the object
+    // actually has — mapping past the end would fault on first touch.
+    if (st.st_size < static_cast<off_t>(shuttle::kDataOffsetV1)) {
         std::fprintf(stderr, "segment too small for a header (%lld bytes)\n",
                      static_cast<long long>(st.st_size));
         close(fd);
         return 1;
     }
-    void* p = mmap(nullptr, sizeof(shuttle::ChannelHeader), PROT_READ,
-                   MAP_SHARED, fd, 0);
+    const size_t map_len =
+        static_cast<uint64_t>(st.st_size) < shuttle::kDataOffsetV2
+            ? static_cast<size_t>(st.st_size)
+            : static_cast<size_t>(shuttle::kDataOffsetV2);
+    void* p = mmap(nullptr, map_len, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
     if (p == MAP_FAILED) {
         std::perror("mmap");
@@ -70,6 +77,22 @@ int main(int argc, char** argv) {
                 "\n",
                 h->producer_heartbeat.load(std::memory_order_relaxed),
                 h->consumer_heartbeat.load(std::memory_order_relaxed));
-    munmap(p, sizeof(shuttle::ChannelHeader));
+    // Stats block: present only in a kVersionStats segment. Guarded by the
+    // mapped length as well as the version, because this tool does not
+    // validate — a garbage version word must not make it read past the map.
+    if (shuttle::has_stats(h) && map_len >= shuttle::kDataOffsetV2) {
+        std::printf("stats (v%" PRIu32 " block)\n", shuttle::kVersionStats);
+        std::printf("  msgs_written     %" PRIu64 "   bytes_written %" PRIu64
+                    "\n",
+                    h->stat_msgs_written.load(std::memory_order_relaxed),
+                    h->stat_bytes_written.load(std::memory_order_relaxed));
+        std::printf("  msgs_dropped     %" PRIu64 " (reserved)\n",
+                    h->stat_msgs_dropped.load(std::memory_order_relaxed));
+        std::printf("  msgs_read        %" PRIu64 "   bytes_read    %" PRIu64
+                    "\n",
+                    h->stat_msgs_read.load(std::memory_order_relaxed),
+                    h->stat_bytes_read.load(std::memory_order_relaxed));
+    }
+    munmap(p, map_len);
     return 0;
 }

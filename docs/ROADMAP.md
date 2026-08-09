@@ -29,25 +29,148 @@ Shipped and tested; listed here because they are frequently proposed as
   disallows it, never a correctness dependency. The flag is recorded in the
   segment header so the opener advises its own mapping too. Unknown create-flag
   bits are masked.
+- **Explicit hugetlbfs pages.** `shuttle_create_ex` with
+  `SHUTTLE_CREATE_HUGETLB_2MB` / `_1GB` puts the segment in *reserved* huge
+  pages: the object becomes a file on a hugetlbfs mount of that page size,
+  discovered by parsing `/proc/mounts` (a mount without `pagesize=` is resolved
+  against `/proc/meminfo`'s `Hugepagesize`). Unlike THP this is a guarantee or
+  an error — no mount, no free pages, or macOS all yield
+  `SHUTTLE_ERR_NO_HUGEPAGES` (-14) and create nothing. **Never a silent
+  fallback to normal pages**; that distinction is the entire point of the flag.
+  Openers need no flag and no `MAP_HUGETLB`: `shuttle_open` probes both
+  namespaces, and a `MAP_SHARED` mapping of a hugetlbfs file is huge-page
+  backed because the file says so.
+
+  Honest caveat about testing: the **positive** path runs only on a host where
+  an operator has reserved pages and mounted hugetlbfs, so CI (and any shared
+  runner) exercises the **error** path instead — `tests/hugetlb_test.cpp`
+  asserts the exact `-14`, the both-bits-set rejection, and that a failed
+  create leaves nothing in either namespace, then prints `SKIP` and exits 0.
+  The positive path was verified on a host with `vm.nr_hugepages=64` and a
+  2 MB hugetlbfs mount (cross-process open, byte-exact transfer,
+  `KernelPageSize: 2048 kB` observed in `/proc/self/smaps` on both sides);
+  it is not verified by every run. `MADV_COLLAPSE` was deliberately **not**
+  implemented: it collapses normal pages into THP, which is redundant once the
+  mapping is on explicitly reserved huge pages.
+
+- **Experimental Windows backend (compile + smoke, NOT parity).** A third
+  platform branch in `include/shuttle/platform.hpp` implements the seam with
+  Win32: `CreateFileMappingW(INVALID_HANDLE_VALUE, …)` named pagefile sections
+  for the segment, `MapViewOfFile`/`UnmapViewOfFile` for mapping, and
+  `WaitOnAddress`/`WakeByAddressAll` for park/wake (replacing the futex/condvar
+  and `os_sync_wait_on_address` paths). Every Win32 `#ifdef` stays inside the
+  seam — the repo's one platform rule holds. The header carries no pthread type
+  either: the park block is now a seam-defined `ParkArea` (three pthread members
+  in the frozen order on POSIX, an inert placeholder on Windows), so the POSIX
+  v1/v2 offsets and `data_offset` are byte-for-byte unchanged (a hard-coded
+  compile-time tripwire in `header.hpp` guards it).
+
+  A `windows-latest` MSVC CI job builds `shuttle_c` + `shuttle_core` + the
+  pure-logic BipBuffer tests and runs `tests/windows_smoke.cpp` — a
+  threads-in-one-process round-trip (copy and zero-copy borrow paths) plus a
+  `CreateProcess` two-process echo across a named section. **Honest caveats,
+  because this is where Windows is NOT at parity:**
+
+  - **No robust-mutex crash recovery.** Windows has no `PTHREAD_MUTEX_ROBUST`
+    equivalent surfaced here. As on macOS, `WaitOnAddress` holds nothing a dying
+    process could orphan, and **heartbeat liveness is the crash story** — but the
+    SIGKILL / `posix_spawn` multi-process gate suite (crash_mutex, robust_mutex,
+    crash_heartbeat, crash_leak) is **POSIX-only** and does not run on Windows.
+  - **No `unlink`.** A Windows named section is refcounted and vanishes with its
+    **last handle** — there is no `shm_unlink`. The creator therefore RETAINS the
+    section handle in the `Channel` for the channel's life, and `close()` is what
+    reclaims the name. `seg_unlink` reports existence only.
+  - **Data offset differs.** Segments never cross an OS, so the Windows `ParkArea`
+    footprint (and thus `data_offset`) is derived independently and is smaller
+    than the POSIX 1280/1536; it is single-OS and needs no cross-platform match.
+  - **No FFI, no performance claim.** The Python/Rust FFI gates and all
+    latency/CPU gates are POSIX-only.
+
+  This is a reviewable starting point behind the seam, not a supported surface.
+
+- **Configurable backpressure: the drop-newest policy.** `shuttle_write` accepts
+  the per-op flag `SHUTTLE_DROP_NEWEST` (`0x2`): on a full ring the message is
+  discarded instead of blocking, and the call returns the new positive
+  `SHUTTLE_DROPPED` (`1`) — the first non-negative-non-zero return in the ABI,
+  which is why the documentation now says to test errors as `rc < 0`. Strictly
+  **per call**: no create-flag, no channel mode, no fallback path, so
+  "backpressure, never drops" remains the default and the guarantee. It implies
+  try-semantics (it can never park, even against a dead consumer), it never
+  touches anything already queued, oversize payloads still fail with
+  `MSG_TOO_LARGE` rather than being disguised as backpressure, and it is refused
+  with `INVALID_ARGS` on the read/acquire paths where there is nothing to drop.
+  Drops increment `msgs_dropped` on a `SHUTTLE_CREATE_STATS` segment; on a v1
+  segment the drop still happens, uncounted. See `tests/drop_policy_test.cpp`.
+
+  **Overwrite-oldest is rejected for v1.x**, and not on taste. Making the
+  producer discard the oldest queued message would require it to:
+
+  1. **advance `read`** — the consumer's cursor. Strict single-writer ownership
+     of `write`/`watermark` (producer) and `read` (consumer) is the premise
+     every memory-ordering proof in `spsc.hpp` rests on: it is what lets each
+     store be a plain store rather than an RMW, and what makes a stale read of
+     the peer's cursor merely conservative instead of unsound. A second writer
+     to `read` invalidates all of it, C2's handoff argument first.
+  2. **invalidate a borrow that is legally outstanding.** `[read, read +
+     borrowed)` is a live pointer the consumer is allowed to be dereferencing;
+     the zero-copy contract says those bytes stay valid until release. A
+     producer reclaiming them turns the headline feature into a use-after-free
+     that no API rule could make the consumer's fault.
+  3. **parse frame headers it does not own,** racing the consumer, to find where
+     the oldest message ends — reading data-region bytes whose framing is only
+     stable because exactly one side advances each cursor.
+
+  A sound freshness story needs none of that, and needs no library change:
+  **consumer drain-to-latest** — read and release in a loop while messages are
+  available, keep the last one. The consumer is the side that knows what it is
+  behind on, it is only doing what a consumer always does, and backpressure
+  still protects the ring if it stops draining. It is documented as the
+  recommended pattern in `docs/API.md`.
+
+## Shipped in v1.4
+
+Listed for the same reason as "Already in v1": these were never proposed here,
+they landed directly, and without a line in this file a reader would reasonably
+propose them as future work. All three are opt-in, additive to the frozen ABI,
+and documented in [API.md](API.md); measurements are in
+[EXPERIMENTS.md](EXPERIMENTS.md).
+
+- **Page-aligned payload spans** (`SHUTTLE_CREATE_ALIGNED_SPANS`, `0x10`). Every
+  payload span starts on a system page, so a borrowed pointer can go straight
+  to `cudaHostRegister` or `newBufferWithBytesNoCopy`. Paid for in internal
+  fragmentation, and deliberately backed by geometry rather than by the
+  ignore-unknown-bits rule: an aligned segment's page-rounded `data_offset` is
+  what makes a pre-v1.4 binary refuse it (`CORRUPT`, by design).
+- **File-backed channels** (`shuttle_create_file` / `shuttle_open_file` /
+  `shuttle_unlink_file`). The segment lives in a file at a path you choose, so
+  capacity is bounded by the filesystem instead of by RAM or `/dev/shm`. The
+  crash story was re-argued rather than assumed — robust-mutex `EOWNERDEAD`
+  recovery is *observed* on a file mapping, not inferred. **Durability stays an
+  explicit non-goal** (no `msync`, ever, on this path); a persistence use case
+  would need its own design.
+- **Peek and prefetch** (`shuttle_peek_next`, plus automatic `MADV_WILLNEED` on
+  file-backed channels). Peek is the read-only lookahead that makes pipelined
+  consumption possible under strict release-before-acquire borrows. The
+  prefetch hint is advisory and carries an honest caveat: on the one host it
+  has been measured on it is **not** a speedup (E4 in EXPERIMENTS.md), and it
+  is documented that way rather than sold.
 
 ## v1.x candidates
 
 Plausible next steps; each carries a caveat that keeps it out of v1.
-
-- **Explicit hugetlbfs pages.** Reserved 2 MB / 1 GB pages (optionally
-  `MADV_COLLAPSE`) for guaranteed large-page backing rather than THP's advisory
-  best-effort. Needs dedicated hardware with reserved huge pages to test — CI
-  shared runners cannot provide it.
 - **Stats counters in the shared header.** Message/byte counters surfaced
   through the inspect tool. Touches the frozen segment layout, so it needs
   versioning care (the layout freeze is an ABI contract).
-- **Configurable backpressure policies.** Lossy drop/overwrite modes for callers
-  that prefer freshness over completeness. Must be **strictly opt-in**:
-  never-drops is a v1 guarantee, so any lossy mode is an explicit,
-  separately-selected policy — never a default or a silent fallback.
 - **Bare-metal Linux benchmark run.** Convert the provisional headline latency
   claim into a final one by measuring on controlled hardware (shared CI runners
-  produce arbitrary numbers and cannot settle a percentile claim).
+  produce arbitrary numbers and cannot settle a percentile claim). A virtualized
+  Linux x86_64 data point now exists — cloud container, 4 vCPU, glibc,
+  unsanitized `-O2`, 2026-08-08: 62.3 µs median (p99 97.1 µs) for the 50 MB
+  blob, 101×/355× over UDS/HTTP, 5.5 GB/s on the 16 KB stream, re-confirmed
+  against the v1.4 tree at 63.5 µs median (E1 in [EXPERIMENTS.md](EXPERIMENTS.md)).
+  That is a shared virtual machine, so it does not settle the claim; bare metal
+  remains the missing piece. The re-run also showed the p99 is not stable enough
+  on that host to quote, which is itself an argument for the controlled box.
 
 ## Exploratory / v2
 
@@ -56,6 +179,29 @@ committed.
 
 - **CUDA IPC / GPU-direct interop.** Let GPU-bound payloads move without a
   CPU-RAM round-trip, for pipelines where both ends already live on the device.
-- **Windows named shared memory.** A `CreateFileMapping`-based platform seam
-  alongside the current POSIX one. v1 is Linux + macOS only; Windows is a whole
-  new backend, not a port.
+  An **experimental, opt-in module now exists in the tree** as a first sketch of
+  this direction — `include/shuttle/shuttle_cuda.h`, `src/shuttle_cuda.cpp`,
+  design in [docs/CUDA_DESIGN.md](CUDA_DESIGN.md). The idea: GPU data never
+  rides the channel; instead the producer sends a small fixed-layout
+  **descriptor** (the opaque 64-byte `cudaIpcMemHandle_t`, device id, offset,
+  length, optional event handle) as an ordinary Shuttle message, and the
+  consumer opens it with `cudaIpcOpenMemHandle` and reads device memory
+  directly. The descriptor codec is **pure host code** (the handle is just
+  bytes), so it is fully unit-tested here — `tests/cuda_desc_test.cpp`, built and
+  run on every platform, no CUDA required. The device glue is compile-guarded
+  behind `-DSHUTTLE_CUDA=ON` and has **never run**: there is no GPU in CI, so a
+  compile-only job proves only that the glue is well-formed against the CUDA
+  headers. **Nothing about actual cross-process device visibility, event
+  synchronization, or performance is proven.** This is a research sketch, not a
+  supported surface, and explicitly not part of the v1 ABI — the design doc
+  keeps the precise proven-vs-unproven ledger. It stays in v2 exactly because
+  the hard part (the borrow-vs-kernel lifetime race, real multi-GPU behavior)
+  cannot be settled without hardware.
+- **Windows to parity.** The experimental `CreateFileMappingW` + `WaitOnAddress`
+  backend now exists behind the seam and is compile- + smoke-tested in CI (see
+  "Landing in this change"). Getting it to *parity* is the open v2 work, and the
+  hard part is exactly what the smoke job cannot touch: a crash-recovery story as
+  strong as Linux's robust mutex (Windows has no equivalent, so this likely means
+  leaning harder on heartbeat liveness and proving it under a Windows-native
+  process-kill harness), and porting the multi-process gate suite off
+  `posix_spawn`. Until then Windows stays experimental, not supported.

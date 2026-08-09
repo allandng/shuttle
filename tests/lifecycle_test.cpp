@@ -68,16 +68,20 @@ int run_driver(const char* self) {
         ++fails;
     }
 
-    // Bump the version in the live header; a fresh open must now report the
-    // distinct mismatch error.
-    ch->hdr->version = shuttle::kVersion + 1;
+    // Bump the version in the live header to one no binary knows; a fresh open
+    // must now report the distinct mismatch error. It must be past the LAST
+    // known version, not kVersion + 1: version 2 is the opt-in stats layout,
+    // and poking it onto a v1 header produces a version/geometry disagreement,
+    // which open() reports as kErrCorrupt (see stats_test case (d)) — a
+    // different, equally deliberate verdict from the one this case is about.
+    ch->hdr->version = shuttle::kVersionStats + 1;
     rc = shuttle_test::run_child_sync(self, "opener-badver", name, nullptr,
                                       kChildTimeoutNs);
     if (rc != 0) {
         std::fprintf(stderr, "FAIL: opener-badver child rc=%d\n", rc);
         ++fails;
     }
-    ch->hdr->version = shuttle::kVersion;
+    ch->hdr->version = shuttle::kVersion;  // restore before close/unlink
 
     shuttle::close(ch);
     if (shuttle::unlink(name) != shuttle::kOk) {

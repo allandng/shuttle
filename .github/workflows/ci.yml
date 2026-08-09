@@ -1,5 +1,7 @@
-# Linux CI: builds and runs the correctness suite natively on glibc x86_64
-# runners, under ASan/UBSan and TSan.
+# CI: builds and runs the correctness suite on both supported platforms —
+# natively on glibc x86_64 runners (g++) and on macOS runners (Apple clang) —
+# under ASan/UBSan and TSan. Same four legs the local `make` harness runs
+# (test-mac / tsan-mac / test-linux / tsan-linux), minus the container.
 #
 # Performance-MEASUREMENT tests are excluded here (-E filter below): they
 # assert latency percentiles / CPU ratios that are only meaningful on
@@ -52,3 +54,227 @@ jobs:
           cmake --build build/ci-tsan -j
       - name: Test
         run: ctest --test-dir build/ci-tsan --output-on-failure -E "$PERF_TESTS"
+
+  # macOS legs: the second platform of the two-platform harness, run natively
+  # (Apple clang; no container involved — Docker is not available on GitHub's
+  # macOS runners, and these jobs do not need it).
+  #
+  # Runner-image requirement: the macOS park path uses os_sync_wait_on_address,
+  # which is macOS 14.4+ only. `macos-latest` is currently a macOS 14/15 image,
+  # so it satisfies that. If these jobs ever fail to COMPILE with a missing
+  # <os/os_sync_wait_on_address.h> or an unavailable-API error, suspect a
+  # runner-image downgrade below 14.4 and pin an explicit `macos-15`-style
+  # label rather than working around it in the source.
+  #
+  # Flake triage: shared macOS runners are noisier than the Linux ones, and the
+  # timing-sensitive correctness tests are the first suspects — of the ones the
+  # PERF_TESTS filter still leaves running, the park/wake pair
+  # (shuttle_park_idle_test, shuttle_park_hotpath_test) asserts on idle CPU and
+  # on the peer actually parking, so it is the most sensitive to a noisy
+  # neighbour. Deliberately NOT excluded: these legs filter out exactly the
+  # perf-MEASUREMENT set above, on mac the same as on Linux.
+  macos-asan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        # The image already ships Apple clang, cmake, python3 and rustc; only
+        # cffi (needed by the C ABI Python FFI tests) is missing.
+        #
+        # `python3 -m pip` rather than `pip3`: the tests spawn plain `python3`
+        # from PATH, and -m pip guarantees the package lands in *that*
+        # interpreter. `--break-system-packages` because the image's python3 is
+        # Homebrew's, which is PEP 668 externally-managed and refuses a bare
+        # install; its pip is new enough (>= 23.0) for the flag. Kept as one
+        # unconditional command with no `|| pip3 install --user cffi` fallback
+        # so a future image change fails loudly here instead of silently
+        # installing into an interpreter the tests never see.
+        run: python3 -m pip install --break-system-packages cffi
+      - name: Configure + build (ASan/UBSan)
+        run: |
+          cmake -B build/ci-asan -DSHUTTLE_SAN=asan
+          cmake --build build/ci-asan -j
+      - name: Test
+        run: ctest --test-dir build/ci-asan --output-on-failure -E "$PERF_TESTS"
+
+  macos-tsan:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        # See the macos-asan job for why this exact pip invocation.
+        run: python3 -m pip install --break-system-packages cffi
+      # No ASLR-entropy workaround here: that one is specific to gcc TSan on
+      # Ubuntu 24.04. Apple clang's TSan runs as-is, same as `make tsan-mac`.
+      - name: Configure + build (TSan)
+        run: |
+          cmake -B build/ci-tsan -DSHUTTLE_SAN=tsan
+          cmake --build build/ci-tsan -j
+      - name: Test
+        run: ctest --test-dir build/ci-tsan --output-on-failure -E "$PERF_TESTS"
+
+  # Fuzz smoke: a MINUTE of libFuzzer per harness, not a campaign. The point is
+  # to keep the two harnesses building and running against every change — a
+  # harness that silently stops compiling is worse than no harness — and to
+  # catch the regressions that are cheap to find, which in practice means the
+  # ones a minute of coverage-guided mutation reaches from an empty corpus. No
+  # corpus is checked in and none is cached, so each run starts cold and
+  # explores a different path; treat a failure here as real, not as flake.
+  # Serious fuzzing runs out of band, for hours, with a persistent corpus.
+  #
+  # Linux-only and clang-only: libFuzzer ships with clang's compiler-rt and gcc
+  # has no equivalent, which is why -DSHUTTLE_FUZZ=ON hard-errors under g++.
+  # libclang-rt-18-dev is what actually provides libclang_rt.fuzzer-x86_64.a;
+  # it is pinned to 18 because that is what the `clang` metapackage resolves to
+  # on ubuntu-24.04. If a future image moves clang off 18, this job fails at
+  # LINK time with a missing libclang_rt.fuzzer — bump both together.
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-rt-18-dev cmake
+      - name: Configure + build (libFuzzer + ASan/UBSan)
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          mkdir -p fuzz-artifacts
+          cmake -B build/ci-fuzz -DSHUTTLE_FUZZ=ON -DSHUTTLE_BUILD_TESTS=OFF
+          cmake --build build/ci-fuzz -j \
+            --target shuttle_bipbuffer_fuzz shuttle_header_fuzz
+      - name: Fuzz BipBuffer (60s)
+        run: |
+          ./build/ci-fuzz/shuttle_bipbuffer_fuzz -max_total_time=60 \
+            -rss_limit_mb=2048 -print_final_stats=1 \
+            -artifact_prefix=./fuzz-artifacts/bipbuffer-
+      - name: Fuzz header validation (60s)
+        run: |
+          ./build/ci-fuzz/shuttle_header_fuzz -max_total_time=60 \
+            -rss_limit_mb=2048 -print_final_stats=1 \
+            -artifact_prefix=./fuzz-artifacts/header-
+      # A crash whose reproducer stays on the dead runner is a crash nobody can
+      # act on: libFuzzer writes the exact input that failed, so keep it.
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz-artifacts/
+          if-no-files-found: ignore
+
+  # Experimental CUDA IPC module (WP9). This job proves TWO things and, just as
+  # importantly, does NOT prove a third.
+  #
+  #   PROVEN here:
+  #     1. The host DESCRIPTOR CODEC works. It is pure host code with no CUDA
+  #        dependency, so it builds and RUNS on this plain runner — the same
+  #        shuttle_cuda_desc_test the linux-asan/tsan jobs already run, invoked
+  #        explicitly here so the guarantee lives in one legible place.
+  #     2. The DEVICE GLUE is WELL-FORMED. src/shuttle_cuda.cpp is compiled with
+  #        -DSHUTTLE_WITH_CUDA against a MINIMAL stub cuda_runtime.h written
+  #        below (NOT vendored into the repo), so its calls to cudaIpc* type-
+  #        check and its C++ parses. Compile only — there is nothing to link or
+  #        run against a stub.
+  #
+  #   NOT PROVEN here (no GPU, no CUDA toolkit on any GitHub runner):
+  #     - that cross-process device memory actually becomes visible,
+  #     - that the event handle synchronizes streams correctly,
+  #     - the handle-cache refcount behavior against real cudaIpcOpenMemHandle,
+  #     - performance, multi-GPU / MIG, or the borrow-vs-kernel lifetime race.
+  #     - the CMake -DSHUTTLE_CUDA=ON path (find_package(CUDAToolkit) +
+  #       CUDA::cudart) is likewise NOT exercised: we bypass it and drive g++
+  #       directly against the stub, because a stub has no CMake package.
+  #
+  # Why the stub and not apt's nvidia-cuda-toolkit: the apt package is ~GB, slow,
+  # and its CMake CUDAToolkit discovery is flaky on hosted runners — and even
+  # with it installed there is still no GPU, so it would prove nothing the stub
+  # does not. The stub is deterministic, seconds-fast, and makes the guarantee
+  # ("the glue is well-formed") exactly match what a GPU-less runner can honestly
+  # assert. See docs/CUDA_DESIGN.md for the full proven-vs-unproven ledger.
+  cuda-glue-compile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ cmake
+      - name: Host codec test (pure host code, actually RUNS)
+        run: |
+          cmake -B build/ci-cuda -DSHUTTLE_CUDA=OFF
+          cmake --build build/ci-cuda -j --target shuttle_cuda_desc_test
+          ctest --test-dir build/ci-cuda -R shuttle_cuda_desc_test \
+            --output-on-failure
+      - name: Write a minimal cuda_runtime.h stub (NOT committed to the repo)
+        run: |
+          mkdir -p stub
+          cat > stub/cuda_runtime.h <<'EOF'
+          /* MINIMAL stub — declarations only, just enough to compile the glue.
+           * NOT a real CUDA header; proves well-formedness, nothing about GPU
+           * behavior. */
+          #ifndef CUDA_RUNTIME_H_STUB
+          #define CUDA_RUNTIME_H_STUB
+          #include <stddef.h>
+          typedef enum cudaError { cudaSuccess = 0, cudaErrorAlreadyMapped = 207 } cudaError_t;
+          typedef struct CUevent_st* cudaEvent_t;
+          typedef struct cudaIpcMemHandle_st { char reserved[64]; } cudaIpcMemHandle_t;
+          typedef struct cudaIpcEventHandle_st { char reserved[64]; } cudaIpcEventHandle_t;
+          #define cudaIpcMemLazyEnablePeerAccess 0x01
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          cudaError_t cudaIpcGetMemHandle(cudaIpcMemHandle_t* handle, void* devPtr);
+          cudaError_t cudaIpcOpenMemHandle(void** devPtr, cudaIpcMemHandle_t handle, unsigned int flags);
+          cudaError_t cudaIpcCloseMemHandle(void* devPtr);
+          cudaError_t cudaIpcGetEventHandle(cudaIpcEventHandle_t* handle, cudaEvent_t event);
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          EOF
+      - name: Compile-only glue against the stub (-DSHUTTLE_WITH_CUDA)
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -g -DSHUTTLE_WITH_CUDA \
+            -Iinclude -Istub \
+            -c src/shuttle_cuda.cpp -o /tmp/shuttle_cuda_glue.o
+          echo "glue compiled well-formed against the stub (no GPU behavior proven)"
+
+  # Experimental Windows backend (WP8). This job proves the Win32 platform seam
+  # COMPILES under MSVC and that its named-section + WaitOnAddress park/wake path
+  # actually moves bytes — in one process across threads, and across two
+  # processes. It does NOT prove parity, and is not meant to:
+  #
+  #   PROVEN here:
+  #     - shuttle_c, shuttle_core and the whole platform seam build with MSVC
+  #       (the bipbuffer tests and the smoke link shuttle_core, forcing
+  #       src/shuttle.cpp + include/shuttle/platform.hpp through the compiler).
+  #     - the pure-logic BipBuffer property/edge/oversize tests pass (portable).
+  #     - windows_smoke: a CreateFileMappingW named section carries byte-exact
+  #       messages producer->consumer over the copy AND zero-copy borrow paths
+  #       (threads), and across a CreateProcess parent/child pair — exercising
+  #       WaitOnAddress/WakeByAddressAll cross-process wakeups.
+  #     - the host CUDA descriptor codec (pure host code) also builds and runs.
+  #
+  #   NOT PROVEN here (POSIX-only, by design — see docs/ROADMAP.md):
+  #     - crash recovery / robust-mutex (EOWNERDEAD) semantics: Windows has no
+  #       robust mutex; heartbeat liveness is the crash story (as on macOS), and
+  #       the SIGKILL / posix_spawn multi-process gate suite is not ported.
+  #     - the cross-language FFI (Python/Rust) gate tests.
+  #     - performance: no latency/CPU gates run here.
+  #
+  # No sanitizer leg: -DSHUTTLE_SAN is never passed, so shuttle_san stays the
+  # empty INTERFACE target and MSVC gets no GNU sanitizer flags. The Visual
+  # Studio generator is multi-config, hence the explicit --config / -C Release.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (MSVC)
+        run: cmake -B build/ci-win
+      - name: Build (Release)
+        run: cmake --build build/ci-win --config Release -j
+      - name: Test
+        run: ctest --test-dir build/ci-win -C Release --output-on-failure
