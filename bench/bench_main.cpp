@@ -14,7 +14,9 @@
 // discarded; median and p99 reported.
 //
 // Workloads: 50 MB blob (the gate: both ratios >= 10x), and a 16 KB frame
-// stream (throughput, informational — NFR-P4 context).
+// stream (throughput, informational — NFR-P4 context). The stream figure is
+// timed by the CONSUMER over its post-warm-up frames only, not by the driver's
+// wall clock around the process pair — see write_window() for why.
 //
 // This binary is built WITHOUT sanitizers (they would invalidate the
 // comparison). Numbers printed under a container are labeled
@@ -138,6 +140,47 @@ bool load_stats(const char* path, int warmup, Stats* out) {
     return true;
 }
 
+// ---------- steady-state throughput window (E7) ----------
+//
+// The driver's wall clock around a spawned pair is NOT a throughput
+// measurement. Besides the frames it also contains the segment/socket setup,
+// two posix_spawns, both children's startup and teardown, and wait_deadline's
+// poll loop — several milliseconds against a 16 KB stream whose actual
+// transfer is under three. Worse, that poll loop sleeps 5 ms per turn, so
+// whether a child's exit is noticed on poll N or poll N+1 shifted the
+// denominator by ~5 ms and the reported MB/s by a factor of two: the bimodal
+// Shuttle stream row in E6 (13734 / 6717 / 13291 MB/s) was that, and nothing
+// about the transport — in the reproduction the consumer's own window was
+// unchanged in the low run. The baselines looked flat only because the same
+// fixed overhead sits next to a much larger true signal.
+//
+// So the consumer times itself: from just before it takes delivery of the
+// first TIMED frame to just after the last one. That window contains only
+// transferred frames — no setup, no teardown, no warm-up — and it is what
+// `frames_per_s` / `frame_mbps` are computed from. It is written to a sidecar
+// file so the latency file stays exactly one ns sample per line.
+void write_window(const char* outpath, uint64_t start_ns, uint64_t end_ns) {
+    if (outpath == nullptr || start_ns == 0) return;
+    char wp[128];
+    std::snprintf(wp, sizeof wp, "%s.win", outpath);
+    FILE* f = std::fopen(wp, "w");
+    if (f == nullptr) return;
+    std::fprintf(f, "%llu\n", (unsigned long long)(end_ns - start_ns));
+    std::fclose(f);
+}
+
+bool load_window(const char* outpath, uint64_t* out) {
+    char wp[128];
+    std::snprintf(wp, sizeof wp, "%s.win", outpath);
+    FILE* f = std::fopen(wp, "r");
+    if (f == nullptr) return false;
+    unsigned long long v = 0;
+    const bool ok = std::fscanf(f, "%llu", &v) == 1 && v > 0;
+    std::fclose(f);
+    if (ok) *out = v;
+    return ok;
+}
+
 void fill_payload(unsigned char* p, uint64_t n, uint64_t iter) {
     // Cheap full-payload write so every transport pays identical
     // generation cost BEFORE the timestamp is taken.
@@ -175,14 +218,16 @@ int shu_producer(const char* name, uint64_t size, int iters) {
 }
 
 int shu_consumer(const char* name, uint64_t size, int iters,
-                 const char* outpath) {
+                 const char* outpath, int warmup) {
     int err = 0;
     shuttle::Channel* ch = shuttle::open(name, &err);
     if (ch == nullptr) return 1;
     shuttle::Consumer c(ch);
     FILE* out = std::fopen(outpath, "w");
     if (out == nullptr) return 1;
+    uint64_t t_win = 0;
     for (int i = 0; i < iters; ++i) {
+        if (i == warmup) t_win = shuttle::monotonic_ns();
         const unsigned char* p = nullptr;
         uint64_t len = 0;
         if (c.read(&p, &len) != shuttle::kOk || len != size) return 1;
@@ -191,6 +236,7 @@ int shu_consumer(const char* name, uint64_t size, int iters,
                      (unsigned long long)read_stamp_delta(p));
         c.release();
     }
+    write_window(outpath, t_win, shuttle::monotonic_ns());
     std::fclose(out);
     shuttle::close(ch);
     return 0;
@@ -210,17 +256,21 @@ int stream_producer(int fd, uint64_t size, int iters) {
     return 0;
 }
 
-int stream_consumer(int fd, uint64_t size, int iters, const char* outpath) {
+int stream_consumer(int fd, uint64_t size, int iters, const char* outpath,
+                    int warmup) {
     std::vector<unsigned char> buf(size);
     FILE* out = std::fopen(outpath, "w");
     if (out == nullptr) return 1;
+    uint64_t t_win = 0;
     for (int i = 0; i < iters; ++i) {
+        if (i == warmup) t_win = shuttle::monotonic_ns();
         uint64_t len = 0;
         if (!read_all(fd, &len, 8) || len != size) return 1;
         if (!read_all(fd, buf.data(), len)) return 1;
         std::fprintf(out, "%llu\n",
                      (unsigned long long)read_stamp_delta(buf.data()));
     }
+    write_window(outpath, t_win, shuttle::monotonic_ns());
     std::fclose(out);
     return 0;
 }
@@ -232,7 +282,7 @@ void set_bufs(int fd) {
 }
 
 int uds_consumer(const char* path, uint64_t size, int iters,
-                 const char* outpath) {
+                 const char* outpath, int warmup) {
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
@@ -244,7 +294,7 @@ int uds_consumer(const char* path, uint64_t size, int iters,
     int fd = accept(s, nullptr, nullptr);
     if (fd < 0) return 1;
     set_bufs(fd);
-    const int rc = stream_consumer(fd, size, iters, outpath);
+    const int rc = stream_consumer(fd, size, iters, outpath, warmup);
     close(fd);
     close(s);
     unlink(path);
@@ -274,7 +324,7 @@ int uds_producer(const char* path, uint64_t size, int iters) {
 // ---------- HTTP/1.1 baseline ----------
 
 int http_consumer(const char* portfile, uint64_t size, int iters,
-                  const char* outpath) {
+                  const char* outpath, int warmup) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -303,7 +353,9 @@ int http_consumer(const char* portfile, uint64_t size, int iters,
     FILE* out = std::fopen(outpath, "w");
     if (out == nullptr) return 1;
     const char resp[] = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    uint64_t t_win = 0;
     for (int i = 0; i < iters; ++i) {
+        if (i == warmup) t_win = shuttle::monotonic_ns();
         // Read headers until CRLFCRLF (carry may already contain them).
         std::string hdr = carry;
         carry.clear();
@@ -326,6 +378,7 @@ int http_consumer(const char* portfile, uint64_t size, int iters,
                      (unsigned long long)read_stamp_delta(body.data()));
         if (!write_all(fd, resp, sizeof resp - 1)) return 1;
     }
+    write_window(outpath, t_win, shuttle::monotonic_ns());
     std::fclose(out);
     close(fd);
     close(s);
@@ -391,10 +444,11 @@ struct RunResult {
 
 int run_pair(const char* self, const std::string& cons_role,
              const std::string& prod_role, const std::string& rendezvous,
-             uint64_t size, int iters, const char* outpath) {
+             uint64_t size, int iters, const char* outpath, int warmup) {
     pid_t cons = spawn_role(self, {cons_role, rendezvous,
                                    std::to_string(size),
-                                   std::to_string(iters), outpath});
+                                   std::to_string(iters), outpath,
+                                   std::to_string(warmup)});
     if (cons < 0) return 1;
     pid_t prod = spawn_role(self, {prod_role, rendezvous,
                                    std::to_string(size),
@@ -433,14 +487,14 @@ int bench_transport(const char* self, const char* tag, RunResult* rr) {
             shuttle::create(rdv, 128ull << 20, 64ull << 20, &err);
         if (ch == nullptr) return 1;
         if (run_pair(self, cons_role, prod_role, rdv, kBlobSize,
-                     kBlobWarmup + kBlobIters, out) != 0)
+                     kBlobWarmup + kBlobIters, out, kBlobWarmup) != 0)
             return 1;
         shuttle::close(ch);
         shuttle::unlink(rdv);
     } else {
         unlink(rdv);
         if (run_pair(self, cons_role, prod_role, rdv, kBlobSize,
-                     kBlobWarmup + kBlobIters, out) != 0)
+                     kBlobWarmup + kBlobIters, out, kBlobWarmup) != 0)
             return 1;
     }
     if (!load_stats(out, kBlobWarmup, &rr->blob)) return 1;
@@ -448,7 +502,6 @@ int bench_transport(const char* self, const char* tag, RunResult* rr) {
     // 16 KB frame stream (throughput, informational).
     char out2[96];
     std::snprintf(out2, sizeof out2, "/tmp/shb.%s.%s.frames", tag, tmp);
-    const uint64_t t0 = shuttle::monotonic_ns();
     if (std::strcmp(tag, "shu") == 0) {
         shuttle::unlink(rdv);
         int err = 0;
@@ -456,18 +509,22 @@ int bench_transport(const char* self, const char* tag, RunResult* rr) {
             shuttle::create(rdv, 8ull << 20, 1ull << 20, &err);
         if (ch == nullptr) return 1;
         if (run_pair(self, cons_role, prod_role, rdv, kFrameSize,
-                     kFrameWarmup + kFrameIters, out2) != 0)
+                     kFrameWarmup + kFrameIters, out2, kFrameWarmup) != 0)
             return 1;
         shuttle::close(ch);
         shuttle::unlink(rdv);
     } else {
         unlink(rdv);
         if (run_pair(self, cons_role, prod_role, rdv, kFrameSize,
-                     kFrameWarmup + kFrameIters, out2) != 0)
+                     kFrameWarmup + kFrameIters, out2, kFrameWarmup) != 0)
             return 1;
     }
-    const double secs = (shuttle::monotonic_ns() - t0) / 1e9;
-    const double frames = kFrameWarmup + kFrameIters;
+    // Consumer-timed steady-state window: kFrameIters frames, warm-up and
+    // process lifecycle excluded (write_window above).
+    uint64_t win_ns = 0;
+    if (!load_window(out2, &win_ns)) return 1;
+    const double secs = win_ns / 1e9;
+    const double frames = kFrameIters;
     rr->frames_per_s = frames / secs;
     rr->frame_mbps = frames * kFrameSize / 1e6 / secs;
     return 0;
@@ -511,8 +568,9 @@ int run_driver(const char* self) {
     std::printf("  ratio: uds/shuttle %.1fx, http/shuttle %.1fx"
                 " (gate: both >= 10x)\n",
                 r_uds, r_http);
-    std::printf("16 KB stream throughput: shuttle %.0f MB/s, uds %.0f MB/s,"
-                " http %.0f MB/s\n",
+    std::printf("16 KB stream throughput (%d timed frames, consumer-timed):"
+                " shuttle %.0f MB/s, uds %.0f MB/s, http %.0f MB/s\n",
+                kFrameIters,
                 shu.frame_mbps, uds.frame_mbps, http.frame_mbps);
 
     if (r_uds < 10.0 || r_http < 10.0) {
@@ -535,15 +593,19 @@ int main(int argc, char** argv) {
         const uint64_t size = std::strtoull(argv[3], nullptr, 10);
         const int iters = std::atoi(argv[4]);
         const char* out = argc >= 6 ? argv[5] : nullptr;
+        const int warmup = argc >= 7 ? std::atoi(argv[6]) : 0;
         if (role == "shu-prod") return shu_producer(rdv, size, iters);
-        if (role == "shu-cons") return shu_consumer(rdv, size, iters, out);
+        if (role == "shu-cons")
+            return shu_consumer(rdv, size, iters, out, warmup);
         if (role == "uds-prod") return uds_producer(rdv, size, iters);
-        if (role == "uds-cons") return uds_consumer(rdv, size, iters, out);
+        if (role == "uds-cons")
+            return uds_consumer(rdv, size, iters, out, warmup);
         if (role == "http-prod") return http_producer(rdv, size, iters);
-        if (role == "http-cons") return http_consumer(rdv, size, iters, out);
+        if (role == "http-cons")
+            return http_consumer(rdv, size, iters, out, warmup);
     }
     std::fprintf(stderr, "usage: %s [<role> <rendezvous> <size> <iters>"
-                         " [latfile]]\n",
+                         " [latfile [warmup]]]\n",
                  argv[0]);
     return 2;
 }

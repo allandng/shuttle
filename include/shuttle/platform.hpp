@@ -1082,9 +1082,44 @@ inline int hugetlb_object_exists_fs(const char* name) noexcept {
 }
 
 // Monotonic clock in nanoseconds. Kept here so test/driver code shares one
-// definition. POSIX uses CLOCK_MONOTONIC; Windows uses QueryPerformanceCounter
-// (steady, high-resolution), scaled to ns without overflow by splitting the
-// counter into whole seconds and a sub-second remainder.
+// definition. Windows uses QueryPerformanceCounter (steady, high-resolution),
+// scaled to ns without overflow by splitting the counter into whole seconds
+// and a sub-second remainder; Linux uses CLOCK_MONOTONIC; macOS uses
+// CLOCK_UPTIME_RAW (see below).
+//
+// THE CONTRACT EVERY CALLER MAY RELY ON, on all three platforms:
+//   1. Monotonic and system-wide, so a timestamp taken in one process can be
+//      subtracted from one taken in another on the same host (bench/ does
+//      exactly this: the producer stamps the payload head, the consumer
+//      differences it).
+//   2. Frozen while the machine is suspended, so an elapsed-time budget
+//      cannot be burned by seconds in which no peer was scheduled.
+//   3. Ticks at the real-time rate to within measurement noise while awake.
+// It is NOT an absolute-deadline source for any timed wait in this file: the
+// macOS park path takes a RELATIVE timeout (os_sync_wait_on_address_with_-
+// timeout / pthread_cond_timedwait_relative_np) and the Linux condvar builds
+// its absolute deadline from its own clock_gettime(CLOCK_MONOTONIC) inside
+// cond_timedwait_rel(). No value from here is ever handed to the kernel, so
+// changing this clock cannot desynchronize a wait. Keep it that way: if a
+// caller ever needs an ABSOLUTE deadline for a wait primitive, it must read
+// the clock that primitive names, not this function.
+//
+// macOS, why CLOCK_UPTIME_RAW and not CLOCK_MONOTONIC (E7):
+//   - Resolution. Darwin's CLOCK_MONOTONIC quantizes to 1 us, which made the
+//     harness's sub-10-us latency samples exact multiples of 1000 ns and put
+//     +/-20% of quantization on the headline median. CLOCK_UPTIME_RAW is
+//     mach_absolute_time() with the timebase applied: ~41.7 ns/tick on Apple
+//     silicon (24 MHz), and it is also the cheaper read of the two.
+//   - Sleep semantics, which move in the RIGHT direction. Darwin's
+//     CLOCK_MONOTONIC keeps incrementing while the system is asleep;
+//     CLOCK_UPTIME_RAW does not (clock_gettime(3)). Linux's CLOCK_MONOTONIC
+//     already excludes suspend, so this makes the three platforms agree on
+//     rule 2 above instead of macOS being the odd one out. It also puts the
+//     heartbeat-staleness clock (spsc.hpp StaleTracker) on the SAME time base
+//     as the macOS park timeout, which is OS_CLOCK_MACH_ABSOLUTE_TIME: a
+//     laptop that suspends for a minute with a peer parked now freezes the
+//     staleness budget and the wait budget together, instead of waking up and
+//     declaring a perfectly live peer dead.
 inline uint64_t monotonic_ns() noexcept {
 #if defined(SHUTTLE_PLATFORM_WINDOWS)
     LARGE_INTEGER freq;
@@ -1095,6 +1130,8 @@ inline uint64_t monotonic_ns() noexcept {
     const uint64_t c = static_cast<uint64_t>(ctr.QuadPart);
     if (f == 0) return 0;
     return (c / f) * 1000000000ull + (c % f) * 1000000000ull / f;
+#elif defined(SHUTTLE_PLATFORM_MACOS)
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 #else
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
