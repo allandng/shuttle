@@ -12,17 +12,18 @@ In a loom, the shuttle carries the thread back and forth across the warp. Here i
   transport     median        vs Shuttle
   ─────────────────────────────────────────
   Shuttle         5 µs             —
-  Unix socket   9.3 ms         1,857× slower
-  HTTP (raw)    8.5 ms         1,699× slower
+  Unix socket   8.5 ms         1,700× slower
+  HTTP (raw)    7.3 ms         1,460× slower
 
-  (native Apple M-series, macOS — dev figures; see "Benchmark honesty" below)
+  (native Apple M3, macOS — dev figures, re-measured 2026-08-17;
+   median of three runs. See "Benchmark honesty" below)
 ```
 
 ## Why
 
 Local AI stacks are polyglot: a Rust/Tauri frontend, Python sidecars, a C++ inference engine — all on one machine, shoveling large binary payloads (audio frames, embeddings, LLM context windows) between processes over localhost HTTP. On that path a 50 MB tensor is copied into a kernel socket buffer, through the loopback stack, into the receiver's socket buffer, and framed/deframed by HTTP — several full copies plus protocol overhead, per message.
 
-Shuttle replaces that path for same-host communication: one region of physical RAM is mapped into both processes via POSIX shared memory. The producer writes a payload once; the consumer reads it **in place**. Measured consumer-side cost of receiving 2 GB over the borrow path: **0.22 ms of CPU — 0.03% of what the same bytes cost over a Unix socket**.
+Shuttle replaces that path for same-host communication: one region of physical RAM is mapped into both processes via POSIX shared memory. The producer writes a payload once; the consumer reads it **in place**. Measured consumer-side cost of receiving 2 GB over the borrow path: **0.29 ms of CPU — 0.04% of what the same bytes cost over a Unix socket**.
 
 ## Design
 
@@ -32,7 +33,7 @@ Shuttle replaces that path for same-host communication: one region of physical R
 - **Parking, not polling.** A blocked peer sleeps (idle cost measured at 0.05% CPU) and wakes in microseconds. The park decision uses a seq_cst Dekker protocol to close the classic store→load race; every wait is a bounded timedwait — nothing can sleep forever.
 - **Backpressure, never drops.** A full buffer blocks the producer; data integrity is non-negotiable for embeddings and context windows. Oversized writes fail fast instead of blocking forever (validated at channel creation). *Never drops* remains the default and the guarantee — a caller who would rather lose a sample than stall opts in **per call** with `SHUTTLE_DROP_NEWEST` (v1.3), which is not a channel mode and never applies on its own.
 - **Crash resilience.** Heartbeat liveness is the primary mechanism on both platforms: a peer SIGKILLed mid-transfer — even while *holding the park mutex* — leaves the survivor with a clean `PEER_DEAD` error, never a deadlock. Linux adds robust-mutex (`EOWNERDEAD`) recovery; macOS parks on `os_sync_wait_on_address`, which holds nothing a dying process could orphan.
-- **Frozen C ABI.** Ten v1 functions whose signatures and semantics never change; new capability arrives only as a new symbol or a new flag bit (the surface is at v1.4 and `SHUTTLE_ABI_VERSION` is still `1`). Integer error codes, no exception ever crosses the boundary ([`include/shuttle/shuttle_c.h`](include/shuttle/shuttle_c.h)). Python binds via cffi with a zero-copy `memoryview` that invalidates on release; the Rust wrapper makes use-after-release a **compile error** (E0597) via borrow lifetimes.
+- **Frozen C ABI.** Eleven v1 functions whose signatures and semantics never change; new capability arrives only as a new symbol or a new flag bit (the surface is at v1.4 and `SHUTTLE_ABI_VERSION` is still `1`). Integer error codes, no exception ever crosses the boundary ([`include/shuttle/shuttle_c.h`](include/shuttle/shuttle_c.h)). Python binds via cffi with a zero-copy `memoryview` that invalidates on release; the Rust wrapper makes use-after-release a **compile error** (E0597) via borrow lifetimes.
 
 ### Since v1.1 — all opt-in, all additive to the frozen ABI
 
@@ -56,7 +57,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-This is the path CI proves on `ubuntu-24.04` (g++, cmake). The cross-language FFI tests additionally need `python3` + `cffi` and `rustc`. Swap `-DSHUTTLE_SAN=asan` for `-DSHUTTLE_SAN=tsan` to get the ThreadSanitizer build — a separate tree, since ASan and TSan cannot be linked into the same binary. A handful of tests measure latency percentiles and CPU ratios and are only meaningful on quiet, controlled hardware; CI excludes them on shared runners with `ctest -E "bench_g71|park_latency|wake_under_load|nocopy_cpu|trickle"`, and you should too on a busy machine.
+This is the path CI proves on `ubuntu-24.04` (g++, cmake) and on `macos-latest` (Apple clang): six jobs cover the supported platforms (the ASan and TSan legs on each of those two, a 60-second libFuzzer smoke of both harnesses, and a CUDA glue compile check against a stub), and a seventh runs the experimental Windows smoke job described under **Scope**. The cross-language FFI tests additionally need `python3` + `cffi` and `rustc`. Swap `-DSHUTTLE_SAN=asan` for `-DSHUTTLE_SAN=tsan` to get the ThreadSanitizer build — a separate tree, since ASan and TSan cannot be linked into the same binary. A handful of tests measure latency percentiles and CPU ratios and are only meaningful on quiet, controlled hardware; CI excludes them on shared runners with `ctest -E "bench_g71|park_latency|wake_under_load|nocopy_cpu|trickle"`, and you should too on a busy machine.
 
 The project also ships a two-platform harness driven by `make`, which builds and runs the same suite natively on macOS (Apple silicon) *and* inside a glibc Linux container under both sanitizers:
 
@@ -132,23 +133,26 @@ target_link_libraries(my_app PRIVATE shuttle::c)   # or shuttle::core
 
 The build was driven gate-by-gate with one rule: **one new variable per phase** — data-structure logic proven before concurrency, concurrency before IPC, ordering before wake mechanics, wake before crash recovery. The test suite is the standing evidence, and it stands alone.
 
-Highlights of what the suite (**36 tests**, ASan + TSan clean on both legs; `ctest -N` on a default build is the count) actually proves:
+The suite is **36 tests**, ASan + TSan clean on both legs (`ctest -N` on a default build is the count). Most recently verified **2026-08-17** on a native Apple M3 (macOS, AppleClang 21) at commit `9509d82`: **36/36 under ASan+UBSan and 36/36 under TSan, zero sanitizer reports on either leg**, zero compiler warnings, no suppressions. Three expected macOS skips (robust mutex ×2, hugetlb) sit *inside* passing tests, which is why the count is still 36.
 
-- 200k-pair randomized property test of the BipBuffer with invariants checked after every operation (19k+ wraps in the tight configuration).
-- ≥1 GiB two-process byte-exact FIFO stress; asymmetric-speed stress with the spin paths *proven engaged*; a wrap-heavy stress that fires the delicate A→B handoff 57k times.
+Highlights of what the suite actually proves:
+
+- 200k-pair randomized property test of the BipBuffer with invariants checked after every operation (19k+ wraps *observed* in the tight configuration — the count is printed, not an asserted floor).
+- ≥1 GiB two-process byte-exact FIFO stress; asymmetric-speed stress with the spin paths *proven engaged*; a wrap-heavy stress that fires the delicate A→B handoff 57k times on the dev host (the asserted floor is 25k — the run fails if the handoff path was not hammered).
 - 100k trickle park/wake cycles with zero lost wakeups; hot path verified to take **zero** locks when the peer isn't parked.
 - SIGKILL crash tests at both kill points (mid-transfer, and while holding the park mutex), on both platforms, including proof that the *test can fail* (a deliberately buggy recovery leaves the mutex `ENOTRECOVERABLE`).
 - Cross-language byte-exact runs (C++→Python, C++→Rust) over the borrow path, and an induced-error sweep showing every failure surfaces as the right integer in all three languages.
 - The v1.4 additions carry their own gates: a ≥10k-operation alignment property test (wrap-heavy, plus proof that a pre-v1.4 binary *rejects* an aligned segment), file-backed SIGKILL tests at both kill points including a raw `EOWNERDEAD` observation on a file mapping, and a trickle variant that keeps `peek_next` in the park/wake loop with zero lost wakeups.
-- `fuzz/` holds two libFuzzer harnesses: one over the BipBuffer's operation sequences, one over header/geometry validation — the untrusted-input surface, with an oracle that recomputes the geometry independently. The header harness found a real integer overflow in `validate_header`, which was fixed in the same commit.
+- `fuzz/` holds two libFuzzer harnesses: one over the BipBuffer's operation sequences, one over header/geometry validation — the untrusted-input surface, with an oracle that recomputes the geometry independently. The header harness found a real integer overflow in `shuttle_open`'s geometry check (a `uint64_t` sum that wrapped, letting a forged segment disarm the length guard), which was fixed in the same commit — the fix is what extracted that validation into today's `validate_header`.
 
 Measurements — the three-transport benchmark, aligned-vs-classic throughput, file-backed-vs-shm latency, and a recorded **null result** for the prefetch hint — are kept as a dated experiment log in [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md).
 
 ## Benchmark honesty
 
-- Numbers above are from a native Apple M-series host (macOS) — **development figures**. Container (Docker on the same host) figures are 24 µs median for the 50 MB blob — still 482×/541× over UDS/HTTP — but are labeled *virtualized, not headline*.
+- Numbers above are from a native Apple M-series host (macOS) — **development figures**. They were **re-measured on 2026-08-17** on a native Apple M3 (macOS 26.5.1, AppleClang 21, unsanitized `-O2`) against commit `9509d82`: median of three consecutive runs is **5.0 µs** for the 50 MB blob (p99 8.0 µs), against **8.50 ms** UDS and **7.30 ms** HTTP — **1,700×** and **1,460×**. The previous table read 9.3 ms UDS (1,857×) and 8.5 ms HTTP (1,699×); Shuttle's own 5 µs reproduced exactly, and **both ratio shortfalls come from the baselines being faster on this host**, not from Shuttle regressing. Full run log: [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md), E6. Container (Docker on the same host) figures are 24 µs median for the 50 MB blob — still 482×/541× over UDS/HTTP — but are labeled *virtualized, not headline*.
+- **The Shuttle-side figure is at the limit of the clock.** The harness times with `clock_gettime(CLOCK_MONOTONIC)`, which on macOS quantizes to **1 µs** — every archived nanosecond sample is an exact multiple of 1000. A 5 µs median is therefore *5 clock ticks*, and ±1 tick of quantization is ±20% on the median and hence on both ratios (4–6 µs spans roughly 1,417×–2,125× against the same UDS baseline). **Treat the ratios as order-of-magnitude statements, not three-significant-figure ones.** The mid-millisecond UDS and HTTP baselines are unaffected — a 1 µs tick is noise at that scale. The 16 KB stream case has its own spread: median **13.3 GB/s** across the three runs, with one run at 6.7 GB/s, so it is treated as a noisy bimodal quantity rather than a bound.
 - There is now also a **virtualized Linux x86_64 (cloud container, 4 vCPU)** data point, glibc, unsanitized `-O2`, 20 iterations after 3 warmups (2026-08-08): **62.3 µs median** for the 50 MB blob (p99 97.1 µs) — **101× over UDS, 355× over HTTP** — and **5.5 GB/s** on the 16 KB stream throughput case. The harness prints `(linux, native)` for this run only because it cannot detect virtualization from inside; it is a shared cloud container, and a cloud container is still not bare metal.
-- Those ratios (101×/355×) sit well below the macOS-native ones (1,857×/1,699×), and the two causes are worth separating. Part of it is the baselines: UDS is genuinely faster on that box (6.3 ms for the 50 MB blob, against 9.3 ms on macOS), which shrinks its ratio without Shuttle changing at all — though HTTP is not (22.1 ms, against 8.5 ms). The rest is Shuttle itself being slower in absolute terms on shared cloud vCPUs: 62.3 µs, against 5 µs native and 24 µs in the macOS container. Both effects move the ratios, and only bare metal will separate the virtualization tax from the platform.
+- Those ratios (101×/355×) sit well below the macOS-native ones (1,700×/1,460× as re-measured 2026-08-17), and the two causes are worth separating. Part of it is the baselines: UDS is genuinely faster on that box (6.3 ms for the 50 MB blob, against 8.50 ms on macOS), which shrinks its ratio without Shuttle changing at all — though HTTP is not (22.1 ms, against 7.30 ms). The rest is Shuttle itself being slower in absolute terms on shared cloud vCPUs: 62.3 µs, against 5 µs native and 24 µs in the macOS container. Both effects move the ratios, and only bare metal will separate the virtualization tax from the platform.
 - That data point was **re-measured on 2026-08-08 against the current tree**, after the v1.4 features landed: 63.5 µs median (median of three consecutive runs; individual runs 62.6 / 63.5 / 72.7 µs) and 5.34 GB/s on the 16 KB stream. The default path is unchanged, as the design intends — every new capability is gated on a create-flag. The p99 did **not** reproduce as tightly (127.5 / 137.7 / 252.3 µs against the 97.1 µs above), so treat that percentile as one sample of a noisy quantity on a shared vCPU, not as a bound. Full run log: [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md), E1.
 - The production target is Linux; the headline claim is **provisional until the harness runs on bare-metal Linux** (`make test-linux` on any glibc box, or run `shuttle_bench` directly). The virtualized Linux run above does not settle it.
 - The HTTP baseline is deliberately fair: raw uncompressed body, keep-alive, TCP_NODELAY, 4 MB socket buffers — HTTP doing the least wasteful thing it can. A Unix-domain-socket baseline is included as the stronger comparator.
@@ -181,5 +185,6 @@ bench/             three-transport benchmark harness
 tools/             shuttle_inspect (read-only segment introspection)
 cmake/             install/packaging inputs (find_package config, shuttle.pc)
 docs/              API.md (C ABI reference), EXPERIMENTS.md (dated measurements),
-                   ROADMAP.md (post-v1 triage), CUDA_DESIGN.md (the sketch)
+                   ROADMAP.md (post-v1 triage), CUDA_DESIGN.md (the sketch),
+                   addons/ (turbofieldfare-pass.md)
 ```

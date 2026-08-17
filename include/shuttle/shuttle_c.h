@@ -8,7 +8,7 @@
  * copy-read returns the non-negative payload length on success).
  *
  * Changing any signature, constant, or semantic here is an ABI break and
- * requires bumping SHUTTLE_ABI_VERSION. The v1 surface (the 10 functions
+ * requires bumping SHUTTLE_ABI_VERSION. The v1 surface (the 11 functions
  * below shuttle_create..shuttle_keepalive) is FROZEN and unchanged; the
  * v1.1 additions (shuttle_create_ex + SHUTTLE_CREATE_* below) are strictly
  * additive — new symbols only, no existing signature or semantic touched —

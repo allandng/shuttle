@@ -20,7 +20,7 @@ not an error and it is not `SHUTTLE_OK`; code that tests `!= SHUTTLE_OK` will
 report a successful drop as a failure. Code that tests `< 0` is correct for
 every entry point here, before and after this addition.
 
-The ten functions `shuttle_create` .. `shuttle_keepalive` are frozen v1.
+The eleven functions `shuttle_create` .. `shuttle_keepalive` are frozen v1.
 `shuttle_create_ex` is an additive v1.1 symbol and `shuttle_get_stats` an
 additive v1.2 symbol (new symbols only, no existing signature or semantic
 touched); v1.3 adds only the `SHUTTLE_DROP_NEWEST` flag bit and the

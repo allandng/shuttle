@@ -164,6 +164,15 @@ version-gated (layout 1 → 2) rather than silent, which is what keeps it minor.
   idempotent behavior is kept deliberately: it composes with
   `shuttle_peek_next`. Recorded as E5 in `docs/EXPERIMENTS.md`.
 - Stale test count in the README (29 → 36, per `ctest -N` on a default build).
+- **Miscounted frozen v1 surface (ten → eleven), documentation only.** The
+  README, `docs/API.md`, and the header comment in
+  `include/shuttle/shuttle_c.h` all said the frozen v1 surface is *ten*
+  functions. It is **eleven**: `shuttle_create`, `shuttle_open`,
+  `shuttle_close`, `shuttle_unlink`, `shuttle_write`, `shuttle_read`,
+  `shuttle_acquire_write`, `shuttle_commit_write`, `shuttle_acquire_read`,
+  `shuttle_release_read`, `shuttle_keepalive`. No symbol, signature, or
+  semantic changed — the surface was always these eleven and the prose
+  undercounted it. `SHUTTLE_ABI_VERSION` is unaffected.
 
 ### Changed
 
@@ -196,6 +205,19 @@ version-gated (layout 1 → 2) rather than silent, which is what keeps it minor.
   `SHUTTLE_CREATE_ALIGNED_SPANS` changes `data_offset` **geometry** (old
   opener: `CORRUPT`). A flag that changes how bytes are laid out must never be
   left to the ignore rule.
+- **Re-verified on native Apple M3, 2026-08-17 (docs only — no code changed).**
+  At commit `9509d82`, macOS 26.5.1 / AppleClang 21: 36/36 under ASan+UBSan and
+  36/36 under TSan, zero sanitizer reports on either leg, zero compiler
+  warnings; three expected macOS skips (robust mutex ×2, hugetlb) inside
+  passing tests. `shuttle_bench`, median of three runs: **5.0 µs** for the
+  50 MB blob against **8.50 ms** UDS and **7.30 ms** HTTP — **1,700×** and
+  **1,460×**, replacing the README's 9.3 ms/8.5 ms (1,857×/1,699×) table. The
+  ratio shortfall is the **baselines being faster on this host**; Shuttle's own
+  median reproduced exactly. The borrow-path CPU figure was re-measured at
+  0.29 ms / **0.04%** per 2 GB (was 0.22 ms / 0.03%). Recorded with its
+  caveats — including the finding that macOS `CLOCK_MONOTONIC` quantizes to
+  1 µs, so the 5 µs median is five ticks and the ratios carry ±20% on the
+  Shuttle side — as **E6** in `docs/EXPERIMENTS.md`.
 
 ## [1.1.0] - 2026-07-24
 

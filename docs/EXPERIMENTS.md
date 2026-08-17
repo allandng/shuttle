@@ -9,14 +9,15 @@ Related: [API.md](API.md) for what each feature is, [ROADMAP.md](ROADMAP.md)
 for what is still open, and the README's **Benchmark honesty** section for the
 rules these entries are held to.
 
-Every number here was produced by a run on the machine described below. The
+Every number in **E1–E5** was produced by a run on the machine described below;
+**E6** ran on a different host and carries its own environment table. The
 README's **Benchmark honesty** rules bind this file: nothing measured on a
 virtualized host is a headline figure, and each entry says so on its own rather
 than relying on the reader remembering the header.
 
 ---
 
-## Environment (all entries, 2026-08-08)
+## Environment (E1–E5, 2026-08-08)
 
 | | |
 |---|---|
@@ -424,6 +425,134 @@ documentation has been corrected to match — see the note in `docs/API.md`.
 **What it does NOT show.** Nothing about thread safety: a handle is still
 single-threaded per role, and idempotence is not a licence to acquire from two
 threads.
+
+---
+
+## E6 — Three-transport benchmark, native Apple M3 (2026-08-17)
+
+**Why.** The README's headline table is the one set of numbers in this project
+that is *not* virtualized, and it had been carried forward unchanged across
+several feature passes. Two things were worth re-checking against the current
+tree: whether the macOS-native figures still reproduce at `9509d82`, and — the
+question that turned out to matter more — what the harness's clock resolution
+does to a five-microsecond median.
+
+**Environment.** Different host from E1–E5; this entry does not inherit that
+header.
+
+| | |
+|---|---|
+| Host | **native Apple M3 Mac — not virtualized, not a container** |
+| OS | macOS 26.5.1 |
+| Compiler | AppleClang 21.0.0.21000101, **unsanitized, `-O2`**; cmake 4.3.1 |
+| Binary | `build/mac-asan/shuttle_bench` — the bench target is defined *above* `link_libraries(shuttle_san)` in `CMakeLists.txt`, so it is unsanitized regardless of `SHUTTLE_SAN`; confirmed with `otool -L` (no `libclang_rt.asan`) |
+| Tree | commit `9509d82`, branch `main` |
+| Load | machine otherwise idle |
+| Harness label | printed `(macos, native)` — `in_container()` is a `stat("/.dockerenv")` probe, and it is correct here |
+
+`shuttle_bench` unchanged from the repository: 50 MB blob, 20 iterations after
+3 warmups, end-to-end producer-commit → consumer-holds-payload across
+`posix_spawn`'d processes, plus a 16 KB frame stream for throughput (the MB/s
+figure includes the 500 warmup frames in its wall time).
+
+**How.**
+
+```sh
+./build/mac-asan/shuttle_bench          # x3, back to back
+./build/mac-asan/shuttle_nocopy_cpu_test
+./build/mac-asan/shuttle_park_idle_test
+```
+
+**Numbers — 50 MB blob, three consecutive runs.**
+
+| Run | Shuttle median | Shuttle p99 | UDS median | UDS p99 | HTTP median | HTTP p99 | uds/shuttle | http/shuttle |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 5.0 µs | 8.0 µs | 8.54 ms | 10.17 ms | 7.30 ms | 9.31 ms | 1708.6× | 1460.0× |
+| 2 | 6.0 µs | 8.0 µs | 8.17 ms | 9.93 ms | 7.24 ms | 7.46 ms | 1361.3× | 1206.7× |
+| 3 | 5.0 µs | 9.0 µs | 8.50 ms | 9.11 ms | 7.31 ms | 48.90 ms | 1700.2× | 1461.8× |
+| **median of 3** | **5.0 µs** | **8.0 µs** | **8.50 ms** | 9.93 ms | **7.30 ms** | 9.31 ms | **1700×** | **1460×** |
+
+The 48.90 ms HTTP p99 in run 3 is a single-sample outlier in a 20-sample set
+and is why the p99 columns are recorded but not promoted anywhere.
+
+**Numbers — 16 KB stream throughput (MB/s).**
+
+| Run | shuttle | uds | http |
+|---|---|---|---|
+| 1 | 13734 | 7004 | 967 |
+| 2 | **6717** | 7066 | 963 |
+| 3 | 13291 | 7027 | 897 |
+| median | **13291 (≈13.3 GB/s)** | 7027 | 963 |
+
+Run 2 is almost exactly half of the other two on the Shuttle row while the two
+baselines stay flat to within 1%, so this is a property of the Shuttle
+measurement (or of what the scheduler did to it), not of the host being busy.
+**Bimodal; treat 13.3 GB/s as a median, not a level.**
+
+**Numbers — CPU accounting.**
+
+| Measurement | Value | Build |
+|---|---|---|
+| Consumer CPU, 2 GB over the borrow path | **0.29 ms** (7.3 µs/msg) — **0.04%** of the 699.27 ms UDS copy baseline | unsanitized `-O2` |
+| Idle blocked peer | 1.4 ms CPU over 2.98 s blocked — **0.05%** | **ASan-instrumented** |
+
+The park-idle figure matches the README's 0.05% but comes from a sanitized
+binary, which is the wrong way round for a CPU claim: instrumentation can only
+add cost, so the figure is an upper bound rather than a like-for-like
+reproduction. It is recorded that way deliberately.
+
+**Test suites, same host and commit.** ASan+UBSan 36/36 (two consecutive runs,
+~67 s), TSan 36/36 (~149 s). Zero sanitizer reports on either leg, zero
+compiler warnings, no suppressions. Three expected macOS skips (robust mutex
+×2, hugetlb) occur *inside* passing tests.
+
+**The finding: the Shuttle column is five clock ticks.**
+`shuttle::monotonic_ns()` is `clock_gettime(CLOCK_MONOTONIC)`, which on macOS
+quantizes to **1 µs**. Every archived sample across all nine latency files is
+an exact multiple of 1000 ns — zero exceptions. The 20 post-warmup Shuttle blob
+samples from run 1, verbatim (ns):
+
+```
+4000 8000 5000 7000 4000 6000 4000 4000 5000 4000
+4000 6000 5000 5000 4000 5000 5000 4000 3000 8000
+```
+
+That is a distribution with **six distinct values in it**, spanning 3–8 ticks.
+A 5 µs median is 5 ticks; ±1 tick is ±20% on the median and therefore on both
+headline ratios, which at 4 µs and 6 µs against the same 8.50 ms UDS baseline
+span roughly **1,417×–2,125×**. The UDS and HTTP medians are mid-millisecond,
+where a 1 µs tick is four orders of magnitude below the signal, so the
+baselines are unaffected.
+
+**What this establishes.**
+
+- The macOS-native headline **reproduces on an M3 at the clock's resolution**:
+  5.0 µs median, the same figure the README has carried, measured at
+  `9509d82` with every v1.2–v1.4 feature in the tree.
+- **The default path is unchanged**, on this platform as well as on the
+  virtualized Linux host of E1 — which is the claim every opt-in create-flag
+  rests on.
+- The ratio movement against the README's previous table (1,857×/1,699× →
+  1,700×/1,460×) is **attributable to the baselines**, not to Shuttle: UDS came
+  in at 8.50 ms against 9.3 ms and HTTP at 7.30 ms against 8.5 ms, while
+  Shuttle's own median reproduced exactly.
+
+**What this does NOT establish.**
+
+- **Nothing about the ratios beyond ±20% on the Shuttle side.** "1,700×" is a
+  faithful quotient of the numbers measured; it is not a three-significant-
+  figure result, and this harness on this OS cannot make it one. Sub-microsecond
+  resolution would need `mach_absolute_time` or a busy-wait calibration, neither
+  of which the harness does.
+- **Nothing about Linux, and nothing about bare metal.** This is the second
+  non-bare-metal-Linux entry in a row; the README's headline claim stays
+  provisional for exactly the reason it already says.
+- **Nothing about stream throughput stability.** One of three runs came in at
+  half the median with the baselines unmoved, and the cause was not
+  investigated. A 13.3 GB/s number should not be quoted without the outlier
+  next to it.
+- Nothing about the ASan build's CPU cost being separable from the park-idle
+  figure above, since no unsanitized park-idle run was taken.
 
 ---
 
