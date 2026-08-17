@@ -205,6 +205,20 @@ target_compile_definitions(shuttle_cabi_errors_test PRIVATE
     RUST_SRC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/ffi/rust"
     RUST_OUT_DIR="${CMAKE_CURRENT_BINARY_DIR}")
 
+# G6.4: sanitizer coverage for the C ABI translation unit ITSELF. The three
+# gates above drive src/shuttle_c.cpp through the UNsanitized shuttle_c dylib
+# (deliberately so — see its note near the top of this file), which leaves that
+# one translation unit's handle bookkeeping, borrow caching, stats plumbing and
+# error translation invisible to ASan and TSan. This target therefore does NOT
+# link shuttle_c: it COMPILES src/shuttle_c.cpp into the test executable, below
+# link_libraries(shuttle_san), so the ABI code inherits the tree's sanitizer.
+# src/shuttle.cpp still comes from shuttle_core (also sanitized), so nothing is
+# compiled twice into this binary. Correctness gate, not perf: it runs both ends
+# of a real channel on threads in ONE process, which is the only configuration
+# TSan can see across.
+add_executable(shuttle_cabi_threads_test tests/cabi_threads_test.cpp src/shuttle_c.cpp)
+target_link_libraries(shuttle_cabi_threads_test PRIVATE shuttle_core Threads::Threads)
+
 add_executable(shuttle_hugepage_test tests/hugepage_test.cpp)
 target_link_libraries(shuttle_hugepage_test PRIVATE shuttle_c shuttle_core Threads::Threads)
 
@@ -260,6 +274,7 @@ add_test(NAME shuttle_crash_mutex_test COMMAND shuttle_crash_mutex_test)
 add_test(NAME shuttle_cabi_python_test COMMAND shuttle_cabi_python_test)
 add_test(NAME shuttle_cabi_rust_test COMMAND shuttle_cabi_rust_test)
 add_test(NAME shuttle_cabi_errors_test COMMAND shuttle_cabi_errors_test)
+add_test(NAME shuttle_cabi_threads_test COMMAND shuttle_cabi_threads_test)
 add_test(NAME shuttle_hugepage_test COMMAND shuttle_hugepage_test)
 add_test(NAME shuttle_hugetlb_test COMMAND shuttle_hugetlb_test)
 add_test(NAME shuttle_stats_test COMMAND shuttle_stats_test)
@@ -278,6 +293,7 @@ set_tests_properties(shuttle_spsc_stress_test shuttle_spsc_threads_test
                      shuttle_robust_mutex_test shuttle_crash_leak_test
                      shuttle_crash_mutex_test shuttle_cabi_python_test
                      shuttle_cabi_rust_test shuttle_cabi_errors_test
+                     shuttle_cabi_threads_test
                      shuttle_hugepage_test shuttle_hugetlb_test
                      shuttle_stats_test shuttle_drop_policy_test
                      shuttle_aligned_spans_test shuttle_filebacked_test
