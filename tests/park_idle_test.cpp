@@ -21,7 +21,28 @@ namespace {
 
 constexpr uint64_t kIdleNs = 3ull * 1000000000ull;
 constexpr uint64_t kMinObservedWaitNs = 2ull * 1000000000ull;
-constexpr uint64_t kMaxCpuNs = 250ull * 1000000;  // 250 ms; spin would be ~3 s
+// Idle CPU budget for the ~3 s blocked read. Calibrated on native Apple M3
+// (AppleClang 21) over 8 runs per leg: 1.2-1.5 ms under ASan, 0.6-1.6 ms under
+// TSan — 0.02-0.06% of the idle block. Re-run with the machine deliberately
+// oversubscribed (16 spinners on 8 cores) the figure went DOWN, to 0.5-0.7 ms
+// on both legs: a parked thread's cost is a couple of syscalls plus one wake,
+// so it does not scale with machine load, which is what makes a tight bound
+// safe here at all.
+//
+// 30 ms = 1% of the block: ~19x over the worst observation (1.6 ms), yet ~100x
+// under what the failure mode costs — a busy-poll consumer burns a full core,
+// i.e. ~3000 ms here. The gate only has to separate ~1 ms from ~3000 ms, and
+// anywhere in that gap is arbitrary; 1% is the round number in it. The old
+// 250 ms (8.3%) sat 170x above the measurement and would have passed an
+// implementation quietly spinning on 8% of a core.
+//
+// CI caveat: park_idle is deliberately NOT in the perf-exclusion regex
+// (bench_g71|park_latency|wake_under_load|nocopy_cpu|trickle), so this runs on
+// shared runners and under TSan. That is why the bound is 30 ms and not the
+// ~5 ms the measurements alone would justify: it leaves an order of magnitude
+// of slack for a runner several times slower than an M3 while still failing a
+// real spin by two orders of magnitude.
+constexpr uint64_t kMaxCpuNs = 30ull * 1000000;  // 30 ms; spin would be ~3 s
 constexpr uint64_t kChildTimeoutNs = 60ull * 1000000000ull;
 constexpr char kWakeMsg[] = "wake-up";
 

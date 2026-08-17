@@ -64,7 +64,7 @@ void check_invariants(const shuttle::BipBuffer& b, uint64_t expect_bytes) {
 }
 
 void run_config(uint64_t cap, uint64_t max_len, uint64_t target_pairs,
-                uint64_t seed, const char* label) {
+                uint64_t seed, uint64_t min_wraps, const char* label) {
     std::vector<unsigned char> mem(cap);
     shuttle::BipBuffer buf(mem.data(), cap);
     Rng rng{seed};
@@ -124,6 +124,14 @@ void run_config(uint64_t cap, uint64_t max_len, uint64_t target_pairs,
     }
     CHECK(inflight_bytes == 0 || !queued_len.empty(),
           "accounting drift at end");
+    // The wrap count is a gate, not a statistic: a byte-exact FIFO run that
+    // never wrapped would pass every check above while testing none of the
+    // early-wrap/watermark handoff this configuration exists to hammer.
+    CHECK(wraps_seen >= min_wraps,
+          "%s: %llu wraps < floor %llu — this configuration stopped"
+          " exercising the wrap path",
+          label, (unsigned long long)wraps_seen,
+          (unsigned long long)min_wraps);
     std::printf("  %s: %llu pairs, %llu wraps, byte-exact, invariants ok\n",
                 label, (unsigned long long)target_pairs,
                 (unsigned long long)wraps_seen);
@@ -132,12 +140,25 @@ void run_config(uint64_t cap, uint64_t max_len, uint64_t target_pairs,
 }  // namespace
 
 int main() {
+    // The wrap floors below are exact, not statistical. This run has no
+    // nondeterminism to average over: splitmix64 seeded from a literal,
+    // single-threaded, no time/address/thread inputs, and the branch that
+    // draws each random number depends only on the buffer geometry. The
+    // counts therefore reproduce byte-for-byte on any platform and are
+    // unaffected by instrumentation — verified identical on the ASan and
+    // TSan legs (1496 roomy / 19267 tight, native Apple M3, AppleClang 21).
+    //
+    // The floors sit just under those observations rather than at them, so
+    // a deliberate framing or geometry change that shifts the count a little
+    // does not force a test edit, while any collapse of wrap coverage fails.
     // Roomy: many messages in flight between wraps.
     run_config(/*cap=*/1u << 16, /*max_len=*/2000, /*pairs=*/100000,
-               /*seed=*/0xC0FFEE, "roomy 64KB/0..2000B");
+               /*seed=*/0xC0FFEE, /*min_wraps=*/1400,  // observed 1496
+               "roomy 64KB/0..2000B");
     // Tight: wrap every couple of messages, hammers early-wrap + handoff.
     run_config(/*cap=*/4096, /*max_len=*/1500, /*pairs=*/100000,
-               /*seed=*/0xBEEF, "tight 4KB/0..1500B");
+               /*seed=*/0xBEEF, /*min_wraps=*/19000,  // observed 19267
+               "tight 4KB/0..1500B");
     if (fails == 0) std::printf("bipbuffer_test ok: G2.1 property run clean\n");
     return fails == 0 ? 0 : 1;
 }
