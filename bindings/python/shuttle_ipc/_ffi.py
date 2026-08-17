@@ -2,7 +2,7 @@
 
 ABI mode, not API mode: nothing here is compiled at install time, so the wheel
 is pure Python and binds whatever ``libshuttle_c`` the host provides. The cdef
-below is the complete surface as of ABI v1.4 — the ten frozen v1 functions,
+below is the complete surface as of ABI v1.4 — the eleven frozen v1 functions,
 ``shuttle_create_ex`` (v1.1), ``shuttle_get_stats`` + ``shuttle_stats`` (v1.2),
 the file-backed trio ``shuttle_create_file`` / ``shuttle_open_file`` /
 ``shuttle_unlink_file`` and the lookahead ``shuttle_peek_next`` (v1.4) —

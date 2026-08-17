@@ -1,12 +1,12 @@
 # Rust bindings
 
 Two crates in one workspace, both over the frozen C ABI
-(`include/shuttle/shuttle_c.h`, v1.1). No C++ header is involved, and neither
+(`include/shuttle/shuttle_c.h`, v1.4). No C++ header is involved, and neither
 crate is published — they are built from this repo by path.
 
 | Crate | What it is |
 |---|---|
-| [`shuttle-sys`](shuttle-sys) | Raw `extern "C"` declarations: the ten frozen v1 functions plus the additive v1.1 `shuttle_create_ex`, the error codes, and the two flag words. |
+| [`shuttle-sys`](shuttle-sys) | Raw `extern "C"` declarations: the eleven frozen v1 functions plus every additive symbol through v1.4 — `shuttle_create_ex` (v1.1), `shuttle_get_stats` (v1.2), the file-backed trio and `shuttle_peek_next` (v1.4) — the error codes, and the two flag words. |
 | [`shuttle`](shuttle) | The safe wrapper: `Channel` → `Producer` / `Consumer`, copy and zero-copy paths, errors as an enum, `Drop` closing the handle. |
 
 The reference bindings under `tests/ffi/rust/` remain the ABI conformance
@@ -88,9 +88,13 @@ let first = consumer.acquire_read()?;
 let second = consumer.acquire_read()?;   // E0499: `consumer` already borrowed
 ```
 
-Both are `compile_fail` doc-tests on `Borrowed` (annotated with those exact
-error codes), so `cargo test` fails if either ever starts compiling.
-`Reservation<'_>` has the same shape on the producer side.
+Both are `compile_fail` doc-tests on `Borrowed`, so `cargo test` fails if either
+ever starts compiling — and the `rust-bindings` CI job runs exactly that, so the
+guarantee is enforced on every change rather than only when someone remembers to
+run cargo. The `,E0597` / `,E0499` suffixes on those doctests are documentation
+and not a check: stable rustdoc verifies only that the snippet fails to compile,
+not which error it fails with. `Reservation<'_>` has the same shape on the
+producer side.
 
 One asymmetry, deliberate: `Reservation` does **not** implement `Drop`. The C
 ABI has no cancel — a reservation ends only at `shuttle_commit_write` — so this

@@ -113,6 +113,62 @@ jobs:
       - name: Test
         run: ctest --test-dir build/ci-tsan --output-on-failure -E "$PERF_TESTS"
 
+  # Distributable Rust crate. The ESSENTIAL PURPOSE of this job is the three
+  # `compile_fail` doctests in bindings/rust/shuttle/src/lib.rs — E0597
+  # (use-after-release), E0499 (second borrow outstanding), E0502 (peek through
+  # a live borrow). They are the entire reason that crate hand-writes a wrapper
+  # instead of re-exporting `shuttle-sys`, and rustdoc only runs them under
+  # `cargo test`. No other job in this file invokes cargo, so until this one
+  # existed nothing enforced them: the enforced E0597 proof elsewhere in the
+  # repo (tests/ffi/rust + shuttle_cabi_rust_test, run by the sanitizer legs
+  # above) covers the REFERENCE wrapper under tests/ffi/, which is a different
+  # body of code.
+  #
+  # What a `compile_fail` doctest does and does not pin: it fails the run if the
+  # snippet ever starts COMPILING, and that is the guarantee being enforced. The
+  # `,E0597`-style suffix is NOT checked by stable rustdoc — mutating one to an
+  # unrelated code still passes — so the codes are documentation and the compile
+  # failure is the gate.
+  #
+  # Scope is the full `cargo test`, not `--doc`: the crate's 39 integration
+  # tests need no special environment. Both ends of the channel live in one
+  # process (the ABI does not care that they share an address space), so there
+  # is no second-process or live-peer requirement, and the file-backed cases use
+  # `std::env::temp_dir()` rather than a mount this runner would have to
+  # provide. No sanitizer leg: the ASan/TSan jobs above cover libshuttle_c
+  # itself, and this job is about the Rust surface over it.
+  #
+  # `cargo` from apt rather than a toolchain action, matching how every other
+  # job here gets its compiler: the workspace declares ZERO external
+  # dependencies, so nothing is fetched from a registry and any cargo at or past
+  # the crates' `rust-version = "1.64"` will do — the sources use no syntax or
+  # std API newer than that. The `cargo` package Depends on `rustc`, so
+  # --no-install-recommends still pulls both; `rustc` is named anyway for
+  # legibility. The runner image also ships a rustup toolchain that may win on
+  # PATH; either one satisfies the crates, which is exactly why this installs a
+  # floor instead of pinning a version.
+  rust-bindings:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++ cmake cargo rustc
+      # Library only: cargo needs libshuttle_c.so to link against and nothing
+      # else out of this tree, and SHUTTLE_BUILD_TESTS=OFF keeps the C++ test
+      # suite (already covered by the legs above) out of the configure.
+      - name: Build libshuttle_c
+        run: |
+          cmake -B build/ci-rust -DSHUTTLE_BUILD_TESTS=OFF
+          cmake --build build/ci-rust -j --target shuttle_c
+      # SHUTTLE_LIB_DIR is the same invocation bindings/rust/README.md documents:
+      # shuttle-sys's build script turns it into a link-search path, and both
+      # build scripts turn it into an rpath so the test binaries find the .so at
+      # run time without LD_LIBRARY_PATH.
+      - name: cargo test (integration tests + the compile_fail doctests)
+        run: SHUTTLE_LIB_DIR=$PWD/build/ci-rust cargo test --manifest-path bindings/rust/Cargo.toml
+
   # Fuzz smoke: a MINUTE of libFuzzer per harness, not a campaign. The point is
   # to keep the two harnesses building and running against every change — a
   # harness that silently stops compiling is worse than no harness — and to

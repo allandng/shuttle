@@ -2,7 +2,7 @@
 
 Python bindings for [Shuttle](../../README.md), a zero-copy shared-memory SPSC
 IPC library. The package binds the frozen C ABI (`include/shuttle/shuttle_c.h`,
-v1.1) through cffi in **ABI mode**: nothing is compiled at install time, the
+v1.4) through cffi in **ABI mode**: nothing is compiled at install time, the
 wheel is pure Python, and no C++ header is involved.
 
 The reference bindings under `tests/ffi/` remain the ABI conformance tests. This

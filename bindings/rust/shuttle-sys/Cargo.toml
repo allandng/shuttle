@@ -1,6 +1,6 @@
 [package]
 name = "shuttle-sys"
-description = "Raw FFI declarations for the frozen Shuttle C ABI v1.1"
+description = "Raw FFI declarations for the frozen Shuttle C ABI v1.4"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -9,4 +9,4 @@ publish.workspace = true
 build = "build.rs"
 
 [dependencies]
-shuttle-sys = { path = "../shuttle-sys", version = "1.1.0" }
+shuttle-sys = { path = "../shuttle-sys", version = "1.4.0" }

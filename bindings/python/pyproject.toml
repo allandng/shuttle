@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "shuttle-ipc"
-version = "1.1.0"
-description = "Python bindings for Shuttle, a zero-copy shared-memory SPSC IPC library (C ABI v1.1)"
+version = "1.4.0"
+description = "Python bindings for Shuttle, a zero-copy shared-memory SPSC IPC library (C ABI v1.4)"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "../../LICENSE" }

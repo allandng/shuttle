@@ -1,12 +1,13 @@
 //! Raw FFI declarations for the frozen Shuttle C ABI.
 //!
-//! This crate is the complete surface as of ABI v1.4 and nothing else: the ten
-//! frozen v1 functions `shuttle_create`..`shuttle_keepalive`, plus the additive
-//! `shuttle_create_ex` (v1.1), `shuttle_get_stats` (v1.2), the file-backed trio
-//! `shuttle_create_file` / `shuttle_open_file` / `shuttle_unlink_file` and the
-//! lookahead `shuttle_peek_next` (v1.4). Every declaration is transcribed by
-//! hand from `include/shuttle/shuttle_c.h`, which is the single source of
-//! truth. No symbol appears here that the header does not declare.
+//! This crate is the complete surface as of ABI v1.4 and nothing else: the
+//! eleven frozen v1 functions `shuttle_create`..`shuttle_keepalive`, plus the
+//! additive `shuttle_create_ex` (v1.1), `shuttle_get_stats` (v1.2), the
+//! file-backed trio `shuttle_create_file` / `shuttle_open_file` /
+//! `shuttle_unlink_file` and the lookahead `shuttle_peek_next` (v1.4). Every
+//! declaration is transcribed by hand from `include/shuttle/shuttle_c.h`,
+//! which is the single source of truth. No symbol appears here that the header
+//! does not declare.
 //!
 //! `SHUTTLE_ABI_VERSION` is still 1: everything since v1.1 has been a new
 //! symbol or a new constant, never a changed signature.

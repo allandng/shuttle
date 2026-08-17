@@ -12,13 +12,16 @@ release and bumps `kVersion`.
 
 ## [Unreleased]
 
-Everything since 1.1.0, in one section because none of it has been tagged. It
-spans **three additive C ABI steps** — v1.2 (stats), v1.3 (drop-newest), v1.4
-(aligned spans, file-backed channels, peek) — and under the policy above each
-of those is a minor release, so this would tag as **1.4.0**:
-`SHUTTLE_ABI_VERSION` is still `1`, no frozen signature moved, and no header
-field moved. The one segment-layout addition (`SHUTTLE_CREATE_STATS`) is
-version-gated (layout 1 → 2) rather than silent, which is what keeps it minor.
+## [1.4.0] - 2026-08-17
+
+Everything since 1.1.0, in one release because none of it was tagged as it
+landed. It spans **three additive C ABI steps** — v1.2 (stats), v1.3
+(drop-newest), v1.4 (aligned spans, file-backed channels, peek) — and under the
+policy above each of those is a minor release, which is what makes this
+**1.4.0** rather than three separate tags: `SHUTTLE_ABI_VERSION` is still `1`,
+no frozen signature moved, and no header field moved. The one segment-layout
+addition (`SHUTTLE_CREATE_STATS`) is version-gated (layout 1 → 2) rather than
+silent, which is what keeps it minor.
 
 ### Added
 
@@ -155,6 +158,50 @@ version-gated (layout 1 → 2) rather than silent, which is what keeps it minor.
   check and in `parse()`'s backstop, so the whole class is gone rather than the
   one reachable instance. No legitimate geometry changes verdict; 9.7M fuzz
   executions clean after the fix.
+- **Packaging: the project version was still `1.1.0` while the tree shipped the
+  v1.4 surface.** `CMakeLists.txt` said `project(shuttle VERSION 1.1.0)`, and
+  `PROJECT_VERSION` is what reaches the three things a consumer actually reads:
+  the `libshuttle_c.so.1.1.0` / `.1.1.0.dylib` filename behind the `SONAME`
+  symlink, the `shuttleConfigVersion.cmake` compatibility check, and `Version:`
+  in `shuttle.pc`. An installed tree with every v1.4 symbol in it therefore
+  answered `find_package(shuttle 1.4 REQUIRED)` with "not compatible" and failed
+  the consumer's configure. Now `1.4.0`. **`SHUTTLE_ABI_VERSION` and `SOVERSION`
+  are deliberately untouched at `1`** — the C ABI is frozen at v1 and every
+  addition since has been a new symbol, so the soname stays `libshuttle_c.so.1`
+  and nothing has to relink. The same stale string was in the binding manifests
+  (`bindings/python/pyproject.toml`, `shuttle_ipc.__version__`, the Rust
+  workspace version and the `shuttle` → `shuttle-sys` dependency pin) and in the
+  two binding READMEs' statement of which ABI they cover; all now read 1.4.0 /
+  v1.4. Verified against a throwaway install prefix: `libshuttle_c.1.4.0.dylib`,
+  `Version: 1.4.0` in the `.pc`, and a `find_package(shuttle 1.4 REQUIRED)`
+  consumer that configures — while `find_package(shuttle 1.5)` is still refused,
+  so the check is live rather than vacuously satisfied.
+- **The Rust binding workspace's `cargo test` could not run at all, and its
+  `compile_fail` guarantee was enforced by nothing.** Two problems, one fix
+  each. (1) `shuttle/build.rs` baked the `libshuttle_c` rpath with
+  `cargo:rustc-link-arg-tests`, which reaches only targets of kind `Test` — the
+  `tests/*.rs` binaries — and **not** the unit-test binary cargo builds from
+  `src/lib.rs`, which is a `Lib`-kind target with `test = true`. That binary
+  links the library like any other and so aborted at dyld/ld.so load *before*
+  running its zero tests, failing the whole run; `shuttle-sys` emitted no rpath
+  at all and died the same way. Both build scripts now emit the unscoped
+  `cargo:rustc-link-arg`, which a build script still applies only to its own
+  package's units, so nothing is imposed on a downstream consumer. The
+  invocation `bindings/rust/README.md` documents now works verbatim. (2) The
+  three `compile_fail` doctests that are the safe wrapper's entire reason to
+  exist over `shuttle-sys` — E0597 use-after-release, E0499 second borrow
+  outstanding, E0502 peek through a live borrow — run only under `cargo test`,
+  and no CI job invoked cargo; the enforced E0597 proof in `tests/ffi/rust` +
+  `shuttle_cabi_rust_test` covers the **reference** wrapper, a different body of
+  code. A `rust-bindings` job on `ubuntu-24.04` now builds `shuttle_c` and runs
+  the crate's full `cargo test` — 39 integration tests (single-process, both
+  channel ends in one address space, so no live peer is needed) plus the six
+  doctests. Confirmed to be a live gate and not a passing no-op: deleting the
+  second `acquire_read` from the E0499 snippet makes the run fail. One honest
+  correction alongside it — the `,E0597`-style suffixes are **not** checked by
+  stable rustdoc (mutating one to an unrelated error code still passes), so what
+  is enforced is "this does not compile", and `bindings/rust/README.md` no
+  longer implies otherwise.
 - **`docs/API.md` contradicted the implementation on `shuttle_acquire_read`.**
   The borrow rules claimed a second acquire before releasing returns
   `INVALID_ARGS`; the consumer side has always been **idempotent** (it returns
@@ -165,8 +212,12 @@ version-gated (layout 1 → 2) rather than silent, which is what keeps it minor.
   `shuttle_peek_next`. Recorded as E5 in `docs/EXPERIMENTS.md`.
 - Stale test count in the README (29 → 36, per `ctest -N` on a default build).
 - **Miscounted frozen v1 surface (ten → eleven), documentation only.** The
-  README, `docs/API.md`, and the header comment in
-  `include/shuttle/shuttle_c.h` all said the frozen v1 surface is *ten*
+  README, `docs/API.md`, the header comment in
+  `include/shuttle/shuttle_c.h`, and the distributable bindings' descriptions
+  of their own surface (`bindings/rust/README.md`,
+  `bindings/rust/shuttle-sys/src/lib.rs`, `bindings/python/shuttle_ipc/_ffi.py`
+  — the first two contradicting themselves, each saying *eleven* a few lines
+  below in the same comment) all said the frozen v1 surface is *ten*
   functions. It is **eleven**: `shuttle_create`, `shuttle_open`,
   `shuttle_close`, `shuttle_unlink`, `shuttle_write`, `shuttle_read`,
   `shuttle_acquire_write`, `shuttle_commit_write`, `shuttle_acquire_read`,

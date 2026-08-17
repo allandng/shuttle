@@ -10,6 +10,12 @@
 //! line below reaches dependent build scripts as `DEP_SHUTTLE_C_LIB_DIR` —
 //! that is how the safe wrapper's build.rs gets the same directory for an
 //! rpath, without re-reading the environment.
+//!
+//! This crate needs the same rpath for itself: `cargo test` builds a unit-test
+//! binary from `src/lib.rs` even though there is no `#[cfg(test)]` code here,
+//! and that binary links `libshuttle_c` and so aborts at dyld/ld.so load
+//! without one. A build-script directive applies to its own package's units
+//! only, so this cannot be delegated to the wrapper's build script.
 
 fn main() {
     println!("cargo:rerun-if-env-changed=SHUTTLE_LIB_DIR");
@@ -18,6 +24,9 @@ fn main() {
         if !dir.is_empty() {
             println!("cargo:rustc-link-search=native={}", dir);
             println!("cargo:lib_dir={}", dir);
+            if !cfg!(windows) {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir);
+            }
         }
     }
 

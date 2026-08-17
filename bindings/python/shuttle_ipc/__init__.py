@@ -56,7 +56,7 @@ from .errors import (DROPPED, ERR_BAD_MAGIC, ERR_BAD_VERSION,
                      PeerDead, ShuttleError, SysError, TooBig, WouldBlock,
                      error_for_code)
 
-__version__ = "1.1.0"
+__version__ = "1.4.0"
 
 __all__ = [
     "__version__",
