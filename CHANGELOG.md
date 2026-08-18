@@ -132,6 +132,24 @@ silent, which is what keeps it minor.
   message. The codec is pure host code and is unit-tested on every platform
   with no CUDA present; the device glue is compile-guarded behind
   `-DSHUTTLE_CUDA=ON` and **has never run**. Not part of the v1 ABI.
+- **G6.4 — sanitizer coverage for the C ABI translation unit.** `libshuttle_c`
+  is deliberately built *unsanitized*, because `python3` and `rustc` `dlopen`
+  it and a foreign runtime must not be forced to carry an ASan or TSan runtime.
+  The cost of that decision was invisible: `src/shuttle_c.cpp`'s own handle
+  bookkeeping, borrow caching, stats plumbing and error translation were
+  reached by the three existing cabi gates **only through the uninstrumented
+  dylib**, so no sanitizer ever saw them. The new
+  `tests/cabi_threads_test.cpp` compiles `src/shuttle_c.cpp` directly into a
+  sanitized executable and drives the full C ABI with both channel ends on
+  threads in **one** process — the only configuration TSan can see across —
+  covering the copy and zero-copy paths, partial commits, `shuttle_peek_next`
+  with a borrow outstanding, a `SHUTTLE_DROP_NEWEST` burst, `shuttle_get_stats`
+  overlapping live traffic, keepalive on a timer thread, and every rejection
+  branch. Three enforced floors (wraps ≥ 12000, peek hits ≥ 10000, ring fills)
+  were each run inverted to prove the gate can fail. The suite is **37 tests**;
+  37/37 ASan and 37/37 TSan, zero reports, with the shipped dylib and the
+  existing cabi gates byte-identical — nothing about what is distributed
+  changed.
 - **macOS CI legs.** ASan and TSan on `macos-latest`, so the two-platform
   claim is enforced by CI rather than by local runs.
 - **Contributor hygiene.** `.clang-format` derived from the existing tree (not
@@ -210,7 +228,51 @@ silent, which is what keeps it minor.
   the implementation — no code changed, so no caller's behavior changed. The
   idempotent behavior is kept deliberately: it composes with
   `shuttle_peek_next`. Recorded as E5 in `docs/EXPERIMENTS.md`.
-- Stale test count in the README (29 → 36, per `ctest -N` on a default build).
+- **Two gate tests measured a number and enforced nothing.** Both printed a
+  figure the README then quoted, which meant a regression would have been
+  reported as a pass. (1) `bipbuffer_test` printed its wrap count; a run that
+  never wrapped at all still passed, so the "19k+ wraps" claim rested on
+  someone reading the output. The operation sequence is deterministically
+  seeded (splitmix64 from a literal, single-threaded), so the counts are
+  **exact on every platform and both sanitizer legs** rather than merely
+  typical, and floors now sit just under the observed values: tight
+  19000/observed 19267, roomy 1400/observed 1496. (2) `park_idle_test` passed
+  anything under 250 ms of CPU over its ~3 s blocked window — 8.3% — against a
+  measured 0.6–1.6 ms, a ceiling roughly 150× above the signal it was meant to
+  guard. Calibrated across 28 runs on both legs including a 2×-oversubscribed
+  machine (**load *lowers* the figure**, which is the expected direction: a
+  parked thread's cost is a few syscalls, not a share of the machine), the
+  bound is now **30 ms (1%)** — about 19× above the worst observation and about
+  100× below a busy-poll regression, with enough slack for the shared CI
+  runners where this test is deliberately *not* excluded. The README's 0.05%
+  idle-CPU figure and its wrap-count claim are now enforced rather than
+  asserted.
+- **macOS read the wrong monotonic clock, at 1 µs resolution and with the wrong
+  suspend semantics.** `monotonic_ns()` was `clock_gettime(CLOCK_MONOTONIC)`;
+  it is now `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)`. Two independent
+  problems, one fix. **Correctness first:** Darwin's `CLOCK_MONOTONIC` keeps
+  advancing while the machine is suspended, while the macOS park timeout
+  (`OS_CLOCK_MACH_ABSOLUTE_TIME`) freezes. A laptop that slept with a peer
+  parked therefore burned heartbeat-staleness budget for the entire suspend
+  while the park timeout stood still, and could wake up and report a **live
+  peer as `PEER_DEAD`** — a spurious error on a healthy channel, latent since
+  the heartbeat landed and never observed in the wild because it needs a
+  suspend at the wrong moment. `CLOCK_UPTIME_RAW` freezes across suspend, so
+  both budgets now freeze together and all three platforms agree that suspended
+  time does not elapse. **Resolution second:** the old clock quantized to 1 µs,
+  which made every sub-10-µs latency sample an exact multiple of 1000 ns and
+  put a systematic ±20% on the headline median; the new one ticks at ~41.7 ns
+  (a 24 MHz timebase) and is the cheaper read. Proven rather than asserted —
+  400 pooled blob samples now hold 157 distinct values with 3.5% on the
+  microsecond grid, against 100% before. The swap is safe because **no
+  `monotonic_ns()` value is ever handed to the kernel as a deadline**: the
+  macOS park path takes a relative timeout and the Linux condvar builds its
+  absolute deadline from its own `clock_gettime` call, so this function is used
+  only for differences. That contract, and the rule that keeps it true, are now
+  written above the function in `include/shuttle/platform.hpp`. Recorded as
+  **E7** in `docs/EXPERIMENTS.md`, which also supersedes E6's quantization
+  finding.
+- Stale test count in the README (29 → 37, per `ctest -N` on a default build).
 - **Miscounted frozen v1 surface (ten → eleven), documentation only.** The
   README, `docs/API.md`, the header comment in
   `include/shuttle/shuttle_c.h`, and the distributable bindings' descriptions
@@ -242,6 +304,22 @@ silent, which is what keeps it minor.
   ROADMAP; the **headline claim stays provisional** until the harness runs on
   bare-metal Linux. A shared cloud container is not bare metal, and the re-run
   against this tree (E1) showed the p99 on that host is too noisy to quote.
+- **The 16 KB stream throughput figure now measures a different quantity.** It
+  was 5,500 frames — including the 500 warmups — divided by the *driver's* wall
+  clock around the spawned pair, a denominator that also contained process
+  setup, two `posix_spawn`s, teardown, and a `waitpid` poll loop whose
+  `usleep(5000)` actually sleeps 5–8 ms, quantizing the result into discrete
+  levels. E6's "bimodal" 13.7 / 6.7 / 13.3 GB/s Shuttle row was that artifact
+  and nothing else; the E-core/QoS explanation for it was tested and **refuted**
+  (spawned children inherit `QOS_CLASS_USER_INTERACTIVE`, and the low run's
+  consumer-side window was normal). The figure is now **5,000 timed frames over
+  a consumer-timed steady-state window**, applied symmetrically to all three
+  transports, and the distribution is unimodal. **Consequence, stated so nobody
+  reads a trend that is not there: every stream figure published before this
+  change is not comparable to one published after it** — including E1's 5.5 and
+  5.34 GB/s on virtualized Linux and E6's 13.3 GB/s. Within any single run the
+  three transports stay comparable to each other, since all three moved to the
+  new window together. Bench harness only; no library code is involved. E7.
 
 ### Notes
 
@@ -256,19 +334,29 @@ silent, which is what keeps it minor.
   `SHUTTLE_CREATE_ALIGNED_SPANS` changes `data_offset` **geometry** (old
   opener: `CORRUPT`). A flag that changes how bytes are laid out must never be
   left to the ignore rule.
-- **Re-verified on native Apple M3, 2026-08-17 (docs only — no code changed).**
-  At commit `9509d82`, macOS 26.5.1 / AppleClang 21: 36/36 under ASan+UBSan and
-  36/36 under TSan, zero sanitizer reports on either leg, zero compiler
-  warnings; three expected macOS skips (robust mutex ×2, hugetlb) inside
-  passing tests. `shuttle_bench`, median of three runs: **5.0 µs** for the
+- **Re-verified twice on native Apple M3, 2026-08-17, and the second pass is
+  the one the README carries.** First pass, at commit `9509d82` and docs only:
+  36/36 under ASan+UBSan and 36/36 under TSan, zero sanitizer reports, zero
+  compiler warnings; `shuttle_bench` median of three runs **5.0 µs** for the
   50 MB blob against **8.50 ms** UDS and **7.30 ms** HTTP — **1,700×** and
-  **1,460×**, replacing the README's 9.3 ms/8.5 ms (1,857×/1,699×) table. The
-  ratio shortfall is the **baselines being faster on this host**; Shuttle's own
-  median reproduced exactly. The borrow-path CPU figure was re-measured at
-  0.29 ms / **0.04%** per 2 GB (was 0.22 ms / 0.03%). Recorded with its
-  caveats — including the finding that macOS `CLOCK_MONOTONIC` quantizes to
-  1 µs, so the 5 µs median is five ticks and the ratios carry ±20% on the
-  Shuttle side — as **E6** in `docs/EXPERIMENTS.md`.
+  **1,460×**, replacing the README's older 9.3 ms/8.5 ms (1,857×/1,699×) table,
+  with the shortfall attributable to the **baselines being faster on this
+  host** rather than to Shuttle. Recorded as **E6**, whose most useful finding
+  was that macOS `CLOCK_MONOTONIC` quantizes to 1 µs — making that 5.0 µs
+  median five clock ticks. That finding is what prompted the clock fix above,
+  so the second pass re-measured everything at `d07996e` on the new
+  nanosecond clock: **37/37 under ASan+UBSan and 37/37 under TSan**, and
+  `shuttle_bench` over **ten** consecutive runs giving **4.0 µs** median-of-ten
+  for the 50 MB blob (p99 7.1 µs) against **6.74 ms** UDS and **7.40 ms**
+  HTTP — **1,759×** and **1,826×** — plus **62.6 GB/s** on the newly
+  consumer-timed 16 KB stream. Borrow-path CPU re-measured at 0.28 ms /
+  **0.04%** per 2 GB (was 0.22 ms / 0.03% before today). **The host was never
+  quiet** for either session — Spotlight indexing held 79–97% of a core
+  throughout and a 15-minute wait for an idle machine timed out — so these are
+  published as a **loaded-host floor**, equalled or beaten on a quiet host,
+  never worsened. Both passes, their caveats, and the bimodality investigation
+  are **E6** and **E7** in `docs/EXPERIMENTS.md`; E7 supersedes E6's
+  quantization finding and its stream row.
 
 ## [1.1.0] - 2026-07-24
 

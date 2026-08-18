@@ -10,7 +10,10 @@ for what is still open, and the README's **Benchmark honesty** section for the
 rules these entries are held to.
 
 Every number in **E1–E5** was produced by a run on the machine described below;
-**E6** ran on a different host and carries its own environment table. The
+**E6** and **E7** ran on a different host and each carries its own environment
+table. Entries are not automatically comparable to one another: E7 changed the
+16 KB stream metric, so a stream figure from E1 or E6 cannot be read as a trend
+against one from E7, and each entry says so where it matters. The
 README's **Benchmark honesty** rules bind this file: nothing measured on a
 virtualized host is a headline figure, and each entry says so on its own rather
 than relying on the reader remembering the header.
@@ -96,6 +99,10 @@ makes this point about ratios; it holds in the other direction too.
   the README's 97.1 µs p99 as one sample of a noisy quantity, not a bound.
 - It does not prove the new code paths are correct or fast — only that they are
   absent from the default path. The opt-in paths are E2–E4.
+- **The 16 KB stream column is on the old driver-timed metric** and is not
+  comparable to E7's consumer-timed figures. Both numbers in that column
+  (5.5 and 5.34 GB/s) remain a faithful record of what the harness printed at
+  the time; they are simply measuring a different quantity.
 
 ---
 
@@ -430,6 +437,12 @@ threads.
 
 ## E6 — Three-transport benchmark, native Apple M3 (2026-08-17)
 
+> **Partly superseded by E7 (same day, commit `d07996e`).** Two findings below
+> no longer describe the harness: the 1 µs clock quantization was fixed, and
+> the "bimodal" stream row turned out to be a driver-side measurement artifact.
+> The entry is kept as measured — it is the record of what the old harness
+> produced, and the reason the new one exists.
+
 **Why.** The README's headline table is the one set of numbers in this project
 that is *not* virtualized, and it had been carried forward unchanged across
 several feature passes. Two things were worth re-checking against the current
@@ -487,7 +500,10 @@ and is why the p99 columns are recorded but not promoted anywhere.
 Run 2 is almost exactly half of the other two on the Shuttle row while the two
 baselines stay flat to within 1%, so this is a property of the Shuttle
 measurement (or of what the scheduler did to it), not of the host being busy.
-**Bimodal; treat 13.3 GB/s as a median, not a level.**
+**Bimodal; treat 13.3 GB/s as a median, not a level.** *(Superseded by E7: the
+bimodality was the driver's `waitpid` poll loop quantizing the denominator. The
+metric has since changed to a consumer-timed window, so these MB/s figures are
+not comparable to E7's.)*
 
 **Numbers — CPU accounting.**
 
@@ -506,7 +522,9 @@ reproduction. It is recorded that way deliberately.
 compiler warnings, no suppressions. Three expected macOS skips (robust mutex
 ×2, hugetlb) occur *inside* passing tests.
 
-**The finding: the Shuttle column is five clock ticks.**
+**The finding: the Shuttle column is five clock ticks.** *(Superseded by E7,
+which replaced the macOS clock; `monotonic_ns()` now ticks at ~41.7 ns and the
+±20% below no longer applies to any figure taken after `d07996e`.)*
 `shuttle::monotonic_ns()` is `clock_gettime(CLOCK_MONOTONIC)`, which on macOS
 quantizes to **1 µs**. Every archived sample across all nine latency files is
 an exact multiple of 1000 ns — zero exceptions. The 20 post-warmup Shuttle blob
@@ -550,9 +568,328 @@ baselines are unaffected.
 - **Nothing about stream throughput stability.** One of three runs came in at
   half the median with the baselines unmoved, and the cause was not
   investigated. A 13.3 GB/s number should not be quoted without the outlier
-  next to it.
+  next to it. *(E7 investigated it: the cause was the harness's driver-timed
+  denominator, and the metric has been replaced.)*
 - Nothing about the ASan build's CPU cost being separable from the park-idle
   figure above, since no unsanitized park-idle run was taken.
+
+---
+
+## E7 — Nanosecond clock, consumer-timed stream, and re-measurement (2026-08-17, native Apple M3)
+
+**Why.** E6 closed with two unfinished pieces of its own, and this entry is what
+happened when both were chased.
+
+1. **The headline was five clock ticks.** E6 established that the harness's
+   `monotonic_ns()` quantized to 1 µs on macOS, so the 5.0 µs median carried
+   ±20% that no amount of re-running could remove. That is a *harness* limit,
+   and harness limits are fixable.
+2. **The stream row was called bimodal and the cause was "not investigated."**
+   One of three runs at half the median, with both baselines flat to within 1%.
+   E6 said explicitly that 13.3 GB/s should not be quoted without the outlier
+   next to it. That is an admission of not knowing, and it stayed on the list.
+
+Fixing (1) surfaced something neither question was looking for: a latent
+correctness bug on macOS, reachable by any laptop that suspends while a peer is
+parked. Investigating (2) found no scheduler effect at all — the bimodality was
+in the denominator.
+
+**Environment.** Same host class as E6, one commit later; this entry does not
+inherit the E1–E5 header.
+
+| | |
+|---|---|
+| Host | **native Apple M3 Mac — not virtualized, not a container**; 4 P-core + 4 E-core, 8 logical |
+| OS | macOS 26.5.1 |
+| Compiler | AppleClang 21.0.0.21000101, **unsanitized, `-O2`**; cmake 4.3.1 |
+| Binary | `build/mac-asan/shuttle_bench` — defined *above* `link_libraries(shuttle_san)` in `CMakeLists.txt`, so unsanitized regardless of `SHUTTLE_SAN` |
+| Tree | commit `d07996e`, branch `main` |
+| Load | **NOT quiet — see the caveat below.** `spotlightknowledged` held 79–97% of a core throughout; 1-min load average ~3.5 of 8 |
+| Harness label | printed `(macos, native)` |
+
+Raw output lives outside the repository, in the same scratchpad convention the
+header describes: `bench_runs2/` (the diagnostic session — clock probes, QoS
+probe, sleep-quantum probe, the instrumented harness, and a `PROVENANCE.txt`)
+and `bench_runs3/` (the ten final runs, the nocopy run, and the load logs).
+
+---
+
+### Part 1 — the clock
+
+**How.** A standalone probe (`clockprobe.cpp`) reads each candidate clock in a
+tight loop and records the non-zero deltas, then times 200 ms of wall clock
+against each and measures per-call cost.
+
+**Numbers — resolution.**
+
+```
+timebase numer=125 denom=3                    (125/3 = 41.667 ns per tick, 24 MHz)
+CLOCK_MONOTONIC  deltas: 1000 1000 1000 1000 1000 1000 1000 1000
+CLOCK_UPTIME_RAW deltas:   41  167  125  125  125  125   83  125
+200ms: MONOTONIC=202670000 ns  UPTIME_RAW=202670250 ns  skew=250 ns
+```
+
+Every `CLOCK_MONOTONIC` delta is exactly 1000 ns; every `CLOCK_UPTIME_RAW`
+delta is a multiple of 41.67 ns. The two clocks agree on elapsed time to
+250 ns over 200 ms — a rate difference of 1.2 ppm, i.e. the same clock read at
+different granularity, not a different time base.
+
+The new read is also **cheaper**, though by how much is not stable: the
+archived probe measured 14.6 ns/call for
+`clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` against 35.0 ns for
+`clock_gettime(CLOCK_MONOTONIC)`, and a repeat measured 15.5 against 28.4.
+The direction reproduces; the ratio does not, and neither figure is quoted
+anywhere as a result.
+
+**Numbers — the resolution actually reaching the harness.** Post-change, 400
+pooled 50 MB blob samples contain **157 distinct values**, of which **3.5%**
+are multiples of 1000 ns — against the ~4% expected by chance on a 41.67 ns
+grid, and against **100%** before the change. This is the whole point of the
+entry stated as a measurement: the samples are no longer on a microsecond grid.
+
+**Numbers — the latent bug.** Darwin's `CLOCK_MONOTONIC` **keeps advancing
+while the machine is suspended**. The macOS park timeout does not: it uses
+`OS_CLOCK_MACH_ABSOLUTE_TIME`, which freezes. So a laptop that slept with a
+peer parked burned heartbeat-staleness budget for the whole suspend while the
+park timeout stood still, and could wake up and declare a **live peer dead** —
+a spurious `PEER_DEAD`. `CLOCK_UPTIME_RAW` freezes across suspend, so both
+budgets now freeze together, and all three platforms agree that suspended time
+does not elapse.
+
+**The contract argument for why this swap is safe.** Changing a clock under a
+concurrency library is exactly the kind of edit that silently desynchronizes a
+timed wait, so the reason it cannot here is worth writing down rather than
+assuming. **No `monotonic_ns()` value is ever handed to the kernel as a
+deadline.** The macOS park path takes a *relative* timeout
+(`os_sync_wait_on_address_with_timeout` /
+`pthread_cond_timedwait_relative_np`), and the Linux condvar builds its
+absolute deadline from its own `clock_gettime(CLOCK_MONOTONIC)` inside
+`cond_timedwait_rel()`. `monotonic_ns()` is used only for differences —
+heartbeat staleness, spin budgets, and the bench harness's cross-process
+stamp — so the clock it reads is free to change as long as it stays monotonic,
+system-wide, and frozen across suspend. That three-clause contract is now
+written above the function in `include/shuttle/platform.hpp`, together with the
+rule that keeps it true: a caller who ever needs an *absolute* deadline for a
+wait primitive must read the clock that primitive names, not this function.
+
+---
+
+### Part 2 — the stream metric
+
+**Hypothesis 1: the low run landed on E-cores (QoS).** Tested and **refuted**.
+A QoS probe reports the class of the bench process and of a `posix_spawn`'d
+child:
+
+```
+parent pid=40295 qos=USER_INTERACTIVE rel=0
+child  pid=40296 qos=USER_INTERACTIVE rel=0
+```
+
+Children inherit `QOS_CLASS_USER_INTERACTIVE`; nothing demotes them. And an
+instrumented harness showed the low run's **consumer-side window was normal** —
+whatever was slow, it was not the transfer.
+
+**Hypothesis 2: the denominator.** The old figure was 5,500 frames — including
+the 500 warmups — divided by the *driver's* wall clock around the spawned pair.
+That denominator contains process setup, two `posix_spawn`s, teardown, the
+warmup frames, and a `waitpid` poll loop. The poll loop sleeps `usleep(5000)`,
+which on this host is not 5 ms:
+
+```
+usleep(5000) actual: min 5.074 ms  mean 7.107 ms  max 8.053 ms  (n=200)
+```
+
+A ~7 ms granule on a ~8 ms measurement quantizes it. An instrumented harness
+reporting **both** metrics from the same run, 20 runs, shows exactly that: the
+consumer window varies smoothly (post-warmup 0.00156–0.00251 s, i.e.
+32.7–52.4 GB/s), while the driver-timed figure sits pinned near 11.0–11.4 GB/s
+and jumps to discrete outliers — one run at 14,789 MB/s (driver 0.006093 s) and
+one at 9,939 MB/s (driver 0.009067 s) — as the poll loop lands one sleep early
+or late.
+
+**Causal check.** The diagnostic harness exposes the poll interval as
+`SHB_POLL_US`. Dropping it from 5000 to 50 moves the driver-timed figure and
+leaves the consumer-timed window where it was. The quantity that changes when
+you change the poll loop is the one the poll loop was measuring.
+
+**Verdict.** E6's "bimodal 13.7 / 6.7 / 13.3 GB/s" Shuttle row was a harness
+artifact, not a property of Shuttle or of the scheduler. The figure is now
+**5,000 timed frames over a consumer-timed steady-state window**, applied
+symmetrically to all three transports.
+
+**The consequence, stated plainly: the metric changed, so the numbers are not
+comparable across the change.** Every stream figure in this file taken before
+this entry — E1's 5.5 and 5.34 GB/s on virtualized Linux, E6's 13.3 GB/s
+median — was driver-timed and **cannot** be compared to a figure below.
+Within a single run the three transports remain comparable to each other,
+because all three moved to the new window together.
+
+---
+
+### Part 3 — re-measurement (`bench_runs3`)
+
+**How.** Ten consecutive runs, back to back, plus the CPU-accounting tests:
+
+```sh
+./build/mac-asan/shuttle_bench          # x10, back to back
+./build/mac-asan/shuttle_nocopy_cpu_test
+./build/mac-asan/shuttle_park_idle_test
+```
+
+**Numbers — 50 MB blob, ten consecutive runs.** All times µs.
+
+| Run | Shuttle median | Shuttle p99 | UDS median | HTTP median | uds/shuttle | http/shuttle |
+|---|---|---|---|---|---|---|
+| 1 | 4.4 | 7.7 | 8265.0 | 7384.5 | 1871.2× | 1671.8× |
+| 2 | 4.0 | 6.2 | 6889.2 | 7366.0 | 1722.3× | 1841.5× |
+| 3 | 4.2 | 7.2 | 6668.7 | 7412.5 | 1569.1× | 1744.1× |
+| 4 | 3.7 | 7.1 | 6748.0 | 7503.7 | 1819.8× | 2023.7× |
+| 5 | 3.5 | 6.5 | 6729.6 | 7316.2 | 1945.5× | 2115.1× |
+| 6 | 4.5 | **32.7** | 6493.4 | 7537.9 | 1443.0× | 1675.1× |
+| 7 | 4.2 | 7.1 | 6860.2 | 7433.6 | 1646.3× | 1783.9× |
+| 8 | 3.8 | 7.0 | 6732.2 | 7359.7 | 1795.3× | 1962.6× |
+| 9 | 4.1 | 7.6 | 6747.4 | 7390.0 | 1652.1× | 1809.5× |
+| 10 | 3.6 | 6.9 | 6600.2 | 7457.4 | 1820.7× | 2057.2× |
+| **median of 10** | **4.0** | **7.1** | **6739.8** | **7401.2** | **1758.8×** | **1825.5×** |
+
+The ratio columns are medians of the per-run ratios, not a quotient of the
+median columns; they differ by less than a percent here but the former is the
+honest aggregation.
+
+Three things in that table are deliberately not promoted. **Run 6's 32.7 µs
+p99** is one interference sample in a 20-sample set — the highest of the other
+nine runs is 7.7 µs — so it is recorded and not headlined, the same treatment
+E6 gave its 48.90 ms HTTP outlier. **Run 1 is cold**: its 8,265 µs UDS median
+is 20% above every other run; excluding it, runs 2–10 span 6,493.4–6,889.2 µs.
+The published 6,739.8 µs median is the median of all ten *including* run 1,
+because dropping a run for being inconvenient is not a policy this file has.
+**HTTP is the tighter baseline**: 7,316.2–7,537.9 µs, a 3.0% spread against the
+median, with no cold-run effect.
+
+**Numbers — 16 KB stream throughput (MB/s), consumer-timed.**
+
+| Run | shuttle | uds | http |
+|---|---|---|---|
+| 1 | 45321 | 12018 | 1079 |
+| 2 | 58677 | 12796 | 1087 |
+| 3 | 62065 | 12708 | 1083 |
+| 4 | 67840 | 12891 | 1098 |
+| 5 | 60450 | 12796 | 1080 |
+| 6 | 50235 | 11483 | 1072 |
+| 7 | 63210 | 12052 | 1068 |
+| 8 | 65171 | 11469 | 1100 |
+| 9 | 65457 | 11606 | 1049 |
+| 10 | 65014 | 12554 | 1051 |
+| **median** | **62638 (≈62.6 GB/s)** | **12303** | **1080** |
+
+Runs 2–10 cluster near 63 GB/s with a coefficient of variation of 8.4%. The
+distribution is **unimodal**: the two low values are run 1 (cold) and run 6 (the
+same run whose blob p99 spiked at 32.7 µs) — identifiable interference on both,
+so this is a tail, not a second level. Contrast E6, where a single low run sat
+at exactly half the median with no explanation available.
+
+**What the stream number compares, honestly.** It compares *unlike work*, and
+always did. Shuttle's consumer borrows the frame in place and touches only an
+8-byte stamp; the UDS and HTTP consumers `read()` all 16 KB into their own
+buffer. That asymmetry is the point of the library — not copying is the
+feature — but it means the ratio is "borrow versus copy", not "one transport
+versus another at equal work". This was equally true of E6's 13.3 GB/s; it is
+called out here because it matters more at tens of GB/s.
+
+**Numbers — CPU accounting.**
+
+| Measurement | Value | Build |
+|---|---|---|
+| Consumer CPU, 2 GB over the borrow path | **0.28 ms** (6.9 µs/msg) — **0.04%** of the 731.86 ms UDS copy baseline | unsanitized `-O2` |
+| Idle blocked peer | 1.5 ms CPU over 2.98 s blocked — **0.05%**, now **enforced** at ≤ 30 ms (1%) | **ASan-instrumented** |
+
+The park-idle figure still comes from a sanitized binary, which remains the
+wrong way round for a CPU claim — instrumentation can only add cost, so it is
+an upper bound, not a like-for-like reproduction. What changed since E6 is that
+the bound is now a **gate** rather than a printed line: `park_idle_test` used to
+pass anything under 250 ms (8.3% of the block) against a measured 0.6–1.6 ms;
+calibrated across 28 runs on both sanitizer legs, the ceiling is now 30 ms (1%).
+
+**Test suites, same host and commit.** ASan+UBSan 37/37, TSan 37/37. Zero
+sanitizer reports on either leg, zero compiler warnings, no suppressions. Three
+expected macOS skips (robust mutex ×2, hugetlb) occur *inside* passing tests.
+The suite grew from 36 to 37 with `shuttle_cabi_threads_test` (G6.4), which
+compiles `src/shuttle_c.cpp` directly into a sanitized binary — the shipped
+`libshuttle_c` stays unsanitized because foreign runtimes `dlopen` it.
+
+---
+
+### The host-load caveat, twice
+
+Neither of today's measurement sessions ran on a quiet machine, and both are
+labeled as floors rather than as results.
+
+- **`bench_runs2`** (the diagnostic session) ran with `mediaanalysisd` at 190%,
+  `corespotlightd` at 144%, `spotlightknowledged` at 41% and a
+  Virtualization.framework VM alongside; load average 2.7–5.0 on 8 logical
+  cores. Its `PROVENANCE.txt` estimates this depressed every absolute figure by
+  roughly **15–20%** against E6, measured on the identical driver-timed metric
+  (UDS stream 5,860 MB/s here against E6's 7,004). **No absolute figure from
+  that session is published.** Its results are the ratios, the distributions,
+  and the diagnosis — all of which survive a loaded host.
+- **`bench_runs3`** (the ten runs above) is the cleaner session and strictly
+  dominates `bench_runs2` on every figure, which is why it replaces it. It was
+  still **not quiet**: a 15-minute poll waiting for an idle machine timed out
+  (`TIMEOUT_NOT_QUIET`), with `spotlightknowledged` at 79–97% of a core the
+  entire time and 1-min load ~3.5 of 8 both before run 1 and after run 10.
+  These figures are therefore a **loaded-host floor**. A quiet host should
+  produce equal or better numbers; it will not produce worse ones.
+
+Publishing a floor and saying so is the honest option here. Waiting for a quiet
+machine that this host would not provide, and publishing nothing, is not.
+
+**What this establishes.**
+
+- **The macOS quantization caveat is resolved.** The harness clock ticks at
+  ~41.7 ns rather than 1 µs, proven by both a direct delta probe and the
+  distribution of the samples themselves (157 distinct values across 400
+  samples; 3.5% on the microsecond grid, i.e. chance). **This supersedes E6's
+  "the Shuttle column is five clock ticks" finding**, which was correct about
+  the old harness and no longer describes this one.
+- **E6's stream bimodality is explained and gone.** It was the driver's
+  `waitpid` poll loop quantizing the denominator, not the E-cores, not QoS, and
+  not Shuttle. The QoS hypothesis was tested and refuted rather than dropped.
+- **A latent macOS correctness bug is fixed**: heartbeat-staleness budget and
+  park timeout now read clocks that freeze together across system suspend, so a
+  laptop waking from sleep cannot report a live peer as `PEER_DEAD`.
+- **The clock swap cannot desynchronize a wait**, because no `monotonic_ns()`
+  value is ever handed to the kernel as a deadline — an argument from the code's
+  structure, now pinned in a comment above the function so it stays true.
+- **New headline figures at nanosecond resolution**, on a loaded host: 4.0 µs
+  median-of-ten for the 50 MB blob, 1,759× over UDS and 1,826× over HTTP, and
+  62.6 GB/s on the consumer-timed 16 KB stream.
+
+**What this does NOT establish.**
+
+- **Nothing about a quiet host.** Every figure here was taken under sustained
+  Spotlight indexing. They are a floor, and the floor has not been checked
+  against a ceiling.
+- **Nothing that makes the ratios three-significant-figure results.** The clock
+  is no longer the limit, but the millisecond baselines still jitter: uds/shuttle
+  spans 1,443×–1,946× and http/shuttle 1,672×–2,115× across ten identical runs.
+  The finer clock removed a *systematic* ±20%; it did not remove run-to-run
+  variance, and the ratios remain order-of-magnitude statements.
+- **Nothing comparable to any pre-change stream figure.** The metric changed.
+  E1's 5.5 / 5.34 GB/s and E6's 13.3 GB/s are driver-timed numbers; the
+  62.6 GB/s above is a consumer-timed number. Quoting a trend across them would
+  be a measurement artifact, not a result.
+- **The suspend fix is not covered by a test.** It was found by reading the two
+  clocks' documented sleep semantics against each other, not by a failing gate,
+  and it has never been observed in the wild. Suspending a machine is not
+  something the suite can do, so the evidence is the argument plus the platform
+  documentation — weaker than every other claim in this file, and labeled that
+  way.
+- **Nothing about Linux, and nothing about bare metal.** Third non-bare-metal-
+  Linux entry in a row; the README's headline claim stays provisional for the
+  reason it already gives.
+- **Nothing about the stream figure as a like-for-like transport comparison.**
+  Borrow-in-place versus `read()`-the-frame is the comparison being made, on
+  purpose.
 
 ---
 
