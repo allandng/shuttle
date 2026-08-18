@@ -575,7 +575,7 @@ baselines are unaffected.
 
 ---
 
-## E7 — Nanosecond clock, consumer-timed stream, and re-measurement (2026-08-17, native Apple M3)
+## E7 — Nanosecond clock, consumer-timed stream, and re-measurement (2026-08-17, native Apple M3; addendum 2026-08-18)
 
 **Why.** E6 closed with two unfinished pieces of its own, and this entry is what
 happened when both were chased.
@@ -839,6 +839,8 @@ labeled as floors rather than as results.
   entire time and 1-min load ~3.5 of 8 both before run 1 and after run 10.
   These figures are therefore a **loaded-host floor**. A quiet host should
   produce equal or better numbers; it will not produce worse ones.
+  **That last sentence was wrong, and the addendum below records the
+  measurement that refuted it.**
 
 Publishing a floor and saying so is the honest option here. Waiting for a quiet
 machine that this host would not provide, and publishing nothing, is not.
@@ -862,13 +864,18 @@ machine that this host would not provide, and publishing nothing, is not.
   structure, now pinned in a comment above the function so it stays true.
 - **New headline figures at nanosecond resolution**, on a loaded host: 4.0 µs
   median-of-ten for the 50 MB blob, 1,759× over UDS and 1,826× over HTTP, and
-  62.6 GB/s on the consumer-timed 16 KB stream.
+  62.6 GB/s on the consumer-timed 16 KB stream. (The 2026-08-18 addendum
+  re-measures all of these CPU-quiet; the blob figures hold to within noise,
+  the stream figure improves to 71.0 GB/s, and the ratios fall because the
+  baselines speed up.)
 
 **What this does NOT establish.**
 
-- **Nothing about a quiet host.** Every figure here was taken under sustained
-  Spotlight indexing. They are a floor, and the floor has not been checked
-  against a ceiling.
+- **Nothing about a quiet host.** Every figure in Parts 1–3 was taken under
+  sustained Spotlight indexing. They were published as a floor, and at the time
+  of writing the floor had not been checked against a ceiling. It has since
+  been checked — see the addendum below, which finds the floor claim **false**
+  for the blob latencies and the ratios.
 - **Nothing that makes the ratios three-significant-figure results.** The clock
   is no longer the limit, but the millisecond baselines still jitter: uds/shuttle
   spans 1,443×–1,946× and http/shuttle 1,672×–2,115× across ten identical runs.
@@ -890,6 +897,201 @@ machine that this host would not provide, and publishing nothing, is not.
 - **Nothing about the stream figure as a like-for-like transport comparison.**
   Borrow-in-place versus `read()`-the-frame is the comparison being made, on
   purpose.
+
+---
+
+### Addendum (2026-08-18): the CPU-quiet run
+
+Same host, same commit, same unsanitized `-O2` binaries as Part 3 — nothing was
+rebuilt. This entry exists to test one sentence written above: *"A quiet host
+should produce equal or better numbers; it will not produce worse ones."*
+
+Two data sets: **`bench_runs4`** (2 s between runs) and **`bench_runs4b`** (back
+to back, matching Part 3). The reason there are two is in *A procedure
+confound* below.
+
+**Terminology, up front.** These are **not** quiet-host figures and this entry
+never calls them that. The machine was **CPU-quiet** — no busy background
+process — but carried a residual 1-minute load of roughly **1.2–1.5** from the
+user's normal working environment: a resident Docker Desktop VM
+(`Virtualization.framework`), `WindowServer`, and a browser. A **truly idle
+host remains unmeasured**, and this entry does not close that gap.
+
+**Waiting for the host, part one: the strict gate failed.** A first attempt
+(02:22–03:19, 36 polls, `bench_runs4/quiet_poll.txt`) required 1-minute load
+< 1.0 and no background process over 10% CPU. Spotlight was finished by then —
+the Part 3 interference was gone — but the gate never passed in 36 polls. The
+diagnostic detail is the interesting part: between 02:47 and 03:03 the hottest
+background process was only **6.1–8.5%** while load stubbornly floored at
+**1.20–1.25**. That is a resident VM and a compositor holding runnable threads,
+not a CPU hog. Load < 1.0 is simply not reachable on this host while Docker
+Desktop is running, so the strict gate was a test the machine could not pass.
+**No measurement was taken under it**, and no numbers from that window exist.
+
+**Waiting for the host, part two: an adjusted gate.** The gate was relaxed to
+what the host could actually deliver and what the measurement actually needs —
+**hottest non-Claude process < 10% CPU *and* 1-minute load < 1.5, on two
+consecutive polls two minutes apart**. Second watch: 24 polls, 03:22:46–04:10:48
+(`bench_runs4/quiet_poll2.txt`). Three single passes broke on the very next
+poll (03:56:48 load 1.40; 04:02:48 load 1.40; 04:08:48 load 1.36 — each
+followed by a poll at 1.65, 1.68, and so on), which is the Docker VM
+oscillating. The gate passed on the fourth try at **04:10:48**, load
+**1.42**, hottest background process **9.5%** (the Docker VM).
+
+Load through the measurement window was flat — **1.33–1.43** across all ten
+runs, sampled between each — and 1.47 immediately after. **Conditions did not
+degrade mid-window**, so no run in either table below carries an
+interference caveat of the kind Part 3's run 6 carries.
+
+**A procedure confound, found and controlled.** The first CPU-quiet set was
+taken with a 2-second sleep between runs. Part 3 was not: its ten `run*.txt`
+files are stamped 17:40:34–17:40:38, i.e. **all ten back to back in about four
+seconds with no gap**. On Apple Silicon a two-second idle gap is long enough to
+drop the P-state and re-place the next process on an E-core, which is a real
+effect at 4 µs. Rather than publish a comparison across two different
+procedures, the gate was re-armed and a **control set** was taken with the
+sleep removed, matching Part 3 exactly (ten runs in six seconds; gate passed
+04:20:51, load **1.17**, hottest background process **8.6%**).
+
+The confound was large, and it accounts for most of the apparent regression:
+
+| | 2 s between runs | back to back (Part 3 procedure) |
+|---|---|---|
+| Shuttle blob median | 5.2 µs | **4.2 µs** |
+| Shuttle blob p99 | 10.6 µs | **8.4 µs** |
+| UDS blob median | 8813.9 µs | **6473.6 µs** |
+| Stream, Shuttle | 54,087 MB/s | **71,048 MB/s** |
+| Consumer CPU, 2 GB borrow | 0.21 ms | **0.15 ms** |
+
+The spaced set is reported here because it was taken, not because it is
+comparable: **a 36% swing in the UDS baseline from inter-run spacing alone is
+itself a caution** about how much of any of these millisecond baselines is
+scheduling rather than transport. Everything below uses the **back-to-back
+control set**, which is the like-for-like comparison against Part 3.
+
+**Numbers — 50 MB blob, ten consecutive runs, CPU-quiet, back to back.** All
+times µs.
+
+| Run | Shuttle median | Shuttle p99 | UDS median | HTTP median | uds/shuttle | http/shuttle |
+|---|---|---|---|---|---|---|
+| 1 | 4.3 | 8.7 | 6574.2 | 7219.2 | 1531.7× | 1682.0× |
+| 2 | 3.5 | 6.1 | 6652.5 | 7286.6 | 1900.7× | 2081.9× |
+| 3 | 4.2 | 7.8 | 6469.1 | 7246.9 | 1537.0× | 1721.8× |
+| 4 | 4.4 | 8.5 | 6168.5 | 7283.1 | 1396.8× | 1649.2× |
+| 5 | 4.2 | 9.4 | 6447.6 | 7193.3 | 1547.7× | 1726.7× |
+| 6 | 4.0 | 7.0 | 6228.2 | 7263.2 | 1573.2× | 1834.6× |
+| 7 | 4.0 | 8.5 | 6064.3 | 7302.1 | 1500.3× | 1806.6× |
+| 8 | 4.0 | 8.4 | 6623.6 | 7295.2 | 1639.1× | 1805.3× |
+| 9 | 4.2 | 11.1 | 6478.0 | 7213.6 | 1524.2× | 1697.3× |
+| 10 | 4.4 | 7.0 | 6784.2 | 6975.7 | 1535.9× | 1579.3× |
+| **median of 10** | **4.2** | **8.4** | **6473.6** | **7255.0** | **1536.5×** | **1724.2×** |
+
+No run needed excluding and none was. The p99 column is notably better behaved
+than Part 3's: the worst p99 here is **11.1 µs**, against Part 3's 32.7 µs
+outlier — which is what removing Spotlight buys, and it is a real improvement
+even though the *median* p99 got worse.
+
+**Numbers — 16 KB stream throughput (MB/s), consumer-timed.**
+
+| Run | shuttle | uds | http |
+|---|---|---|---|
+| 1 | 71994 | 13208 | 1119 |
+| 2 | 73416 | 13021 | 1096 |
+| 3 | 70522 | 12631 | 1089 |
+| 4 | 71181 | 12938 | 1106 |
+| 5 | 57707 | 12772 | 1133 |
+| 6 | 72767 | 12250 | 1130 |
+| 7 | 67373 | 12732 | 1124 |
+| 8 | 71098 | 12457 | 1110 |
+| 9 | 70998 | 12694 | 1072 |
+| 10 | 65182 | 11185 | 1039 |
+| **median** | **71048 (≈71.0 GB/s)** | **12713** | **1108** |
+
+The distribution is **tighter than Part 3's and still unimodal**: CV **6.5%**
+across all ten runs, against 11.4% across all ten of Part 3's (8.4% over its
+runs 2–10). Eight of ten runs sit in 67.4–73.4 GB/s; the two low values (57.7
+and 65.2 GB/s) are a tail, and unlike Part 3 neither coincides with a blob-p99
+spike. There is no cold-first-run effect here at all — run 1 is 71,994 MB/s,
+near the top of the range — which is itself evidence that Part 3's cold run 1
+was an artifact of the loaded host rather than of the harness.
+
+**Numbers — CPU accounting.**
+
+| Measurement | Value | Build |
+|---|---|---|
+| Consumer CPU, 2 GB over the borrow path | **0.15 ms** (3.9 µs/msg) — **0.02%** of the 686.44 ms UDS copy baseline | unsanitized `-O2` |
+
+**The floor prediction, tested.** Part 3 published its figures as a
+*loaded-host floor* and asserted that a quiet host would be equal or better,
+never worse. Against the like-for-like control set that claim is **false as
+stated**. It holds for throughput and CPU; it fails for blob latency and for
+both headline ratios.
+
+| Figure | Part 3 (loaded, 2026-08-17) | Addendum (CPU-quiet, 2026-08-18) | Floor claim |
+|---|---|---|---|
+| Shuttle blob median | 4.0 µs | 4.2 µs | **violated** (+5%) |
+| Shuttle blob p99 | 7.1 µs | 8.4 µs | **violated** (+18%) |
+| uds/shuttle | 1,759× | 1,536× | **violated** (−13%) |
+| http/shuttle | 1,826× | 1,724× | **violated** (−6%) |
+| UDS blob median | 6739.8 µs | 6473.6 µs | held (baseline 4% faster) |
+| HTTP blob median | 7401.2 µs | 7255.0 µs | held (baseline 2% faster) |
+| Stream, Shuttle | 62,638 MB/s | 71,048 MB/s | held (+13%) |
+| Stream, UDS | 12,303 MB/s | 12,713 MB/s | held (+3%) |
+| Stream, HTTP | 1,080 MB/s | 1,108 MB/s | held (+3%) |
+| Consumer CPU, 2 GB | 0.28 ms (0.04%) | 0.15 ms (0.02%) | held (46% better) |
+
+Read the ratio rows carefully, because they are the ones that look worst and
+they are **not** a Shuttle regression: both baselines got *faster* on the
+quieter host (UDS by 4%, HTTP by 2%) while Shuttle's own median moved 0.2 µs
+the other way. A ratio with a faster denominator and a slower numerator falls
+twice over. The honest one-line summary is that **removing background load
+helped the millisecond transports slightly and did not help the microsecond
+one at all.**
+
+Whether the 4.0 → 4.2 µs move is real is a question this data cannot settle.
+It is 0.2 µs against a per-run spread of 3.5–4.4 µs here and 3.5–4.5 µs in
+Part 3 — comfortably inside run-to-run noise, and a fair reading is "no
+detectable change." But *"no detectable change"* is not *"equal or better"*
+either, and the p99 and both ratios moved further than noise plausibly
+explains. **The prediction was stated as a guarantee, and a guarantee is
+refuted by a single counterexample, not by a preponderance.** It is therefore
+recorded as refuted rather than as narrowly survived.
+
+**What this establishes.**
+
+- **The floor framing was wrong and is withdrawn.** "Loaded-host floor, a quiet
+  host can only be better" was an untested inference presented with more
+  confidence than it had earned. Background load is not a uniform tax that
+  scales every number down together.
+- **The headline blob figures are load-insensitive over this range.** Going
+  from load ~3.5 with Spotlight at 79–97% of a core to load ~1.2 with nothing
+  above 9% moved the Shuttle blob median by 0.2 µs. That is a more useful and
+  more defensible claim than the floor claim it replaces, and it is the one
+  worth carrying forward.
+- **Spotlight was costing tail latency, not median latency.** The p99 outlier
+  is gone (worst 11.1 µs against 32.7 µs) even though median p99 rose.
+- **Stream throughput and borrow-path CPU *did* improve materially** (+13% and
+  46%), so the two figures most sensitive to background load are the two that
+  behaved as the floor claim predicted.
+- **Inter-run spacing is a first-order confound at this scale**, worth more
+  than the entire loaded-versus-quiet effect: a 2-second gap cost 24% of blob
+  median and 36% of UDS median. Any future re-measurement must state its
+  spacing.
+
+**What this does NOT establish.**
+
+- **Still nothing about a truly idle host.** Load 1.2–1.5 with a resident VM is
+  quieter than Part 3, not quiet. The Docker Desktop VM was left running
+  deliberately — it is the user's normal environment, and quitting it to chase
+  a number would measure a machine nobody uses.
+- **Nothing that makes any of these three-significant-figure results.** Across
+  the ten runs here, uds/shuttle spans 1,397×–1,901× and http/shuttle
+  1,579×–2,082×. The ratios remain order-of-magnitude statements, exactly as
+  Part 3 said.
+- **Nothing about whether 4.0 or 4.2 µs is the better estimate.** Two
+  ten-run sets under different conditions are not enough to resolve a 5%
+  difference; both are consistent with a true value near 4 µs.
+- **Nothing about Linux, and nothing about bare metal.** Unchanged.
 
 ---
 
